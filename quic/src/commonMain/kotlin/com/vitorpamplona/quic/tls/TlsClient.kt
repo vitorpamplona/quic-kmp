@@ -22,6 +22,7 @@ package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.quartz.mls.crypto.X25519
 import com.vitorpamplona.quartz.mls.crypto.X25519KeyPair
+import com.vitorpamplona.quartz.utils.TimeUtils
 import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
@@ -83,13 +84,13 @@ class TlsClient(
         ),
     /**
      * Wall-clock provider for the NewSessionTicket [issuedAtMillis] stamp.
-     * Tests inject a fixed clock; production uses System.currentTimeMillis().
+     * Tests inject a fixed clock; production uses the system wall clock.
      * Stored at issue-time only — the obfuscated_ticket_age the next
      * connection emits is `(now_at_resume - issuedAtMillis + ticketAgeAdd)
      * mod 2^32`, so a slightly stale clock skew is harmless (the server
      * de-obfuscates and only cares about its own tracked age window).
      */
-    val nowMillisSource: () -> Long = { System.currentTimeMillis() },
+    val nowMillisSource: () -> Long = { TimeUtils.nowMillis() },
     /**
      * If non-null, this connection resumes a prior session via PSK rather
      * than running a full handshake. The TLS layer:

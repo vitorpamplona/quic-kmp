@@ -20,6 +20,9 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quartz.utils.Log
+import com.vitorpamplona.quartz.utils.TimeUtils
+import com.vitorpamplona.quic.SynchronizedObject
 import com.vitorpamplona.quic.crypto.AesEcbHeaderProtection
 import com.vitorpamplona.quic.crypto.InitialSecrets
 import com.vitorpamplona.quic.crypto.PlatformAesOneBlock
@@ -29,6 +32,7 @@ import com.vitorpamplona.quic.observability.QlogObserver
 import com.vitorpamplona.quic.packet.QuicVersion
 import com.vitorpamplona.quic.stream.QuicStream
 import com.vitorpamplona.quic.stream.StreamId
+import com.vitorpamplona.quic.synchronized
 import com.vitorpamplona.quic.tls.TlsClient
 import com.vitorpamplona.quic.tls.TlsConstants
 import com.vitorpamplona.quic.tls.TlsSecretsListener
@@ -37,6 +41,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.Volatile
 
 /**
  * QUIC v1 client connection. The orchestrator that owns:
@@ -420,7 +425,7 @@ class QuicConnection(
      * giving us a true compare-and-set for "first caller wins the
      * close-reason and gets to fire the qlog event".
      */
-    private val closeStateMonitor = Any()
+    private val closeStateMonitor = SynchronizedObject()
 
     /**
      * Single-shot signal completed when [status] transitions to CLOSED —
@@ -1584,10 +1589,10 @@ class QuicConnection(
                 items.map { init(openBidiStreamLocked(), it) }
             }
         if (writerDebugEnabled) {
-            System.err.println(
+            Log.d("QuicWriter") {
                 "[batch] openBidiStreamsBatch items=${items.size} returned=${result.size} " +
-                    "streamsList_before=$streamsBefore streamsList_after=${streams.size}",
-            )
+                    "streamsList_before=$streamsBefore streamsList_after=${streams.size}"
+            }
         }
         return result
     }
@@ -3345,11 +3350,11 @@ private fun defaultMonotonicNowMillis(): () -> Long {
 
 /**
  * Default wallclock (epoch) supplier for [QuicConnection.epochMillis].
- * Java's `System.currentTimeMillis()` is the same source [com.vitorpamplona.quic.tls.TlsClient]
- * uses by default to stamp `TlsResumptionState.issuedAtMillis`, so deltas
- * across the pair are meaningful even across process restarts.
+ * The same source [com.vitorpamplona.quic.tls.TlsClient] uses by default to
+ * stamp `TlsResumptionState.issuedAtMillis`, so deltas across the pair are
+ * meaningful even across process restarts.
  */
-private fun defaultEpochMillis(): Long = System.currentTimeMillis()
+private fun defaultEpochMillis(): Long = TimeUtils.nowMillis()
 
 /**
  * One source CID we've issued to the peer (RFC 9000 §5.1.1 +

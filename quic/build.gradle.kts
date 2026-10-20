@@ -18,6 +18,16 @@ kotlin {
         }
     }
 
+    // commonMain must stay platform-neutral, but with only JVM-family targets Kotlin
+    // lets it use JVM APIs and its metadata compile checks nothing. -PquicNativeCheck
+    // adds a native target, which turns commonMain into real common code, so
+    // `./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata` (CI and the
+    // pre-push hook) catches a JVM-only call. The target has no actuals yet: never
+    // build or publish it.
+    if (providers.gradleProperty("quicNativeCheck").isPresent) {
+        linuxX64()
+    }
+
     android {
         namespace = "com.vitorpamplona.quic"
         compileSdk =

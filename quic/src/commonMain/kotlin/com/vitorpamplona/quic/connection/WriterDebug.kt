@@ -20,6 +20,8 @@
  */
 package com.vitorpamplona.quic.connection
 
+import kotlin.concurrent.Volatile
+
 /**
  * Opt-in writer-side debug logging. Toggled by external code (the
  * interop endpoint sets it from the QUIC_INTEROP_DEBUG env var at

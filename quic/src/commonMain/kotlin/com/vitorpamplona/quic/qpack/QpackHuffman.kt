@@ -358,7 +358,7 @@ object QpackHuffman {
                 if (len > bitsAvailable) break
                 val candidate = ((bitBuf ushr (bitsAvailable - len)) and ((1L shl len) - 1)).toInt()
                 val codes = codesByLen[len]
-                val pos = codes.binarySearch(candidate)
+                val pos = codes.sortedIndexOf(candidate)
                 if (pos >= 0) {
                     val sym = symsByLen[len][pos]
                     if (outPos == out.size) out = out.copyOf(out.size * 2)
@@ -383,4 +383,23 @@ object QpackHuffman {
         }
         return if (outPos == out.size) out else out.copyOf(outPos)
     }
+}
+
+/**
+ * Binary search of the ascending receiver for [key]: its index, or a negative
+ * value when absent. `IntArray.binarySearch` does the same but is JVM-only.
+ */
+private fun IntArray.sortedIndexOf(key: Int): Int {
+    var low = 0
+    var high = size - 1
+    while (low <= high) {
+        val mid = (low + high) ushr 1
+        val value = this[mid]
+        when {
+            value < key -> low = mid + 1
+            value > key -> high = mid - 1
+            else -> return mid
+        }
+    }
+    return -(low + 1)
 }

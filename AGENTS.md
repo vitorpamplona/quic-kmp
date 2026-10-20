@@ -19,13 +19,19 @@ streams) build on it.
 
 - Crypto primitives and the secure random source come from Quartz (`com.vitorpamplona.quartz`).
   Don't reimplement them here; if one is missing, add it to Quartz.
-- `commonMain` stays free of new JVM-only APIs, so more targets can be added later.
+- `commonMain` stays free of JVM-only APIs, so more targets can be added. CI and the pre-push hook
+  compile it as common code with `./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata`;
+  plain `jvm`/`android` builds don't catch a JVM call there. For a lock, use
+  `com.vitorpamplona.quic.synchronized` with a `SynchronizedObject`, not `kotlin.synchronized`;
+  for `@Volatile`, import `kotlin.concurrent.Volatile`. The platform layer (UDP socket, ciphers,
+  TLS transcript hash, lock, certificate validators) has JVM actuals only.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
   major version. Amethyst pins a version, so a breaking change also needs a matching change in
   Amethyst's `nestsClient` / `marmotQuic`.
 - Log through Quartz's `Log` with the lambda overload (`Log.d(TAG) { "…$x" }`).
 - Before pushing: `./gradlew spotlessApply` and
-  `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test`.
+  `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test` (the pre-push hook runs
+  these plus the `commonMain` check).
   Changes that can affect wire bytes, congestion control or the TLS state machine should also run
   the interop matrix (`quic/interop/run-matrix.sh`, one peer at a time).
 - Commits: conventional commits (`feat:`, `fix:`, …). Never `--no-verify`.

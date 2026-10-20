@@ -34,9 +34,9 @@ Interop is tested against aioquic, picoquic and quic-go with the
   over congested links.
 - **Path MTU discovery.** Packets stay at the 1200-byte minimum datagram size.
 - `TLS_AES_256_GCM_SHA384`, HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
-- **Targets other than JVM and Android.** The protocol code is in `commonMain`, but it still uses
-  a few JVM APIs (`@Volatile`, `synchronized`, `System`), and the UDP socket, ciphers and
-  certificate validation exist only for the JVM.
+- **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
+  (CI compiles it as common code), but the UDP socket, packet ciphers, TLS transcript hash, lock
+  and certificate validation exist only for the JVM so far.
 
 ## Install
 

@@ -22,8 +22,20 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
+      - name: Cached Konan
+        uses: actions/cache@v6
+        with:
+          path: ~/.konan
+          key: ${{ runner.os }}-konan-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-konan-
+
       - name: Linter (gradle)
         run: ./gradlew spotlessCheck
+
+      # commonMain compiled as common code (a native target added), so a
+      # JVM-only API there fails the build.
+      - name: Check commonMain is platform-neutral
+        run: ./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata
 
       - name: Check JVM
         run: ./gradlew :quic:jvmTest :quic-interop:test

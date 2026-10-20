@@ -13,7 +13,8 @@ echo "$(java -version)"
 echo "Running test... "
 
 # The same checks CI runs (.github/workflows/build.yml).
-./gradlew spotlessCheck :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test
+./gradlew spotlessCheck :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test &&
+    ./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata
 
 status=$?
 
@@ -23,7 +24,8 @@ if [ "$status" = 0 ] ; then
 else
     echo "*********************************************************"
     echo 1>&2 "Formatting or tests failed"
-    printf "Run ${GREEN}./gradlew spotlessApply :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test${NO_COLOR} and fix what fails before pushing...\n"
+    printf "Run ${GREEN}./gradlew spotlessApply :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test${NO_COLOR}\n"
+    printf "and ${GREEN}./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata${NO_COLOR}, and fix what fails before pushing...\n"
     echo "*********************************************************"
     exit 1
 fi

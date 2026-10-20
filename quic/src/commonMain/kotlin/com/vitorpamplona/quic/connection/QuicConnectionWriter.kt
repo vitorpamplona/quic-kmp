@@ -888,12 +888,12 @@ private fun buildApplicationPacket(
         val totalFrames = frames.size
         val streamsViewSize = conn.streamsListLocked().size
         val activeSize = conn.streamsListLocked().count { !it.isClosed }
-        System.err.println(
+        Log.d("QuicWriter") {
             "[writer.app] frames=$totalFrames stream_frames=$streamFrameCount " +
                 "streamsView=$streamsViewSize active=$activeSize " +
                 "packetBudget_remaining=${1100 - (frames.filterIsInstance<StreamFrame>().sumOf { it.data.size + 32 })} " +
-                "connBudget_initial=${(conn.sendConnectionFlowCredit - conn.sendConnectionFlowConsumed).coerceAtLeast(0L)}",
-        )
+                "connBudget_initial=${(conn.sendConnectionFlowCredit - conn.sendConnectionFlowConsumed).coerceAtLeast(0L)}"
+        }
     }
 
     val payload = encodeFrames(frames)

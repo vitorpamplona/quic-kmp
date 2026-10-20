@@ -26,10 +26,12 @@ import com.vitorpamplona.quic.stream.QuicStream
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlin.concurrent.Volatile
 
 /**
  * Container that bundles a [QuicConnection], its [QuicConnectionDriver], and

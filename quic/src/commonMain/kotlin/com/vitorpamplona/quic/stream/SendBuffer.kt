@@ -20,6 +20,10 @@
  */
 package com.vitorpamplona.quic.stream
 
+import com.vitorpamplona.quic.SynchronizedObject
+import com.vitorpamplona.quic.synchronized
+import kotlin.concurrent.Volatile
+
 /**
  * Outbound send buffer for one direction of a QUIC stream (or for the
  * per-encryption-level CRYPTO offset stream).
@@ -60,7 +64,7 @@ package com.vitorpamplona.quic.stream
  * send loop under the connection mutex; [markAcked] / [markLost] run on
  * the parser path also under the connection mutex. The two execution
  * paths are NOT serialised by a shared lock, so all internal state is
- * mutated under `synchronized(this)`. Single-field reads
+ * mutated under `synchronized(lock)`. Single-field reads
  * ([nextOffset], [sentOffset], [finPending], [finSent], [finAcked])
  * use `@Volatile` backing fields and bypass the monitor — they cannot
  * tear (Boolean is single-byte; Long writes happen inside the
@@ -94,6 +98,9 @@ package com.vitorpamplona.quic.stream
 class SendBuffer(
     val bestEffort: Boolean = false,
 ) {
+    /** Guards the mutable state below; see "Concurrency" above. */
+    private val lock = SynchronizedObject()
+
     /**
      * Contiguous byte storage covering `[flushedFloor, nextOffset)`.
      * Indexing: byte at logical offset `o` lives at `data[(o - flushedFloor).toInt()]`.
@@ -180,7 +187,7 @@ class SendBuffer(
      */
     val readableBytes: Int
         get() =
-            synchronized(this) {
+            synchronized(lock) {
                 val sum = retransmitTotalBytes + (_nextOffset - nextSendOffset)
                 sum.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
             }
@@ -199,7 +206,7 @@ class SendBuffer(
 
     fun enqueue(bytes: ByteArray) {
         if (bytes.isEmpty()) return
-        synchronized(this) {
+        synchronized(lock) {
             ensureCapacity(dataLen + bytes.size)
             bytes.copyInto(data, dataLen)
             dataLen += bytes.size
@@ -209,7 +216,7 @@ class SendBuffer(
 
     /** Mark the write side as closing; the next [takeChunk] sets FIN once empty. */
     fun finish() {
-        synchronized(this) { _finPending = true }
+        synchronized(lock) { _finPending = true }
     }
 
     /**
@@ -225,7 +232,7 @@ class SendBuffer(
      * Returns null if there's nothing to send.
      */
     fun takeChunk(maxBytes: Int): Chunk? =
-        synchronized(this) {
+        synchronized(lock) {
             val cap = maxBytes.coerceAtLeast(0)
 
             // 1. Retransmit queue first.
@@ -291,7 +298,7 @@ class SendBuffer(
         offset: Long,
         length: Long,
     ) {
-        synchronized(this) {
+        synchronized(lock) {
             removeOverlap(inFlight, offset, length, OverlapAction.ACK)
             advanceFlushedFloorIfPossible()
         }
@@ -315,7 +322,7 @@ class SendBuffer(
         length: Long,
         fin: Boolean,
     ) {
-        synchronized(this) {
+        synchronized(lock) {
             // Bytes already released (below flushedFloor) are gone for
             // good — by definition they were ACK'd, so there's nothing
             // to retransmit. Clamp the requested range to the retained
@@ -369,7 +376,7 @@ class SendBuffer(
      * been ACK'd.
      */
     fun requeueAllInflight() {
-        synchronized(this) {
+        synchronized(lock) {
             if (inFlight.isEmpty()) return
             if (bestEffort) {
                 inFlight.clear()
