@@ -64,4 +64,35 @@ class QuicLogTest {
         assertEquals(listOf("DEBUG Writer one", "INFO Writer two", "WARN Tls three", "ERROR Tls four"), lines)
         assertSame(error, caught)
     }
+
+    @Test
+    fun `a sink that rejects a level never builds its message`() {
+        val lines = mutableListOf<String>()
+        var built = false
+        QuicLog.sink =
+            object : QuicLog.Sink {
+                override fun log(
+                    level: QuicLog.Level,
+                    tag: String,
+                    message: String,
+                    throwable: Throwable?,
+                ) {
+                    lines += "$level $message"
+                }
+
+                override fun isLoggable(level: QuicLog.Level) = level >= QuicLog.Level.WARN
+            }
+        QuicLog.d("Test") {
+            built = true
+            "debug"
+        }
+        QuicLog.i("Test") {
+            built = true
+            "info"
+        }
+        QuicLog.w("Test") { "warn" }
+        QuicLog.e("Test") { "error" }
+        assertFalse(built)
+        assertEquals(listOf("WARN warn", "ERROR error"), lines)
+    }
 }

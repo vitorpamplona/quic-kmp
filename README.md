@@ -262,7 +262,8 @@ long-lived connection with many streams:
       }
   ```
 
-  Set `writerDebugEnabled = true` (in `com.vitorpamplona.quic.connection`) as well for the
+  If your logger filters by level, override `Sink.isLoggable` too, so a line it would drop is
+  never built. Set `writerDebugEnabled = true` (in `com.vitorpamplona.quic.connection`) as well for the
   writer's per-packet traces.
 
 ## Versioning
