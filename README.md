@@ -250,7 +250,19 @@ long-lived connection with many streams:
   writes them as a `.sqlog` file that qvis opens.
 - **Wireshark.** Pass a `TlsSecretsListener` as `extraSecretsListener` and write the secrets in
   `SSLKEYLOGFILE` format to decrypt a capture.
-- **Logs** go through Quartz's `Log` (`com.vitorpamplona.quartz.utils.Log`).
+- **Logs.** The library logs nothing until you set `QuicLog.sink`. Point it at your logger once,
+  at startup:
+
+  ```kotlin
+  QuicLog.sink =
+      QuicLog.Sink { level, tag, message, throwable ->
+          println("[$level] $tag: $message")
+          throwable?.printStackTrace()
+      }
+  ```
+
+  Set `writerDebugEnabled = true` (in `com.vitorpamplona.quic.connection`) as well for the
+  writer's per-packet traces.
 
 ## Versioning
 

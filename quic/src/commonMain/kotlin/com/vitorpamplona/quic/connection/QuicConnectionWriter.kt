@@ -22,7 +22,7 @@
 
 package com.vitorpamplona.quic.connection
 
-import com.vitorpamplona.quartz.utils.Log
+import com.vitorpamplona.quic.QuicLog
 import com.vitorpamplona.quic.connection.recovery.RecoveryToken
 import com.vitorpamplona.quic.connection.recovery.SentPacket
 import com.vitorpamplona.quic.frame.AckEcnCounts
@@ -888,7 +888,7 @@ private fun buildApplicationPacket(
         val totalFrames = frames.size
         val streamsViewSize = conn.streamsListLocked().size
         val activeSize = conn.streamsListLocked().count { !it.isClosed }
-        Log.d("QuicWriter") {
+        QuicLog.d("QuicWriter") {
             "[writer.app] frames=$totalFrames stream_frames=$streamFrameCount " +
                 "streamsView=$streamsViewSize active=$activeSize " +
                 "packetBudget_remaining=${1100 - (frames.filterIsInstance<StreamFrame>().sumOf { it.data.size + 32 })} " +
@@ -1253,7 +1253,7 @@ private fun appendFlowControlUpdates(
             conn.advertisedMaxStreamsUni = newCap
             frames += MaxStreamsFrame(bidi = false, maxStreams = newCap)
             tokens += RecoveryToken.MaxStreamsUni(maxStreams = newCap)
-            Log.d("NestQuic") {
+            QuicLog.d("QuicWriter") {
                 "MAX_STREAMS_UNI emit oldCap=$oldCap → newCap=$newCap " +
                     "peerInitiatedUniCount=${conn.peerInitiatedUniCount}"
             }
@@ -1266,7 +1266,7 @@ private fun appendFlowControlUpdates(
             conn.advertisedMaxStreamsBidi = newCap
             frames += MaxStreamsFrame(bidi = true, maxStreams = newCap)
             tokens += RecoveryToken.MaxStreamsBidi(maxStreams = newCap)
-            Log.d("NestQuic") {
+            QuicLog.d("QuicWriter") {
                 "MAX_STREAMS_BIDI emit oldCap=$oldCap → newCap=$newCap " +
                     "peerInitiatedBidiCount=${conn.peerInitiatedBidiCount}"
             }

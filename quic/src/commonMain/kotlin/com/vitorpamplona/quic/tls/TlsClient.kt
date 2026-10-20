@@ -22,10 +22,10 @@ package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.quartz.mls.crypto.X25519
 import com.vitorpamplona.quartz.mls.crypto.X25519KeyPair
-import com.vitorpamplona.quartz.utils.TimeUtils
 import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
+import kotlin.time.Clock
 
 /**
  * TLS 1.3 client driven by QUIC's encryption-level CRYPTO stream payloads.
@@ -90,7 +90,7 @@ class TlsClient(
      * mod 2^32`, so a slightly stale clock skew is harmless (the server
      * de-obfuscates and only cares about its own tracked age window).
      */
-    val nowMillisSource: () -> Long = { TimeUtils.nowMillis() },
+    val nowMillisSource: () -> Long = { Clock.System.now().toEpochMilliseconds() },
     /**
      * If non-null, this connection resumes a prior session via PSK rather
      * than running a full handshake. The TLS layer:

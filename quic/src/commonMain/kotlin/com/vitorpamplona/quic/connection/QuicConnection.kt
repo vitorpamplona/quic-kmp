@@ -20,8 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
-import com.vitorpamplona.quartz.utils.Log
-import com.vitorpamplona.quartz.utils.TimeUtils
+import com.vitorpamplona.quic.QuicLog
 import com.vitorpamplona.quic.SynchronizedObject
 import com.vitorpamplona.quic.crypto.AesEcbHeaderProtection
 import com.vitorpamplona.quic.crypto.InitialSecrets
@@ -42,6 +41,7 @@ import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.concurrent.Volatile
+import kotlin.time.Clock
 
 /**
  * QUIC v1 client connection. The orchestrator that owns:
@@ -1589,7 +1589,7 @@ class QuicConnection(
                 items.map { init(openBidiStreamLocked(), it) }
             }
         if (writerDebugEnabled) {
-            Log.d("QuicWriter") {
+            QuicLog.d("QuicWriter") {
                 "[batch] openBidiStreamsBatch items=${items.size} returned=${result.size} " +
                     "streamsList_before=$streamsBefore streamsList_after=${streams.size}"
             }
@@ -3354,7 +3354,7 @@ private fun defaultMonotonicNowMillis(): () -> Long {
  * stamp `TlsResumptionState.issuedAtMillis`, so deltas across the pair are
  * meaningful even across process restarts.
  */
-private fun defaultEpochMillis(): Long = TimeUtils.nowMillis()
+private fun defaultEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
 
 /**
  * One source CID we've issued to the peer (RFC 9000 §5.1.1 +

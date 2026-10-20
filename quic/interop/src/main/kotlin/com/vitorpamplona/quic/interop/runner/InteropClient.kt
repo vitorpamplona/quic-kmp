@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.interop.runner
 
+import com.vitorpamplona.quic.QuicLog
 import com.vitorpamplona.quic.connection.QuicConnection
 import com.vitorpamplona.quic.connection.QuicConnectionConfig
 import com.vitorpamplona.quic.connection.QuicConnectionDriver
@@ -134,6 +135,12 @@ fun main() {
     val debugEnv = System.getenv("QUIC_INTEROP_DEBUG")
     if (debugEnv == "1") {
         com.vitorpamplona.quic.connection.writerDebugEnabled = true
+        // The library logs nothing until a sink is set; print its lines beside ours.
+        QuicLog.sink =
+            QuicLog.Sink { level, tag, message, throwable ->
+                System.err.println("[$level] $tag: $message")
+                throwable?.printStackTrace()
+            }
         System.err.println(
             "[boot] DEBUG=1; writerDebugEnabled=true; build_id=" +
                 "${com.vitorpamplona.quic.connection.WRITER_DEBUG_BUILD_ID}; " +
