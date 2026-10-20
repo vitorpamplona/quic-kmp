@@ -20,8 +20,9 @@ streams) build on it.
 - Crypto primitives and the secure random source come from Quartz (`com.vitorpamplona.quartz`).
   Don't reimplement them here; if one is missing, add it to Quartz.
 - `commonMain` stays free of new JVM-only APIs, so more targets can be added later.
-- The public API is consumed by Amethyst from a pinned version. A breaking change needs a version
-  bump and a matching change in Amethyst's `nestsClient` / `marmotQuic`.
+- Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
+  major version. Amethyst pins a version, so a breaking change also needs a matching change in
+  Amethyst's `nestsClient` / `marmotQuic`.
 - Log through Quartz's `Log` with the lambda overload (`Log.d(TAG) { "…$x" }`).
 - Before pushing: `./gradlew spotlessApply` and
   `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test`.

@@ -34,8 +34,9 @@ Interop is tested against aioquic, picoquic and quic-go with the
   over congested links.
 - **Path MTU discovery.** Packets stay at the 1200-byte minimum datagram size.
 - `TLS_AES_256_GCM_SHA384`, HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
-- **Targets other than JVM and Android.** The protocol code is in `commonMain`, but sockets and
-  ciphers have JVM actuals only.
+- **Targets other than JVM and Android.** The protocol code is in `commonMain`, but it still uses
+  a few JVM APIs (`@Volatile`, `synchronized`, `System`), and the UDP socket, ciphers and
+  certificate validation exist only for the JVM.
 
 ## Install
 
@@ -253,8 +254,8 @@ long-lived connection with many streams:
 
 ## Versioning
 
-The API follows the needs of its consumers and can still change between minor versions before
-1.0. Each release is tagged `v<version>` and listed on the
+Releases follow [semantic versioning](https://semver.org/): a breaking change to the public API
+bumps the major version. Each release is tagged `v<version>` and listed on the
 [releases page](https://github.com/vitorpamplona/quic-kmp/releases).
 
 ## Developer Setup
@@ -363,10 +364,10 @@ SIGNING_PRIVATE_KEY=<base64versionOfTheFile>
 SIGNING_PASSWORD=<gpg key passphrase>
 ```
 
-Then tag the release version starting with `v`. Tag `v0.1.0` publishes version `0.1.0`:
+Then tag the release version starting with `v`. Tag `v1.0.0` publishes version `1.0.0`:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 ## Contributing
