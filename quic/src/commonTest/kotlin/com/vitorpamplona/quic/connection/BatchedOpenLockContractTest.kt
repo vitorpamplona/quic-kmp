@@ -87,7 +87,7 @@ class BatchedOpenLockContractTest {
     }
 
     @Test
-    fun `openBidiStreamLocked throws when caller holds the wrong lock (lifecycleLock)`() {
+    fun `openBidiStreamLocked throws when caller holds the wrong lock - lifecycleLock`() {
         runBlocking {
             val client = handshakedClient()
             // Exact regression shape: caller holds lifecycleLock and

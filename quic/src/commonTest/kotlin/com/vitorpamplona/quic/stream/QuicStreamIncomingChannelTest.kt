@@ -27,6 +27,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * Bounds-checking on the per-stream `incomingChannel`.
@@ -97,9 +98,7 @@ class QuicStreamIncomingChannelTest {
             stream.closeIncoming()
             val collected = mutableListOf<ByteArray>()
             stream.incoming.collect { collected += it }
-            assert(collected.size <= 64) {
-                "channel surfaced ${collected.size} chunks; cap is 64"
-            }
+            assertTrue(collected.size <= 64, "channel surfaced ${collected.size} chunks; cap is 64")
         }
     }
 

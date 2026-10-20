@@ -33,10 +33,10 @@ jobs:
       - name: Linter (gradle)
         run: ./gradlew spotlessCheck
 
-      # commonMain compiled as common code (a native target added), so a
-      # JVM-only API there fails the build.
-      - name: Check commonMain is platform-neutral
-        run: ./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata
+      # commonMain and commonTest compiled for a native target (with placeholder
+      # actuals), so a JVM-only API in either fails the build.
+      - name: Check common code is platform-neutral
+        run: ./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64
 
       - name: Check
         run: ./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test

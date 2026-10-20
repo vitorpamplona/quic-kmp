@@ -20,11 +20,12 @@ kotlin {
 
     // commonMain must stay platform-neutral, but with only JVM-family targets Kotlin
     // lets it use JVM APIs and its metadata compile checks nothing. -PquicNativeCheck
-    // adds a native target, which turns commonMain into real common code, so
-    // `./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata` (CI and the
-    // pre-push hook) catches a JVM-only call. The target has no actuals yet: never
-    // build or publish it.
-    if (providers.gradleProperty("quicNativeCheck").isPresent) {
+    // adds a native target, which turns commonMain and commonTest into real common
+    // code, so `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64` (CI and
+    // the pre-push hook) catches a JVM-only call in either. Its actuals are throwing
+    // placeholders (src/nativeCheck): never run or publish it.
+    val nativeCheck = providers.gradleProperty("quicNativeCheck").isPresent
+    if (nativeCheck) {
         linuxX64()
     }
 
@@ -67,6 +68,12 @@ kotlin {
             create("jvmAndroid") {
                 dependsOn(commonMain.get())
             }
+
+        if (nativeCheck) {
+            // Throwing placeholder actuals, so the check target builds and commonTest
+            // compiles too: `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64`.
+            getByName("linuxX64Main").kotlin.srcDir("src/nativeCheck/kotlin")
+        }
 
         jvmMain {
             dependsOn(jvmAndroid)

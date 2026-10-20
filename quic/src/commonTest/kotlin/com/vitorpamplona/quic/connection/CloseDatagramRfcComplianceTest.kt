@@ -73,7 +73,7 @@ class CloseDatagramRfcComplianceTest {
         }
 
     @Test
-    fun `PTO probe emits a PING at Initial level pre-handshake (RFC 9002 sec 6_2_4)`() =
+    fun `PTO probe emits a PING at Initial level pre-handshake - RFC 9002 sec 6_2_4`() =
         runBlocking {
             // Reproduces the third bug found via the aioquic interop run on
             // 2026-05-06: when the first ClientHello is dropped (e.g. sim
@@ -117,7 +117,7 @@ class CloseDatagramRfcComplianceTest {
         }
 
     @Test
-    fun `single-byte PING-only Initial pads to exactly 1200 bytes (no overshoot beyond varint growth)`() =
+    fun `single-byte PING-only Initial pads to exactly 1200 bytes - no overshoot beyond varint growth`() =
         runBlocking {
             // Boundary case for the padding-rebuild deficit calculation.
             // The smallest possible Initial-level frame payload is a single
@@ -155,7 +155,7 @@ class CloseDatagramRfcComplianceTest {
         }
 
     @Test
-    fun `ConnectionCloseFrame encodes type 0x1c when frameType is non-null (transport close)`() {
+    fun `ConnectionCloseFrame encodes type 0x1c when frameType is non-null - transport close`() {
         // Bug B fix relies on the writer passing frameType=0L (instead of
         // null) when emitting a close at Initial / Handshake level. Encode
         // path must produce 0x1c for that case, 0x1d only for app-level.

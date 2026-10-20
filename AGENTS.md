@@ -19,12 +19,15 @@ streams) build on it.
 
 - Crypto primitives and the secure random source come from Quartz (`com.vitorpamplona.quartz`).
   Don't reimplement them here; if one is missing, add it to Quartz.
-- `commonMain` stays free of JVM-only APIs, so more targets can be added. CI and the pre-push hook
-  compile it as common code with `./gradlew -PquicNativeCheck :quic:compileCommonMainKotlinMetadata`;
-  plain `jvm`/`android` builds don't catch a JVM call there. For a lock, use
-  `com.vitorpamplona.quic.synchronized` with a `SynchronizedObject`, not `kotlin.synchronized`;
-  for `@Volatile`, import `kotlin.concurrent.Volatile`. The platform layer (UDP socket, ciphers,
-  TLS transcript hash, lock, certificate validators) has JVM actuals only.
+- `commonMain` and `commonTest` stay free of JVM-only APIs, so more targets can be added. CI and the
+  pre-push hook compile both for a native target with
+  `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64`; plain `jvm`/`android` builds don't
+  catch a JVM call there. That target's actuals in `quic/src/nativeCheck/` only throw: they exist so
+  the check compiles, never run them. For a lock, use `com.vitorpamplona.quic.synchronized` with a
+  `SynchronizedObject`, not `kotlin.synchronized`; for `@Volatile`, import `kotlin.concurrent.Volatile`;
+  in tests use `assertTrue`, not `assert`, and write backticked test names with letters, digits,
+  spaces, `-` and `_` only (Kotlin/Native rejects `()`, `,`, `.`, `:`, `/`, `#` and others). JVM-only tests go in `jvmTest`. The platform layer (UDP
+  socket, ciphers, TLS transcript hash, lock, certificate validators) has JVM actuals only.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
   major version. Amethyst pins a version, so a breaking change also needs a matching change in
   Amethyst's `nestsClient` / `marmotQuic`.

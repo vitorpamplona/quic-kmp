@@ -20,9 +20,11 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quic.SynchronizedObject
 import com.vitorpamplona.quic.frame.AckFrame
 import com.vitorpamplona.quic.frame.StreamFrame
 import com.vitorpamplona.quic.stream.StreamId
+import com.vitorpamplona.quic.synchronized
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -175,7 +177,7 @@ class CloseUnderLoadTest {
             // here is the production-safety bar.
             val outcome = ArrayList<Outcome>()
             outcome.ensureCapacity(n)
-            val resultsLock = Any()
+            val resultsLock = SynchronizedObject()
 
             coroutineScope {
                 val openers =
