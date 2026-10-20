@@ -31,7 +31,9 @@ streams) build on it.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
   major version. Amethyst pins a version, so a breaking change also needs a matching change in
   Amethyst's `nestsClient` / `marmotQuic`.
-- Log through Quartz's `Log` with the lambda overload (`Log.d(TAG) { "…$x" }`).
+- Log through `QuicLog` (`QuicLog.d(TAG) { "…$x" }`), never Quartz's `Log`: the library logs
+  nothing until the app sets `QuicLog.sink`. Read wall-clock time from `kotlin.time.Clock` or an
+  injected source, not Quartz's `TimeUtils`. Quartz is a dependency for crypto only.
 - Before pushing: `./gradlew spotlessApply` and
   `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test` (the pre-push hook runs
   these plus the `commonMain` check).
