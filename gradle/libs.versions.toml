@@ -1,0 +1,26 @@
+[versions]
+agp = "9.4.1"
+android-compileSdk = "37"
+android-minSdk = "26"
+jacksonModuleKotlin = "2.22.3"
+kotlin = "2.4.20"
+kotlinxCoroutines = "1.11.0"
+mavenPublish = "0.37.0"
+quartz = "1.19.0"
+secp256k1Kmp = "0.24.0"
+spotless = "8.10.3"
+
+[libraries]
+jackson-module-kotlin = { module = "com.fasterxml.jackson.module:jackson-module-kotlin", version.ref = "jacksonModuleKotlin" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinxCoroutines" }
+quartz = { module = "com.vitorpamplona.quartz:quartz", version.ref = "quartz" }
+secp256k1-kmp-jni-jvm = { module = "fr.acinq.secp256k1:secp256k1-kmp-jni-jvm", version.ref = "secp256k1Kmp" }
+
+[plugins]
+androidKotlinMultiplatformLibrary = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+diffplugSpotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
+jetbrainsKotlinJvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+vanniktech-mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }

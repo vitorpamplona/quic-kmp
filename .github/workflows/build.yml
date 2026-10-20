@@ -1,0 +1,47 @@
+name: Test/Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Cached Konan
+        uses: actions/cache@v6
+        with:
+          path: ~/.konan
+          key: ${{ runner.os }}-konan-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-konan-
+
+      - name: Linter (gradle)
+        run: ./gradlew spotlessCheck
+
+      # commonMain and commonTest compiled for a native target (with placeholder
+      # actuals), so a JVM-only API in either fails the build.
+      - name: Check common code is platform-neutral
+        run: ./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64
+
+      - name: Check JVM
+        run: ./gradlew :quic:jvmTest :quic-interop:test
+
+      - name: Check Android (host)
+        run: ./gradlew :quic:testAndroidHostTest
+
+      - name: Build (gradle)
+        run: ./gradlew assemble
