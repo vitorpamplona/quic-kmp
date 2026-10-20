@@ -20,7 +20,7 @@
  */
 package com.vitorpamplona.quic.tls
 
-import com.vitorpamplona.quartz.utils.RandomInstance
+import com.vitorpamplona.crypto.random.RandomInstance
 import com.vitorpamplona.quic.QuicWriter
 
 /**

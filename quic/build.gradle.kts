@@ -52,8 +52,9 @@ kotlin {
             dependencies {
                 implementation(libs.kotlinx.coroutines.core)
                 // Crypto primitives (HKDF, HMAC, SHA-256, AES-GCM, ChaCha20-Poly1305,
-                // X25519) and the secure random source come from Quartz.
-                api(libs.quartz)
+                // X25519) and the secure random source come from crypto-kmp. It is `api`
+                // because TlsClient exposes X25519KeyPair.
+                api(libs.crypto)
             }
         }
 
@@ -87,7 +88,8 @@ kotlin {
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)
-                implementation(libs.secp256k1.kmp.jni.jvm)
+                // QlogWriter writes qlog JSON; Jackson used to arrive through Quartz.
+                implementation(libs.jackson.module.kotlin)
             }
         }
 
@@ -95,7 +97,6 @@ kotlin {
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)
-                implementation(libs.secp256k1.kmp.jni.jvm)
             }
         }
     }

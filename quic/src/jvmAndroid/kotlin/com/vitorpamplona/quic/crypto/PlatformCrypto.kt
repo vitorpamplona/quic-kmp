@@ -20,7 +20,7 @@
  */
 package com.vitorpamplona.quic.crypto
 
-import com.vitorpamplona.quartz.nip44Encryption.crypto.ChaCha20Core
+import com.vitorpamplona.crypto.chacha.ChaCha20Core
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
 

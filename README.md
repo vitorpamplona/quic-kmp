@@ -55,8 +55,9 @@ dependencies {
 | Kotlin coroutines | the API is `suspend` and `Flow` based |
 
 The crypto primitives (HKDF, HMAC, SHA-256, AES-GCM, ChaCha20-Poly1305, X25519, secure random)
-come from [Quartz](https://central.sonatype.com/artifact/com.vitorpamplona.quartz/quartz), which
-this library depends on, so Quartz and its dependencies come along with it.
+come from [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp)
+(`com.vitorpamplona.crypto:crypto`), which depends on nothing but the Kotlin stdlib. Its
+`X25519KeyPair` appears in `TlsClient`'s API, so it comes along as an `api` dependency.
 
 ## Quick start
 
