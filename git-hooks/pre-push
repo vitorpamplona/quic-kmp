@@ -12,7 +12,8 @@ echo "$JAVA_HOME"
 echo "$(java -version)"
 echo "Running test... "
 
-./gradlew test
+# The same checks CI runs (.github/workflows/build.yml).
+./gradlew spotlessCheck :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test
 
 status=$?
 
@@ -21,8 +22,8 @@ if [ "$status" = 0 ] ; then
     exit 0
 else
     echo "*********************************************************"
-    echo 1>&2 "Failing test"
-    printf "Run ${GREEN}./gradlew test${NO_COLOR} to make sure you have all tests green before pushing...\n"
+    echo 1>&2 "Formatting or tests failed"
+    printf "Run ${GREEN}./gradlew spotlessApply :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test${NO_COLOR} and fix what fails before pushing...\n"
     echo "*********************************************************"
     exit 1
 fi
