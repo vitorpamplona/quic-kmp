@@ -20,7 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
-import com.vitorpamplona.quartz.utils.RandomInstance
+import com.vitorpamplona.crypto.random.RandomInstance
 
 /**
  * Single connection ID the peer (server) has issued to us via a

@@ -20,8 +20,8 @@
  */
 package com.vitorpamplona.quic.crypto
 
-import com.vitorpamplona.quartz.nip44Encryption.crypto.Hkdf
-import com.vitorpamplona.quartz.utils.sha256.sha256
+import com.vitorpamplona.crypto.kdf.Hkdf
+import com.vitorpamplona.crypto.sha2.sha256
 
 /**
  * The single HKDF-SHA256 instance used everywhere in the QUIC + TLS 1.3 stack.

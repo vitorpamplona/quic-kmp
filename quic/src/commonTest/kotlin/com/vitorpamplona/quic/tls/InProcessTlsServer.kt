@@ -20,9 +20,9 @@
  */
 package com.vitorpamplona.quic.tls
 
-import com.vitorpamplona.quartz.mls.crypto.X25519
-import com.vitorpamplona.quartz.mls.crypto.X25519KeyPair
-import com.vitorpamplona.quartz.utils.RandomInstance
+import com.vitorpamplona.crypto.curve25519.X25519
+import com.vitorpamplona.crypto.curve25519.X25519KeyPair
+import com.vitorpamplona.crypto.random.RandomInstance
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 

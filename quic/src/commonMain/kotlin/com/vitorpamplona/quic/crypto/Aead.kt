@@ -20,8 +20,8 @@
  */
 package com.vitorpamplona.quic.crypto
 
-import com.vitorpamplona.quartz.nip44Encryption.crypto.ChaCha20Poly1305
-import com.vitorpamplona.quartz.utils.ciphers.AESGCM
+import com.vitorpamplona.crypto.aes.AESGCM
+import com.vitorpamplona.crypto.chacha.ChaCha20Poly1305
 
 /**
  * AEAD selector, parameterised by TLS cipher-suite identifier.

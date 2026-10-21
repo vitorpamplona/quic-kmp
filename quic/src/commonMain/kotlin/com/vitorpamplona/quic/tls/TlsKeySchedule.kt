@@ -20,7 +20,7 @@
  */
 package com.vitorpamplona.quic.tls
 
-import com.vitorpamplona.quartz.utils.mac.MacInstance
+import com.vitorpamplona.crypto.mac.MacInstance
 import com.vitorpamplona.quic.crypto.EMPTY_SHA256
 import com.vitorpamplona.quic.crypto.HKDF
 import com.vitorpamplona.quic.crypto.deriveSecret

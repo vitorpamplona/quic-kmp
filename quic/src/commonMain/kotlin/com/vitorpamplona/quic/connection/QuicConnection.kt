@@ -2717,10 +2717,10 @@ class QuicConnection(
             val seq = nextOwnSourceCidSeq
             nextOwnSourceCidSeq += 1
             val cidBytes =
-                com.vitorpamplona.quartz.utils.RandomInstance
+                com.vitorpamplona.crypto.random.RandomInstance
                     .bytes(sourceConnectionId.length)
             val token =
-                com.vitorpamplona.quartz.utils.RandomInstance
+                com.vitorpamplona.crypto.random.RandomInstance
                     .bytes(16)
             issuedSourceConnectionIds[seq] = IssuedSourceConnectionIdEntry(seq, cidBytes, token)
             pendingOwnNewConnectionIdEmits.addLast(
@@ -2747,10 +2747,10 @@ class QuicConnection(
         val seq = nextOwnSourceCidSeq
         nextOwnSourceCidSeq += 1
         val cidBytes =
-            com.vitorpamplona.quartz.utils.RandomInstance
+            com.vitorpamplona.crypto.random.RandomInstance
                 .bytes(sourceConnectionId.length)
         val token =
-            com.vitorpamplona.quartz.utils.RandomInstance
+            com.vitorpamplona.crypto.random.RandomInstance
                 .bytes(16)
         issuedSourceConnectionIds[seq] = IssuedSourceConnectionIdEntry(seq, cidBytes, token)
         pendingOwnNewConnectionIdEmits.addLast(

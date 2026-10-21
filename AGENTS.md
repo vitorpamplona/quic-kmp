@@ -17,8 +17,10 @@ streams) build on it.
 
 ## Rules
 
-- Crypto primitives and the secure random source come from Quartz (`com.vitorpamplona.quartz`).
-  Don't reimplement them here; if one is missing, add it to Quartz.
+- Crypto primitives and the secure random source come from
+  [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp) (`com.vitorpamplona.crypto`). Don't
+  reimplement them here; if one is missing, add it there. To change both together, build against
+  a local checkout with `-PcryptoKmpDir=../crypto-kmp`.
 - `commonMain` and `commonTest` stay free of JVM-only APIs, so more targets can be added. CI and the
   pre-push hook compile both for a native target with
   `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64`; plain `jvm`/`android` builds don't
@@ -30,10 +32,9 @@ streams) build on it.
   socket, ciphers, TLS transcript hash, lock, certificate validators) has JVM actuals only.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
   major version. Amethyst pins a version, so a breaking change also needs a matching change in
-  Amethyst's `nestsClient` / `marmotQuic`.
-- Log through `QuicLog` (`QuicLog.d(TAG) { "…$x" }`), never Quartz's `Log`: the library logs
-  nothing until the app sets `QuicLog.sink`. Read wall-clock time from `kotlin.time.Clock` or an
-  injected source, not Quartz's `TimeUtils`. Quartz is a dependency for crypto only.
+  Amethyst's `nestsClient` / `marmotQuic`. crypto-kmp is pinned in `gradle/libs.versions.toml`.
+- Log through `QuicLog` (`QuicLog.d(TAG) { "…$x" }`): the library logs nothing until the app sets
+  `QuicLog.sink`. Read wall-clock time from `kotlin.time.Clock` or an injected source.
 - Before pushing: `./gradlew spotlessApply` and
   `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test` (the pre-push hook runs
   these plus the `commonMain` check).

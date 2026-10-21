@@ -20,7 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
-import com.vitorpamplona.quartz.utils.RandomInstance
+import com.vitorpamplona.crypto.random.RandomInstance
 
 /**
  * QUIC connection identifier per RFC 9000 §5.1.
