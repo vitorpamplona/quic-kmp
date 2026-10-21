@@ -3,11 +3,11 @@ agp = "9.4.1"
 android-compileSdk = "37"
 android-minSdk = "26"
 cryptoKmp = "1.0.0"
-jacksonModuleKotlin = "2.22.3"
-kotlin = "2.4.20"
+jacksonModuleKotlin = "2.22.4"
+kotlin = "2.4.21"
 kotlinxCoroutines = "1.11.0"
 mavenPublish = "0.37.0"
-spotless = "8.10.3"
+spotless = "8.10.4"
 
 [libraries]
 crypto = { module = "com.vitorpamplona.crypto:crypto", version.ref = "cryptoKmp" }
