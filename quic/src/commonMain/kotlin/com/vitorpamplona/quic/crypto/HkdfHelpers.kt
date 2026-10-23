@@ -32,7 +32,7 @@ import com.vitorpamplona.crypto.sha2.sha256
  * primitive isn't yet in Quartz and nests / mainstream HTTP/3 servers all
  * accept the SHA-256 suites by default.
  */
-val HKDF: Hkdf = Hkdf("HmacSHA256", 32)
+val HKDF: Hkdf = Hkdf("HmacSHA256")
 
 /** Empty-string SHA-256 — RFC 8446's "transcript hash of nothing" sentinel. */
 val EMPTY_SHA256: ByteArray = sha256(ByteArray(0))

@@ -2,7 +2,7 @@
 agp = "9.4.1"
 android-compileSdk = "37"
 android-minSdk = "26"
-cryptoKmp = "1.0.0"
+cryptoKmp = "2.0.0"
 jacksonModuleKotlin = "2.22.4"
 kotlin = "2.4.21"
 kotlinxCoroutines = "1.11.0"
