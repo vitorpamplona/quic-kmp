@@ -2,9 +2,10 @@
 
 A from-scratch, pure-Kotlin QUIC v1 + HTTP/3 + QPACK + WebTransport client, published to Maven
 Central as `com.vitorpamplona.quic:quic`. It started inside
-[Amethyst](https://github.com/vitorpamplona/amethyst) (as `:quic`), which is still its main
-consumer: `nestsClient` (audio rooms over MoQ/WebTransport) and `marmotQuic` (Marmot agent
-streams) build on it.
+[Amethyst](https://github.com/vitorpamplona/amethyst) (as `:quic`). Its consumers are Amethyst's
+`nestsClient` (audio rooms over MoQ/WebTransport) and marmot-kmp's `marmot-quic` (Marmot agent
+streams over raw QUIC, its own ALPNs). Neither protocol belongs here: MoQ stays in `nestsClient`,
+Marmot's binding in marmot-kmp.
 
 ## Layout
 
@@ -31,8 +32,8 @@ streams) build on it.
   spaces, `-` and `_` only (Kotlin/Native rejects `()`, `,`, `.`, `:`, `/`, `#` and others). JVM-only tests go in `jvmTest`. The platform layer (UDP
   socket, ciphers, TLS transcript hash, lock, certificate validators) has JVM actuals only.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
-  major version. Amethyst pins a version, so a breaking change also needs a matching change in
-  Amethyst's `nestsClient` / `marmotQuic`. crypto-kmp is pinned in `gradle/libs.versions.toml`.
+  major version. Amethyst and marmot-kmp pin a version, so a breaking change also needs a matching
+  change in Amethyst's `nestsClient` and marmot-kmp's `marmot-quic`. crypto-kmp is pinned in `gradle/libs.versions.toml`.
 - Log through `QuicLog` (`QuicLog.d(TAG) { "…$x" }`): the library logs nothing until the app sets
   `QuicLog.sink`. Read wall-clock time from `kotlin.time.Clock` or an injected source.
 - Before pushing: `./gradlew spotlessApply` and
