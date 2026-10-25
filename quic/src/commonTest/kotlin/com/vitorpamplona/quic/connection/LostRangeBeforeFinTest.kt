@@ -76,6 +76,44 @@ class LostRangeBeforeFinTest {
         }
 
     @Test
+    fun `a closed stream with no credit left still resends a lost range`() =
+        runBlocking {
+            // The quic-go failures: a response stream whose request was FIN'd
+            // (so the stream counts as closed once our FIN goes out), sending
+            // exactly its credit. The lost range must still go out.
+            val payload = ByteArray(6_000) { it.toByte() }
+            val (client, pipe) = newConnectedClient(maxStreamData = payload.size.toLong())
+            drainAndAckEverything(client, pipe)
+
+            val stream = client.openBidiStream()
+            val peerFin = pipe.buildServerApplicationDatagram(listOf(StreamFrame(stream.streamId, 0L, "request".encodeToByteArray(), fin = true)))!!
+            feedDatagram(client, peerFin, nowMillis = 0L)
+            stream.send.enqueue(payload)
+            stream.send.finish()
+
+            val sent = mutableListOf<Long>()
+            while (true) {
+                val out = drainOutbound(client, nowMillis = 0L) ?: break
+                pipe.decryptClientApplicationFrames(out)
+                sent += client.application.pnSpace.nextPacketNumber - 1L
+            }
+            assertTrue(stream.isClosed)
+            assertEquals(stream.sendCredit, stream.send.sentOffset, "the stream used all its credit")
+
+            ack(client, pipe, largest = sent.last(), firstRange = 0L)
+            assertTrue(stream.send.hasRetransmit)
+
+            val resent = mutableListOf<StreamFrame>()
+            while (true) {
+                val out = drainOutbound(client, nowMillis = 0L) ?: break
+                pipe.decryptClientApplicationFrames(out)!!.filterIsInstance<StreamFrame>().filterTo(resent) { it.streamId == stream.streamId }
+            }
+            assertTrue(resent.isNotEmpty(), "the lost range is retransmitted")
+            assertEquals(0L, resent.minOf { it.offset })
+            assertFalse(stream.send.hasRetransmit)
+        }
+
+    @Test
     fun `an idle connection does not arm the PTO`() =
         runBlocking {
             val (client, pipe) = newConnectedClient()

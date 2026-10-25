@@ -179,6 +179,10 @@ class SendBuffer(
     val finSent: Boolean get() = _finSent
     val finAcked: Boolean get() = _finAcked
 
+    /** A lost range waits to be resent; it needs no new flow-control credit. */
+    val hasRetransmit: Boolean
+        get() = synchronized(lock) { retransmit.isNotEmpty() }
+
     /**
      * The FIN and every byte before it were acknowledged. The FIN can be ACK'd
      * while an earlier range is still lost and waiting for its retransmit, so

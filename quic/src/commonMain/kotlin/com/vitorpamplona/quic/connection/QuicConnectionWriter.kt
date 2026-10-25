@@ -1056,9 +1056,11 @@ private fun buildApplicationPacket(
         // list. N is small (1–10 in the moq-lite audio path) but the
         // multiplexing interop testcase pushes N to ~2000, so we
         // optimize:
-        //   1. filter out streams that are fully closed (no data + no
-        //      retransmits coming) — drops "done" streams from the
+        //   1. filter out streams with nothing left to send (FIN sent,
+        //      no lost range queued) — drops "done" streams from the
         //      walk, which is most of them under bursty interop loads.
+        //      Not [QuicStream.isClosed]: a closed stream can still owe
+        //      the retransmit of a range lost before its FIN.
         //   2. skip the sort entirely when every stream has the
         //      default priority (the common case) — preserving the
         //      insertion-ordered round-robin shape.
@@ -1070,8 +1072,8 @@ private fun buildApplicationPacket(
         // hand back the same N elements. Quick `any` scan first; only
         // pay for the filter list when at least one stream is closed.
         val active =
-            if (streamsView.any { it.isClosed }) {
-                streamsView.filter { !it.isClosed }
+            if (streamsView.any { it.sendDrained }) {
+                streamsView.filter { !it.sendDrained }
             } else {
                 streamsView
             }
@@ -1116,8 +1118,11 @@ private fun buildApplicationPacket(
                 // (zero-byte) chunks may still go through because they don't
                 // consume credit.
                 if (streamRemaining <= 0L || connBudget <= 0L) creditLimited = true
-                if (streamRemaining <= 0L && connBudget <= 0L && !stream.send.finPending) continue
-                val effectiveCap = minOf(streamRemaining, connBudget)
+                // Resent bytes were already counted against both limits, and the
+                // peer may be holding its credit back until this gap fills.
+                val retransmitting = stream.send.hasRetransmit
+                if (!retransmitting && streamRemaining <= 0L && connBudget <= 0L && !stream.send.finPending) continue
+                val effectiveCap = if (retransmitting) Long.MAX_VALUE else minOf(streamRemaining, connBudget)
                 val maxBytes =
                     minOf(packetBudget - frameHeader, effectiveCap.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
                 val chunk = stream.send.takeChunk(maxBytes = maxBytes) ?: continue
@@ -1184,7 +1189,7 @@ private fun buildApplicationPacket(
         val streamFrameCount = frames.count { it is StreamFrame }
         val totalFrames = frames.size
         val streamsViewSize = conn.streamsListLocked().size
-        val activeSize = conn.streamsListLocked().count { !it.isClosed }
+        val activeSize = conn.streamsListLocked().count { !it.sendDrained }
         QuicLog.d("QuicWriter") {
             "[writer.app] frames=$totalFrames stream_frames=$streamFrameCount " +
                 "streamsView=$streamsViewSize active=$activeSize " +

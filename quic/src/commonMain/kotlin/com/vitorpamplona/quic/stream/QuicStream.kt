@@ -217,6 +217,10 @@ class QuicStream(
     val isClosed: Boolean
         get() = send.finSent && receive.finReceived
 
+    /** Everything up to and including the FIN went out once and nothing lost waits to be resent. */
+    internal val sendDrained: Boolean
+        get() = send.finSent && !send.hasRetransmit
+
     /**
      * True once both directions are *fully* settled and the stream may be
      * removed from the connection's tracking lists (see
