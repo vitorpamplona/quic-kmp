@@ -1,6 +1,6 @@
 # Server role for `:quic`
 
-> **Status:** S1–S5 done; S6 done except a server preferred address — 2026-10-25.
+> **Status:** S1–S6 done — 2026-10-25.
 
 ## Why
 
@@ -75,9 +75,12 @@ address.
   the new one. An unanswered challenge moves it back after 3 PTO.
 - NEW_TOKEN: once confirmed, the server sends a token bound to the client's IP (24 h); an Initial
   carrying it counts as validated, so it skips the Retry and the 3x limit.
+- Preferred address: a second `QuicServerTransport`; a server path is (transport, client
+  address), so a client moving there is followed like a rebinding.
+- `maxConnections`: past it, a new client gets an Initial CONNECTION_CLOSE with
+  CONNECTION_REFUSED, built by a throwaway connection that holds only the Initial keys.
 - Not yet: amplification limits on a migrated-to path (the writer can't yet build a datagram
-  smaller than the PMTU to fit one), a server preferred address, a cap on concurrent connections
-  or handshakes.
+  smaller than the PMTU to fit one), a separate cap on handshakes in progress.
 
 Found on the way and fixed for the client too: stream credit followed arrival rather than
 consumption (a fast sender overflowed the 64-chunk app channel and the connection died), 1-RTT

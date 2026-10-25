@@ -122,12 +122,14 @@ class QuicServerTest {
         network: Network,
         requireRetry: Boolean = false,
         versions: List<Int> = listOf(QuicVersion.V1),
+        maxConnections: Int = 10_000,
     ) = QuicServer(
         QuicServerConfig(
             signer = signer,
             alpnSelector = { offered -> offered.firstOrNull { it.contentEquals(TlsConstants.ALPN_H3) } },
             requireRetry = requireRetry,
             supportedVersions = versions,
+            maxConnections = maxConnections,
         ),
         network,
         scope,
@@ -218,6 +220,21 @@ class QuicServerTest {
             // Same IP, another port: the token is bound to the address only.
             val second = echoOnce(server, client(network, 5006, token = saved))
             assertEquals(null, second.connection.serverSetup?.retrySourceConnectionId)
+        }
+
+    @Test
+    fun `a client past the connection limit is refused`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network, maxConnections = 1)
+            echoOnce(server, client(network, 5009))
+            val refused = client(network, 5010)
+            val failure = runCatching { withTimeout(5_000) { refused.awaitHandshake() } }.exceptionOrNull()
+            assertNotNull(failure)
+            // A peer's CONNECTION_CLOSE puts the client in draining (RFC 9000 §10.2.2).
+            assertTrue(refused.status == QuicConnection.Status.DRAINING || refused.status == QuicConnection.Status.CLOSED)
+            assertTrue(refused.closeReason?.contains("connection limit") == true, "closed with: ${refused.closeReason}")
+            assertEquals(1, server.connectionCount)
         }
 
     @Test

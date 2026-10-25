@@ -100,8 +100,10 @@ class QuicServer(
     private val resetTokens = StatelessResetTokens()
     private val readJobs = ArrayList<Job>()
 
-    /** Connections currently routed. */
-    val connectionCount: Int get() = synchronized(lock) { routes.values.toSet().size }
+    private var liveConnections = 0
+
+    /** Connections currently running. */
+    val connectionCount: Int get() = synchronized(lock) { liveConnections }
 
     fun start() {
         for ((local, t) in transports.withIndex()) {
@@ -182,11 +184,29 @@ class QuicServer(
             // gets the same treatment as none.
             if (retry == null) returning = tokens.openNewToken(header.token, d.from, now)
         }
+        if (synchronized(lock) { liveConnections } >= config.maxConnections) {
+            refuse(header, d)
+            return
+        }
         if (retry == null && !returning && config.requireRetry) {
             sendRetry(header, d.from, now)
             return
         }
         startConnection(header, d, retry, returning)
+    }
+
+    /**
+     * RFC 9000 §10.2: an Initial CONNECTION_CLOSE with CONNECTION_REFUSED, from
+     * a throwaway connection that only holds the Initial keys.
+     */
+    private suspend fun refuse(
+        header: LongHeader,
+        d: ReceivedDatagram,
+    ) {
+        val conn = newConnection(header, d, ServerPeerSocket(transports, d.from), retry = null, returning = false, register = false)
+        conn.markClosedExternally("server at its connection limit", com.vitorpamplona.quic.frame.QuicTransportError.CONNECTION_REFUSED)
+        conn.takeFinalCloseDatagram()?.let { transport.send(it, d.from) }
+        QuicLog.d(TAG) { "refused ${d.from}: ${config.maxConnections} connections" }
     }
 
     private fun startConnection(
@@ -195,9 +215,39 @@ class QuicServer(
         retry: AddressTokens.Retry?,
         returning: Boolean,
     ) {
+        val socket = ServerPeerSocket(transports, d.from)
+        val conn = newConnection(header, d, socket, retry, returning, register = true)
+        val driver = QuicConnectionDriver(conn, socket, scope)
+        val accepted = QuicServerConnection(conn, driver, socket)
+        socket.owner = accepted
+        synchronized(lock) {
+            routes[header.dcid] = socket
+            routes[conn.sourceConnectionId] = socket
+            liveConnections++
+        }
+        conn.onTerminated = {
+            synchronized(lock) {
+                routes.entries.removeAll { it.value === socket }
+                liveConnections--
+            }
+            driver.close()
+        }
+        driver.start()
+        socket.deliver(d, 0)
+        this.accepted.trySend(accepted)
+        QuicLog.d(TAG) { "accepted ${d.from} odcid=${conn.originalDestinationConnectionId.toHex()} version=${QuicVersion.name(header.version)} retry=${retry != null}" }
+    }
+
+    private fun newConnection(
+        header: LongHeader,
+        d: ReceivedDatagram,
+        socket: ServerPeerSocket,
+        retry: AddressTokens.Retry?,
+        returning: Boolean,
+        register: Boolean,
+    ): QuicConnection {
         val localCid = ConnectionId.random(config.connectionIdLength)
         val odcid = retry?.originalDestinationConnectionId ?: header.dcid
-        val socket = ServerPeerSocket(transports, d.from)
         var connRef: QuicConnection? = null
         val setup =
             QuicServerSetup(
@@ -223,7 +273,7 @@ class QuicServer(
                 addressValidated = retry != null || returning,
                 statelessResetTokenFor = resetTokens::tokenFor,
                 supportedVersions = config.supportedVersions,
-                onConnectionIdIssued = { cid -> synchronized(lock) { routes[cid] = socket } },
+                onConnectionIdIssued = { cid -> if (register) synchronized(lock) { routes[cid] = socket } },
                 onConnectionIdRetired = { cid -> synchronized(lock) { if (routes[cid] === socket) routes.remove(cid) } },
                 peerAddress = d.from,
                 newTokenFactory = if (config.issueNewTokens) ({ tokens.mintNewToken(d.from, epochMillis()) }) else null,
@@ -248,21 +298,7 @@ class QuicServer(
                 serverSetup = setup,
             )
         connRef = conn
-        val driver = QuicConnectionDriver(conn, socket, scope)
-        val accepted = QuicServerConnection(conn, driver, socket)
-        socket.owner = accepted
-        synchronized(lock) {
-            routes[header.dcid] = socket
-            routes[localCid] = socket
-        }
-        conn.onTerminated = {
-            synchronized(lock) { routes.entries.removeAll { it.value === socket } }
-            driver.close()
-        }
-        driver.start()
-        socket.deliver(d, 0)
-        this.accepted.trySend(accepted)
-        QuicLog.d(TAG) { "accepted ${d.from} odcid=${odcid.toHex()} version=${QuicVersion.name(header.version)} retry=${retry != null}" }
+        return conn
     }
 
     /** RFC 9000 §17.2.1. */

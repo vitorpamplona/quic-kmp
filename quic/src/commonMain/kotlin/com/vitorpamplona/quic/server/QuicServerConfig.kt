@@ -40,6 +40,11 @@ class QuicServerConfig(
     val supportedVersions: List<Int> = listOf(QuicVersion.V1),
     /** Answer every new Initial without a valid token with a Retry (RFC 9000 §8.1.2). */
     val requireRetry: Boolean = false,
+    /**
+     * Connections the server runs at once; a client past it gets
+     * CONNECTION_REFUSED (RFC 9000 §20.1) instead of a handshake.
+     */
+    val maxConnections: Int = 10_000,
     /** Give each client a NEW_TOKEN token, so its next connection skips address validation (RFC 9000 §8.1.3). */
     val issueNewTokens: Boolean = true,
     /** Enables session tickets and resumption. */
