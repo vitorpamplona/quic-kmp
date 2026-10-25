@@ -1644,7 +1644,22 @@ class QuicConnection(
             initialSourceConnectionId = sourceConnectionId.bytes,
             maxDatagramFrameSize = config.maxDatagramFrameSize,
             versionInformation = offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(initialVersion, it) },
+            unknown = if (config.greaseTransportParameters) greaseTransportParameter() else emptyMap(),
         )
+
+    /** One reserved transport parameter, id 31*N+27 (RFC 9000 §18.1), with a few random bytes. */
+    private fun greaseTransportParameter(): Map<Long, ByteArray> {
+        val random =
+            com.vitorpamplona.crypto.random.RandomInstance
+                .bytes(3)
+        val n = (random[0].toLong() and 0xFF) or ((random[1].toLong() and 0x7F) shl 8)
+        val id = 31L * n + 27L
+        return mapOf(
+            id to
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes((random[2].toInt() and 0x07) + 1),
+        )
+    }
 
     /**
      * Lock-split refactor (2026-05-08): caller must hold [streamsLock]

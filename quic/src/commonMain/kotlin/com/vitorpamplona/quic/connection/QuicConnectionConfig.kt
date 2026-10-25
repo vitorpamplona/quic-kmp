@@ -81,4 +81,17 @@ data class QuicConnectionConfig(
      * [QuicConnectionDriver], which opens the socket toward the new address.
      */
     val migrateToPreferredAddress: Boolean = true,
+    /**
+     * Send a PING after this much quiet time, so NAT bindings and the idle
+     * timeout (RFC 9000 §10.1.2) don't end a connection the application
+     * wants to keep. 0 disables it. Pick something below both the idle
+     * timeout and typical NAT expiry (~30 s for UDP).
+     */
+    val keepAliveIntervalMillis: Long = 0L,
+    /**
+     * RFC 9000 §18.1: add one reserved transport parameter (id 31*N+27, random
+     * value) to exercise peers' handling of unknown parameters, as other
+     * stacks do to keep the extension point from ossifying.
+     */
+    val greaseTransportParameters: Boolean = true,
 )

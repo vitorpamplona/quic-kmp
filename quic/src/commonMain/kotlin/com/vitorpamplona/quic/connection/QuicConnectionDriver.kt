@@ -430,6 +430,14 @@ class QuicConnectionDriver(
             // which wakes us, or the PTO.)
             val pacingDelta =
                 connection.pacingDelayMillis(nowForLossTimer).takeIf { it > 0L && !connection.congestionBlocked() }
+            // Keep-alive: a PING once the connection has been quiet this long.
+            val keepAliveMs = connection.config.keepAliveIntervalMillis
+            val keepAliveDelta =
+                if (keepAliveMs > 0L && connection.handshakeConfirmed && connection.status == QuicConnection.Status.CONNECTED) {
+                    (connection.lastActivityMs + keepAliveMs - nowForLossTimer).coerceAtLeast(0L)
+                } else {
+                    null
+                }
             // RFC 9000 §13.2.1: a delayed application ACK falls due at max_ack_delay.
             val ackDelta =
                 connection.application.ackTracker
@@ -445,6 +453,7 @@ class QuicConnectionDriver(
                     probeDelta ?: Long.MAX_VALUE,
                     pacingDelta ?: Long.MAX_VALUE,
                     ackDelta ?: Long.MAX_VALUE,
+                    keepAliveDelta ?: Long.MAX_VALUE,
                 )
             // Suspend until either: a wakeup arrives, or the timer expires.
             val woke =
@@ -473,6 +482,12 @@ class QuicConnectionDriver(
                     connection.markClosedExternally(
                         "idle timeout ($idleTimeoutMs ms with no activity)",
                     )
+                    continue
+                }
+                if (keepAliveDelta != null && keepAliveDelta < ptoMillis && (nextLossDelta == null || keepAliveDelta < nextLossDelta) &&
+                    nowMillis() - connection.lastActivityMs >= keepAliveMs
+                ) {
+                    connection.pendingPing = true
                     continue
                 }
                 // The pacer's or the ACK timer woke us: just drain again.
