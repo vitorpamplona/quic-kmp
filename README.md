@@ -1,5 +1,12 @@
 # QUIC for Kotlin Multiplatform
 
+[![GitHub downloads](https://img.shields.io/github/downloads/vitorpamplona/quic-kmp/total?label=Downloads&labelColor=27303D&color=0D1117&logo=github&logoColor=FFFFFF&style=flat)](https://github.com/vitorpamplona/quic-kmp/releases)
+[![Last Version](https://img.shields.io/github/release/vitorpamplona/quic-kmp.svg?maxAge=3600&label=Stable&labelColor=06599d&color=043b69)](https://github.com/vitorpamplona/quic-kmp/releases/latest)
+[![Maven Central](https://img.shields.io/maven-central/v/com.vitorpamplona.quic/quic?label=Maven%20Central&labelColor=27303D&color=0877d2)](https://central.sonatype.com/artifact/com.vitorpamplona.quic/quic)
+[![JitPack snapshots](https://img.shields.io/badge/snapshots-JitPack-27303D?labelColor=27303D&color=0877d2)](https://jitpack.io/#vitorpamplona/quic-kmp)
+[![CI](https://img.shields.io/github/actions/workflow/status/vitorpamplona/quic-kmp/build.yml?labelColor=27303D)](https://github.com/vitorpamplona/quic-kmp/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/github/license/vitorpamplona/quic-kmp?labelColor=27303D&color=0877d2)](LICENSE)
+
 A pure-Kotlin **QUIC v1 client** with **HTTP/3**, **QPACK** and **WebTransport** building blocks,
 for the JVM and Android. No JNI, no BouncyCastle, no native QUIC library: the TLS 1.3 handshake,
 packet protection, loss recovery, flow control and stream machinery are all Kotlin. The platform's
