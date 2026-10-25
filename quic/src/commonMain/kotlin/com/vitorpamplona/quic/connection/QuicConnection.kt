@@ -165,6 +165,16 @@ class QuicConnection(
      * latest.
      */
     val onResumptionTicket: ((com.vitorpamplona.quic.tls.TlsResumptionState) -> Unit)? = null,
+    /**
+     * RFC 9000 §8.1.3: a token a previous connection to this server received
+     * in a NEW_TOKEN frame ([onNewToken]). Sent in the first Initial so the
+     * server can validate our address without a Retry round trip. A Retry
+     * token replaces it. Tokens are bound to the QUIC version that issued
+     * them (RFC 9369 §5).
+     */
+    val addressValidationToken: ByteArray? = null,
+    /** Called with each NEW_TOKEN the server sends, for a future [addressValidationToken]. */
+    val onNewToken: ((ByteArray) -> Unit)? = null,
 ) {
     val sourceConnectionId: ConnectionId = ConnectionId.random(8)
     var destinationConnectionId: ConnectionId = ConnectionId.random(8)

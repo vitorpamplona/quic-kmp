@@ -653,11 +653,12 @@ private fun buildLongHeaderFromFrames(
     val type = if (level == EncryptionLevel.INITIAL) LongHeaderType.INITIAL else LongHeaderType.HANDSHAKE
     // RFC 9000 §17.2.5.1: after a Retry, every Initial we send MUST carry
     // the server-issued Retry token verbatim in the Initial header's Token
-    // field. Handshake packets have no Token field, so this only affects
+    // field. Before one, a NEW_TOKEN from an earlier connection goes there
+    // (§8.1.3). Handshake packets have no Token field, so this only affects
     // Initial-level builds.
     val token =
         if (type == LongHeaderType.INITIAL) {
-            conn.retryToken ?: ByteArray(0)
+            conn.retryToken ?: conn.addressValidationToken ?: ByteArray(0)
         } else {
             ByteArray(0)
         }

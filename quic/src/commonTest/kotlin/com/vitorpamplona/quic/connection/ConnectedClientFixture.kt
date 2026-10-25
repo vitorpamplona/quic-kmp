@@ -64,6 +64,7 @@ fun newConnectedClient(
     /** Server `preferred_address` transport parameter (RFC 9000 §9.6). */
     preferredAddress: PreferredAddress? = null,
     migrateToPreferredAddress: Boolean = true,
+    onNewToken: ((ByteArray) -> Unit)? = null,
 ): Pair<QuicConnection, InMemoryQuicPipe> =
     runBlocking {
         val client =
@@ -80,6 +81,7 @@ fun newConnectedClient(
                         migrateToPreferredAddress = migrateToPreferredAddress,
                     ),
                 tlsCertificateValidator = PermissiveCertificateValidator(),
+                onNewToken = onNewToken,
             )
         val serverScid = ConnectionId.random(8)
         val tlsServer =

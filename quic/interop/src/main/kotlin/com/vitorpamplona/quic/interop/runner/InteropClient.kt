@@ -800,8 +800,10 @@ private fun runResumptionTest(
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val outcome =
         runBlocking {
-            // Connection 1 — full handshake, capture session ticket.
+            // Connection 1 — full handshake, capture session ticket (and any
+            // NEW_TOKEN, which connection 2 presents for address validation).
             var capturedTicket: com.vitorpamplona.quic.tls.TlsResumptionState? = null
+            var capturedToken: ByteArray? = null
             val outcome1 =
                 runOneResumptionConnection(
                     iterIdx = 0,
@@ -816,6 +818,7 @@ private fun runResumptionTest(
                     scope = scope,
                     resumption = null,
                     onTicket = { capturedTicket = it },
+                    onNewToken = { capturedToken = it },
                 )
             if (outcome1 != "ok") return@runBlocking "resumption[0] $outcome1"
             if (capturedTicket == null) return@runBlocking "resumption[0] no_ticket"
@@ -840,6 +843,7 @@ private fun runResumptionTest(
                     scope = scope,
                     resumption = capturedTicket,
                     onTicket = { /* could refresh, but the test is done */ },
+                    addressValidationToken = capturedToken,
                 )
             if (outcome2 != "ok") return@runBlocking "resumption[1] $outcome2"
             "ok"
@@ -874,6 +878,8 @@ private suspend fun runOneResumptionConnection(
     scope: CoroutineScope,
     resumption: com.vitorpamplona.quic.tls.TlsResumptionState?,
     onTicket: (com.vitorpamplona.quic.tls.TlsResumptionState) -> Unit,
+    onNewToken: ((ByteArray) -> Unit)? = null,
+    addressValidationToken: ByteArray? = null,
 ): String {
     val first = urls[0]
     val host = first.host
@@ -914,6 +920,8 @@ private suspend fun runOneResumptionConnection(
             qlogObserver = qlogWriter ?: com.vitorpamplona.quic.observability.QlogObserver.NoOp,
             resumption = resumption,
             onResumptionTicket = onTicket,
+            onNewToken = onNewToken,
+            addressValidationToken = addressValidationToken,
         )
     val driver = QuicConnectionDriver(conn, socket, scope)
     driver.start()

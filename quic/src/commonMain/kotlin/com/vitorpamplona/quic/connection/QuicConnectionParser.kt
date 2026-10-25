@@ -1160,8 +1160,17 @@ private fun dispatchFrames(
             }
 
             is NewTokenFrame -> {
-                // Round-4 #2: 0-RTT/resumption token. Out-of-scope; drop.
+                // RFC 9000 §19.7: an address-validation token for a future
+                // connection. An empty one is a FRAME_ENCODING_ERROR.
                 ackEliciting = true
+                if (frame.token.isEmpty()) {
+                    conn.markClosedExternally(
+                        "FRAME_ENCODING_ERROR: empty NEW_TOKEN",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FRAME_ENCODING_ERROR,
+                    )
+                    return
+                }
+                conn.onNewToken?.invoke(frame.token)
             }
 
             is NewConnectionIdFrame -> {
