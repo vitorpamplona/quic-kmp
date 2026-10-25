@@ -207,7 +207,8 @@ class Http3GetClient(
                 }
             }
         }
-        return GetResponse(status = status, body = concat(body))
+        // A connection teardown also ends `incoming`; only a FIN means the response is whole.
+        return GetResponse(status = if (stream.receive.finReceived) status else 0, body = concat(body))
     }
 }
 

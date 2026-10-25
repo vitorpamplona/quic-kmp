@@ -32,9 +32,9 @@ case "${ROLE:-client}" in
         exec /opt/quic-interop/bin/quic-interop
         ;;
     server)
-        # Phase 0: server role unimplemented. Exit 127 so the runner skips.
-        echo "server role not implemented" >&2
-        exit 127
+        # Serves /www on UDP 443 with /certs; exits 127 for testcases it
+        # doesn't play, which the runner reports as unsupported.
+        exec /opt/quic-interop/bin/quic-interop
         ;;
     *)
         echo "unknown ROLE=${ROLE}" >&2

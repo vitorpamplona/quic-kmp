@@ -79,7 +79,9 @@ class HqInteropGetClient(
             c.copyInto(body, off)
             off += c.size
         }
-        return GetResponse(status = if (body.isEmpty()) 0 else 200, body = body)
+        // HTTP/0.9 has no status or length: only the FIN says the body is
+        // whole. A connection teardown also ends `incoming`, without one.
+        return GetResponse(status = if (stream.receive.finReceived) 200 else 0, body = body)
     }
 }
 

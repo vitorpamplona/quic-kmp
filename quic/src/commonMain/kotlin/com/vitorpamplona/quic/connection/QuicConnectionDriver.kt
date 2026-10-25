@@ -140,6 +140,7 @@ class QuicConnectionDriver(
     private val closeJob: AtomicReference<Job?> = AtomicReference(null)
 
     fun start() {
+        connection.sendWakeup = ::wakeup
         connection.start()
         // Wire the diagnostic UDP-stats supplier so
         // QuicConnection.flowControlSnapshot can surface

@@ -152,8 +152,9 @@ fun main() {
     }
 
     val role = System.getenv("ROLE") ?: "client"
+    if (role == "server") exitProcess(runInteropServer(System.getenv("TESTCASE")?.trim().orEmpty()))
     if (role != "client") {
-        System.err.println("server role not implemented")
+        System.err.println("unknown ROLE=$role")
         exitProcess(EXIT_UNSUPPORTED)
     }
 
@@ -1261,6 +1262,13 @@ internal class SslKeyLogger(
             ) {
                 pending += "CLIENT_TRAFFIC_SECRET_0" to clientSecret
                 pending += "SERVER_TRAFFIC_SECRET_0" to serverSecret
+            }
+
+            override fun onEarlyDataKeysReady(
+                cipherSuite: Int,
+                clientEarlySecret: ByteArray,
+            ) {
+                pending += "CLIENT_EARLY_TRAFFIC_SECRET" to clientEarlySecret
             }
 
             override fun onHandshakeComplete() = Unit

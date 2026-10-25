@@ -222,6 +222,13 @@ class QuicConnection internal constructor(
     /** True for the server side of a connection. */
     val isServer: Boolean get() = serverSetup != null
 
+    /** Wakes the driver's send loop; set by [QuicConnectionDriver.start]. */
+    @kotlin.concurrent.Volatile
+    internal var sendWakeup: (() -> Unit)? = null
+
+    /** The application read stream data: the writer may owe the peer more credit. */
+    private val onStreamConsumed: () -> Unit = { sendWakeup?.invoke() }
+
     /** Called once when the connection terminates; a server endpoint drops its routes. */
     internal var onTerminated: (() -> Unit)? = null
 
@@ -1286,6 +1293,7 @@ class QuicConnection internal constructor(
                 // RFC 9000 §7.4: the client's parameters arrive in its
                 // ClientHello, before our first Handshake packet; check them
                 // now so a bad set never gets a response at that level.
+                extraSecretsListener?.onHandshakeKeysReady(cipherSuite, clientSecret, serverSecret)
                 if (isServer) applyPeerTransportParameters()
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.HANDSHAKE)
                 qlogObserver.onKeyUpdated("server", EncryptionLevel.HANDSHAKE)
@@ -1302,6 +1310,7 @@ class QuicConnection internal constructor(
                 // 9001 §4.10 forbids using 0-RTT keys once 1-RTT is
                 // available).
                 zeroRttVersion = currentVersion
+                extraSecretsListener?.onEarlyDataKeysReady(cipherSuite, clientEarlySecret)
                 if (isServer) {
                     zeroRttReceiveProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret, currentVersion)
                     return
@@ -1376,6 +1385,7 @@ class QuicConnection internal constructor(
                 appCipherSuite = cipherSuite
                 appReceiveSecret = receiveSecret.copyOf()
                 appSendSecret = sendSecret.copyOf()
+                extraSecretsListener?.onApplicationKeysReady(cipherSuite, clientSecret, serverSecret)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.APPLICATION)
                 qlogObserver.onKeyUpdated("server", EncryptionLevel.APPLICATION)
             }
@@ -2128,6 +2138,7 @@ class QuicConnection internal constructor(
         val stream = QuicStream(id, QuicStream.Direction.BIDIRECTIONAL)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataBidiRemote ?: config.initialMaxStreamDataBidiRemote
         stream.receiveLimit = config.initialMaxStreamDataBidiLocal
+        stream.consumptionListener = onStreamConsumed
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -2163,6 +2174,7 @@ class QuicConnection internal constructor(
         val stream = QuicStream(id, QuicStream.Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE, bestEffort = bestEffort)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataUni ?: config.initialMaxStreamDataUni
         stream.receiveLimit = 0L // can't receive
+        stream.consumptionListener = onStreamConsumed
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -2538,6 +2550,7 @@ class QuicConnection internal constructor(
                 !local -> config.initialMaxStreamDataBidiRemote
                 else -> config.initialMaxStreamDataBidiLocal
             }
+        stream.consumptionListener = onStreamConsumed
         streams[id] = stream
         streamsList = streamsList + stream
         newPeerStreams.addLast(stream)

@@ -1377,6 +1377,13 @@ private fun appendFlowControlUpdates(
         tokens += RecoveryToken.HandshakeDone
     }
 
+    // 1-RTT CRYPTO: what TLS sends after the handshake, a server's
+    // NewSessionTicket (RFC 8446 §4.6.1). Reliable like any CRYPTO.
+    conn.application.cryptoSend.takeChunk(maxBytes = 1000)?.takeIf { it.data.isNotEmpty() }?.let { chunk ->
+        frames += CryptoFrame(chunk.offset, chunk.data)
+        tokens += RecoveryToken.Crypto(level = EncryptionLevel.APPLICATION, offset = chunk.offset, length = chunk.data.size.toLong())
+    }
+
     // RFC 9000 §19.16 RETIRE_CONNECTION_ID. Drain pending retires;
     // the dispatcher re-queues on loss until the peer ACKs.
     while (conn.pathValidator.pendingRetireSequences.isNotEmpty()) {
@@ -1439,7 +1446,9 @@ private fun appendFlowControlUpdates(
     // new MAX_STREAM_DATA frame.
     for (stream in conn.streamsListLocked()) {
         val id = stream.streamId
-        val rcv = stream.receive.contiguousEnd()
+        // Credit follows what the application consumed, not what arrived:
+        // a slow reader holds the peer to one window ahead of it.
+        val rcv = stream.consumedBytes
         if (rcv == 0L) continue
         if (!stream.receiveDirtyForFlowControl) {
             // Stream has data but nothing changed since last drain — skip the

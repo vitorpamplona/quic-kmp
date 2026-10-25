@@ -75,12 +75,12 @@ class QuicStream(
     /**
      * Bytes received and confirmed contiguous, exposed as a flow to the consumer.
      *
-     * Bounded buffer (64 chunks). The producer (parser) uses [trySend] and
-     * surfaces saturation by setting [overflowed]; the parser checks this flag
-     * after each delivery and tears the connection down with INTERNAL_ERROR
-     * rather than silently dropping bytes. Pre-audit-4 the failed `trySend`
-     * was discarded, leaving a hole in the stream that the application could
-     * never know about.
+     * Back-pressure is flow control: the channel itself is unbounded, and
+     * the stream's receive window only advances past [consumedBytes], so the
+     * peer can never get more than one window ahead of the application.
+     * (Before, a 64-chunk channel overflowed under a fast sender — anything
+     * past a few hundred KB in flight on loopback — and the connection was
+     * closed with INTERNAL_ERROR.)
      *
      * **Resilience to collector cancellation.** Pre-fix this exposed
      * [incomingChannel] via `consumeAsFlow()`, which cancels the
@@ -97,11 +97,8 @@ class QuicStream(
      * collector picks up at `channel.receive()` — i.e. from the
      * current head, not the start).
      *
-     * Producer back-pressure unchanged: the channel buffer is still
-     * 64 chunks, [trySend] still sets [overflowed] on saturation,
-     * and the parser still closes the connection if the application
-     * fails to drain. The looser contract just permits the previously-
-     * disallowed pattern of "stop reading temporarily, then resume".
+     * A reader that stops for a while just stops the peer's sending on
+     * this stream once the window is used up; it resumes when reading does.
      *
      * Concurrent collectors are still NOT supported — two simultaneous
      * collects would race the channel iterator and each chunk goes to
@@ -109,8 +106,34 @@ class QuicStream(
      * (one finishes / cancels, then another starts) are the new
      * supported pattern.
      */
-    private val incomingChannel = Channel<ByteArray>(capacity = 64)
-    val incoming: Flow<ByteArray> = flow { for (chunk in incomingChannel) emit(chunk) }
+    private val incomingChannel = Channel<ByteArray>(Channel.UNLIMITED)
+    val incoming: Flow<ByteArray> =
+        flow {
+            for (chunk in incomingChannel) {
+                onConsumed(chunk.size)
+                emit(chunk)
+            }
+        }
+
+    /**
+     * Bytes the application has taken from [incoming]. The receive window
+     * (MAX_STREAM_DATA, and MAX_DATA across streams) only moves past bytes
+     * consumed here, so a slow reader slows the peer down instead of
+     * queuing without bound: what sits in the channel is capped by the
+     * window the peer must stay inside (RFC 9000 §4.1).
+     */
+    @Volatile
+    internal var consumedBytes: Long = 0L
+        private set
+
+    /** Told when the application consumed bytes, so the connection can extend credit. */
+    internal var consumptionListener: (() -> Unit)? = null
+
+    private fun onConsumed(size: Int) {
+        consumedBytes += size
+        receiveDirtyForFlowControl = true
+        consumptionListener?.invoke()
+    }
 
     /**
      * True once a [deliverIncoming] call failed because the channel was
