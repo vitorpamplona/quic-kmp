@@ -36,6 +36,7 @@ import com.vitorpamplona.quic.frame.MaxDataFrame
 import com.vitorpamplona.quic.frame.MaxStreamDataFrame
 import com.vitorpamplona.quic.frame.MaxStreamsFrame
 import com.vitorpamplona.quic.frame.NewConnectionIdFrame
+import com.vitorpamplona.quic.frame.NewTokenFrame
 import com.vitorpamplona.quic.frame.PathChallengeFrame
 import com.vitorpamplona.quic.frame.PathResponseFrame
 import com.vitorpamplona.quic.frame.PingFrame
@@ -1387,6 +1388,11 @@ private fun appendFlowControlUpdates(
         conn.pendingHandshakeDone = false
         frames += HandshakeDoneFrame()
         tokens += RecoveryToken.HandshakeDone
+    }
+    conn.pendingNewToken?.let {
+        conn.pendingNewToken = null
+        frames += NewTokenFrame(it)
+        tokens += RecoveryToken.NewToken(it)
     }
 
     // 1-RTT CRYPTO: what TLS sends after the handshake, a server's

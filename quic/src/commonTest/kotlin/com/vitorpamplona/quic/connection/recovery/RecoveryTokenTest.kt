@@ -138,6 +138,7 @@ class RecoveryTokenTest {
                     is RecoveryToken.PathChallenge -> "pc"
                     is RecoveryToken.RetireConnectionId -> "rcid:${it.sequenceNumber}"
                     RecoveryToken.HandshakeDone -> "hd"
+                    is RecoveryToken.NewToken -> "nt"
                 }
             }
         assertEquals(

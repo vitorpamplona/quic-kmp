@@ -155,23 +155,26 @@ class QuicServer(
         if (bytes.size < MIN_INITIAL_DATAGRAM || header.dcid.length < 8 && header.token.isEmpty()) return
         val now = epochMillis()
         var retry: AddressTokens.Retry? = null
+        var returning = false
         if (header.token.isNotEmpty()) {
             retry = tokens.openRetry(header.token, d.from, now)
-            // A token we can't open (stale, another address, or a NEW_TOKEN
-            // one we don't issue) gets the same treatment as none.
             if (retry != null && retry.retrySourceConnectionId != header.dcid) retry = null
+            // A token we can't open (stale, another address, someone else's)
+            // gets the same treatment as none.
+            if (retry == null) returning = tokens.openNewToken(header.token, d.from, now)
         }
-        if (retry == null && config.requireRetry) {
+        if (retry == null && !returning && config.requireRetry) {
             sendRetry(header, d.from, now)
             return
         }
-        startConnection(header, d, retry)
+        startConnection(header, d, retry, returning)
     }
 
     private fun startConnection(
         header: LongHeader,
         d: ReceivedDatagram,
         retry: AddressTokens.Retry?,
+        returning: Boolean,
     ) {
         val localCid = ConnectionId.random(config.connectionIdLength)
         val odcid = retry?.originalDestinationConnectionId ?: header.dcid
@@ -198,12 +201,13 @@ class QuicServer(
                 clientSourceConnectionId = header.scid,
                 localConnectionId = localCid,
                 retrySourceConnectionId = retry?.retrySourceConnectionId,
-                addressValidated = retry != null,
+                addressValidated = retry != null || returning,
                 statelessResetTokenFor = resetTokens::tokenFor,
                 supportedVersions = config.supportedVersions,
                 onConnectionIdIssued = { cid -> synchronized(lock) { routes[cid] = socket } },
                 onConnectionIdRetired = { cid -> synchronized(lock) { if (routes[cid] === socket) routes.remove(cid) } },
                 peerAddress = d.from,
+                newTokenFactory = if (config.issueNewTokens) ({ tokens.mintNewToken(d.from, epochMillis()) }) else null,
             )
         val conn =
             QuicConnection(

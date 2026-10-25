@@ -138,12 +138,16 @@ class QuicServerTest {
         port: Int,
         compatibleVersions: List<Int> = listOf(QuicVersion.V1),
         path: Network.Rebindable = network.Rebindable(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), port)),
+        token: ByteArray? = null,
+        onNewToken: ((ByteArray) -> Unit)? = null,
     ): QuicConnection {
         val conn =
             QuicConnection(
                 serverName = "quic.test",
                 config = QuicConnectionConfig(compatibleVersions = compatibleVersions),
                 tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
+                addressValidationToken = token,
+                onNewToken = onNewToken,
             )
         QuicConnectionDriver(conn, network.clientSocket(path), scope).start()
         return conn
@@ -200,6 +204,20 @@ class QuicServerTest {
             val server = server(network, requireRetry = true)
             val client = client(network, 5001)
             echoOnce(server, client)
+        }
+
+    @Test
+    fun `a NEW_TOKEN from one connection lets the next skip Retry`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network, requireRetry = true)
+            val token = kotlinx.coroutines.CompletableDeferred<ByteArray>()
+            val first = echoOnce(server, client(network, 5005, onNewToken = { token.complete(it) }))
+            assertNotNull(first.connection.serverSetup?.retrySourceConnectionId, "first connection went through Retry")
+            val saved = withTimeout(5_000) { token.await() }
+            // Same IP, another port: the token is bound to the address only.
+            val second = echoOnce(server, client(network, 5006, token = saved))
+            assertEquals(null, second.connection.serverSetup?.retrySourceConnectionId)
         }
 
     @Test

@@ -82,10 +82,48 @@ internal class AddressTokens(
         }
     }
 
+    /**
+     * A token for a future connection from the same client (RFC 9000 §8.1.3),
+     * bound to its IP address only: its port will differ next time.
+     */
+    fun mintNewToken(
+        peer: UdpPeerAddress,
+        nowMillis: Long,
+    ): ByteArray {
+        val w = QuicWriter()
+        w.writeByte(KIND_NEW_TOKEN)
+        w.writeUint32((nowMillis ushr 32).toInt())
+        w.writeUint32(nowMillis.toInt())
+        val nonce = RandomInstance.bytes(12)
+        return nonce + Aes128Gcm.seal(key, nonce, peer.ip, w.toByteArray())
+    }
+
+    /** True when [token] is one of our NEW_TOKEN tokens for [peer]'s IP, and still fresh. */
+    fun openNewToken(
+        token: ByteArray,
+        peer: UdpPeerAddress,
+        nowMillis: Long,
+    ): Boolean {
+        if (token.size < 12 + 16 + 9) return false
+        val plain = Aes128Gcm.open(key, token.copyOfRange(0, 12), peer.ip, token.copyOfRange(12, token.size)) ?: return false
+        return try {
+            val r = QuicReader(plain)
+            if (r.readByte() != KIND_NEW_TOKEN) return false
+            val issuedAt = (r.readUint32() shl 32) or (r.readUint32() and 0xFFFFFFFFL)
+            nowMillis >= issuedAt && nowMillis - issuedAt <= NEW_TOKEN_LIFETIME_MS
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun aad(peer: UdpPeerAddress): ByteArray = peer.ip + byteArrayOf((peer.port ushr 8).toByte(), peer.port.toByte())
 
     companion object {
         private const val KIND_RETRY = 1
+        private const val KIND_NEW_TOKEN = 2
+
+        /** How long a NEW_TOKEN token lets a returning client skip address validation. */
+        const val NEW_TOKEN_LIFETIME_MS = 24L * 60L * 60L * 1000L
 
         /** A Retry token only has to outlive one round trip. */
         const val RETRY_TOKEN_LIFETIME_MS = 10_000L

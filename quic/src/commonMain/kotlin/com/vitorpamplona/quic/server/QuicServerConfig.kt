@@ -40,6 +40,8 @@ class QuicServerConfig(
     val supportedVersions: List<Int> = listOf(QuicVersion.V1),
     /** Answer every new Initial without a valid token with a Retry (RFC 9000 §8.1.2). */
     val requireRetry: Boolean = false,
+    /** Give each client a NEW_TOKEN token, so its next connection skips address validation (RFC 9000 §8.1.3). */
+    val issueNewTokens: Boolean = true,
     /** Enables session tickets and resumption. */
     val ticketKeys: TlsSessionTicketKeys? = null,
     /** 0xffffffff accepts 0-RTT on resumed connections (RFC 9001 §4.6.1); 0 refuses it. Needs [ticketKeys]. */

@@ -1,7 +1,6 @@
 # Server role for `:quic`
 
-> **Status:** S1–S5 done, S6 partly (compatible version negotiation done; NEW_TOKEN issuance
-> and a server preferred address not yet) — 2026-10-25.
+> **Status:** S1–S5 done; S6 done except a server preferred address — 2026-10-25.
 
 ## Why
 
@@ -74,8 +73,11 @@ address.
 - Rebinding: the address a server sends to (`sendAddress`) only moves in the writer, with the
   packet that carries the new path's PATH_CHALLENGE, so nothing built for the old path goes to
   the new one. An unanswered challenge moves it back after 3 PTO.
-- Not yet: amplification limits on a migrated-to path, NEW_TOKEN issuance, a server preferred
-  address, a cap on concurrent connections or handshakes.
+- NEW_TOKEN: once confirmed, the server sends a token bound to the client's IP (24 h); an Initial
+  carrying it counts as validated, so it skips the Retry and the 3x limit.
+- Not yet: amplification limits on a migrated-to path (the writer can't yet build a datagram
+  smaller than the PMTU to fit one), a server preferred address, a cap on concurrent connections
+  or handshakes.
 
 Found on the way and fixed for the client too: stream credit followed arrival rather than
 consumption (a fast sender overflowed the 64-chunk app channel and the connection died), 1-RTT

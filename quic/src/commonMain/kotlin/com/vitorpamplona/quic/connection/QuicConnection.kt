@@ -1230,6 +1230,9 @@ class QuicConnection internal constructor(
      */
     internal fun amplificationAllowance(): Long = if (addressValidated) Long.MAX_VALUE else 3L * amplificationBytesReceived - amplificationBytesSent
 
+    /** A server owes the client this NEW_TOKEN token (RFC 9000 §8.1.3), first send or after a loss. */
+    internal var pendingNewToken: ByteArray? = null
+
     /** A server owes the client HANDSHAKE_DONE (RFC 9001 §4.1.2), first send or after a loss. */
     internal var pendingHandshakeDone: Boolean = false
 
@@ -1479,6 +1482,7 @@ class QuicConnection internal constructor(
                     // once it completes; it tells the client with
                     // HANDSHAKE_DONE and drops its Handshake keys (§4.9.2).
                     pendingHandshakeDone = true
+                    pendingNewToken = serverSetup?.newTokenFactory?.invoke()
                     markHandshakeConfirmed()
                     handshake.discardKeys()
                 } else {
@@ -3874,6 +3878,7 @@ class QuicConnection internal constructor(
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.PathChallenge,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.RetireConnectionId,
                 com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone,
+                is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewToken,
                 -> {
                     // Flow-control extensions, NEW_CONNECTION_ID,
                     // PATH_CHALLENGE, and RETIRE_CONNECTION_ID have
@@ -4040,6 +4045,10 @@ class QuicConnection internal constructor(
 
                 com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone -> {
                     pendingHandshakeDone = true
+                }
+
+                is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewToken -> {
+                    pendingNewToken = token.token
                 }
             }
         }
