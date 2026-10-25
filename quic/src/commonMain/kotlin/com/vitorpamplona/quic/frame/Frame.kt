@@ -331,6 +331,39 @@ class MaxStreamsFrame(
     }
 }
 
+/** RFC 9000 §19.12: the sender wants to send more but the connection limit [maximumData] stops it. */
+class DataBlockedFrame(
+    val maximumData: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(FrameType.DATA_BLOCKED.toInt())
+        out.writeVarint(maximumData)
+    }
+}
+
+/** RFC 9000 §19.13: stream [streamId] is blocked at its limit [maximumStreamData]. */
+class StreamDataBlockedFrame(
+    val streamId: Long,
+    val maximumStreamData: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(FrameType.STREAM_DATA_BLOCKED.toInt())
+        out.writeVarint(streamId)
+        out.writeVarint(maximumStreamData)
+    }
+}
+
+/** RFC 9000 §19.14: the sender wants to open a stream but the limit [maximumStreams] stops it. */
+class StreamsBlockedFrame(
+    val bidi: Boolean,
+    val maximumStreams: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(if (bidi) FrameType.STREAMS_BLOCKED_BIDI.toInt() else FrameType.STREAMS_BLOCKED_UNI.toInt())
+        out.writeVarint(maximumStreams)
+    }
+}
+
 class DatagramFrame(
     val data: ByteArray,
     val explicitLength: Boolean = true,
@@ -538,17 +571,15 @@ fun decodeFrames(data: ByteArray): List<Frame> {
             }
 
             type == FrameType.DATA_BLOCKED -> {
-                r.readVarint()
+                out += DataBlockedFrame(r.readVarint())
             }
 
-            // ignored
             type == FrameType.STREAM_DATA_BLOCKED -> {
-                r.readVarint()
-                r.readVarint()
+                out += StreamDataBlockedFrame(r.readVarint(), r.readVarint())
             }
 
             type == FrameType.STREAMS_BLOCKED_BIDI || type == FrameType.STREAMS_BLOCKED_UNI -> {
-                r.readVarint()
+                out += StreamsBlockedFrame(type == FrameType.STREAMS_BLOCKED_BIDI, r.readVarint())
             }
 
             type == FrameType.NEW_CONNECTION_ID -> {

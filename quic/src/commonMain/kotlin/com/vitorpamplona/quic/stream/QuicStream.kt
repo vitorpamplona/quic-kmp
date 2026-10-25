@@ -125,6 +125,12 @@ class QuicStream(
     var sendCredit: Long = 0L
         internal set
 
+    /**
+     * The [sendCredit] value a STREAM_DATA_BLOCKED was last sent for, so the
+     * writer reports each limit once (RFC 9000 §4.1). -1 before any.
+     */
+    internal var blockedReportedAt: Long = -1L
+
     /** Per-stream receive credit (the value we advertised). */
     var receiveLimit: Long = 0L
         internal set

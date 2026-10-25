@@ -993,6 +993,7 @@ private fun buildApplicationPacket(
             tierStart = tierEnd
         }
         conn.streamRoundRobinStart = (rotation + 1) % streamsView.size
+        appendBlockedSignals(conn, sorted, connBudget, frames)
     }
 
     // Piggy-back a not-yet-due ACK on a packet that leaves anyway.
@@ -1120,6 +1121,38 @@ private fun buildApplicationPacket(
     // entry is still in place; if the throw was transient, retransmit
     // logic in step 6 picks up the slack on the next outbound.
     return sizeBytes.getOrThrow()
+}
+
+/**
+ * RFC 9000 §4.1: tell the peer when its flow-control limits are what keeps
+ * data queued (STREAM_DATA_BLOCKED / DATA_BLOCKED), once per limit value, so a
+ * peer that only extends credit on demand learns it should.
+ */
+private fun appendBlockedSignals(
+    conn: QuicConnection,
+    streams: List<com.vitorpamplona.quic.stream.QuicStream>,
+    connBudget: Long,
+    frames: MutableList<Frame>,
+) {
+    var anyFresh = false
+    for (stream in streams) {
+        val send = stream.send
+        if (send.nextOffset <= send.sentOffset) continue
+        anyFresh = true
+        if (stream.sendCredit <= send.sentOffset && stream.blockedReportedAt != stream.sendCredit) {
+            frames +=
+                com.vitorpamplona.quic.frame
+                    .StreamDataBlockedFrame(stream.streamId, stream.sendCredit)
+            stream.blockedReportedAt = stream.sendCredit
+        }
+    }
+    val limit = conn.sendConnectionFlowCredit
+    if (anyFresh && connBudget <= 0L && conn.dataBlockedReportedAt != limit) {
+        frames +=
+            com.vitorpamplona.quic.frame
+                .DataBlockedFrame(limit)
+        conn.dataBlockedReportedAt = limit
+    }
 }
 
 /**

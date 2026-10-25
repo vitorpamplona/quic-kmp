@@ -214,6 +214,13 @@ class QuicConnection(
     internal var initialKeysDcid: ConnectionId = destinationConnectionId
 
     /**
+     * RFC 9000 §7.2: the SCID of the first Initial the server sent (after any
+     * Retry). Long-header packets with another SCID are dropped. Cleared when
+     * Retry or Version Negotiation starts the exchange over.
+     */
+    internal var serverInitialScid: ConnectionId? = null
+
+    /**
      * RFC 9368 §2.3 / RFC 9369 §4.1: set once the server switched us to a
      * compatible version by answering in it. The original version's Initial
      * receive keys stay in [originalVersionInitialReceive] so the server's
@@ -1088,6 +1095,9 @@ class QuicConnection(
     /** Total stream bytes we've already sent against [sendConnectionFlowCredit]. */
     internal var sendConnectionFlowConsumed: Long = 0L
 
+    /** The connection limit a DATA_BLOCKED was last sent for (RFC 9000 §4.1); -1 before any. */
+    internal var dataBlockedReportedAt: Long = -1L
+
     private var receiveConnectionFlowLimit: Long = config.initialMaxData
 
     /** Streams the peer has opened that we haven't surfaced yet. */
@@ -1454,6 +1464,7 @@ class QuicConnection(
         // Writer + parser only ever reach the level via [conn.initial],
         // so we mutate the fields rather than swap the instance.
         initialKeysDcid = newDcid
+        serverInitialScid = null
         val (newSend, newReceive) = initialProtections(newDcid, chosen)
         initial.resetForVersionNegotiation(sendProtection = newSend, receiveProtection = newReceive)
         // Re-enqueue the ClientHello so the next drainOutbound emits a v1
@@ -1545,6 +1556,7 @@ class QuicConnection(
         if (retryPacket.version != currentVersion || compatibleVersionSwitched) return false
         destinationConnectionId = retryPacket.scid
         initialKeysDcid = retryPacket.scid
+        serverInitialScid = null
         val (send, receive) = initialProtections(retryPacket.scid, currentVersion)
         // Use resetForRetry, NOT resetForVersionNegotiation: RFC 9001 §5.7
         // requires the Initial PN namespace to continue across the Retry

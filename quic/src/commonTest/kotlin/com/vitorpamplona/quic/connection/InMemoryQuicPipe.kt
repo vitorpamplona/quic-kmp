@@ -509,6 +509,34 @@ class InMemoryQuicPipe(
         return null
     }
 
+    /**
+     * Test-only: a server Initial packet carrying exactly [frames], from
+     * [scid] (the pipe's own by default). Lets tests send what a real server
+     * wouldn't, e.g. frames not allowed at the Initial level.
+     */
+    fun buildServerInitialDatagram(
+        frames: List<com.vitorpamplona.quic.frame.Frame>,
+        scid: ConnectionId = serverScid,
+    ): ByteArray {
+        val payload = encodeFrames(frames)
+        return LongHeaderPacket.build(
+            LongHeaderPlaintextPacket(
+                type = LongHeaderType.INITIAL,
+                version = serverVersion,
+                dcid = client.sourceConnectionId,
+                scid = scid,
+                packetNumber = initialPnSpace.allocateOutbound(),
+                payload = if (payload.size < 4) payload.copyOf(4) else payload,
+            ),
+            Aes128Gcm,
+            initial.serverKey,
+            initial.serverIv,
+            hp,
+            initial.serverHp,
+            largestAckedInSpace = -1L,
+        )
+    }
+
     private fun buildServerInitialPacket(crypto: ByteArray): ByteArray {
         val proto =
             PacketProtection(

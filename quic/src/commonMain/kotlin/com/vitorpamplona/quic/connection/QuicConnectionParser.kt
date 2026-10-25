@@ -381,9 +381,18 @@ private fun feedLongHeaderPacket(
     // resets the idle timer.
     conn.lastActivityMs = nowMillis
 
-    // The server's source CID becomes our destination CID for subsequent packets.
-    if (level == EncryptionLevel.INITIAL) {
-        conn.destinationConnectionId = parsed.packet.scid
+    // RFC 9000 §7.2: the SCID of the server's first Initial becomes our DCID;
+    // later long-header packets with a different SCID belong to something
+    // else and are dropped.
+    val adoptedScid = conn.serverInitialScid
+    if (adoptedScid == null) {
+        if (level == EncryptionLevel.INITIAL) {
+            conn.serverInitialScid = parsed.packet.scid
+            conn.destinationConnectionId = parsed.packet.scid
+        }
+    } else if (parsed.packet.scid != adoptedScid) {
+        conn.qlogObserver.onPacketDropped("long header SCID ${parsed.packet.scid} != server's $adoptedScid", parsed.consumed)
+        return parsed.consumed
     }
 
     // Round-5 #P3: decode the frame list ONCE — qlog (when attached) and
@@ -671,6 +680,21 @@ private fun dispatchFrames(
     path: NetworkPath,
 ) {
     val state = conn.levelState(level)
+    // RFC 9000 §12.4: Initial and Handshake packets carry only PADDING, PING,
+    // ACK, CRYPTO and the transport form of CONNECTION_CLOSE.
+    if (level != EncryptionLevel.APPLICATION) {
+        val illegal =
+            frames.firstOrNull {
+                !(it is AckFrame || it is CryptoFrame || it is PingFrame || it is ConnectionCloseFrame && it.frameType != null)
+            }
+        if (illegal != null) {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: ${illegal::class.simpleName} in a $level packet",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+    }
     var ackEliciting = false
     for (frame in frames) {
         when (frame) {
@@ -1266,9 +1290,19 @@ private fun dispatchFrames(
                 ackEliciting = true
             }
 
+            is com.vitorpamplona.quic.frame.DataBlockedFrame,
+            is com.vitorpamplona.quic.frame.StreamDataBlockedFrame,
+            is com.vitorpamplona.quic.frame.StreamsBlockedFrame,
+            -> {
+                // RFC 9000 §19.12-§19.14: informational (the peer is blocked
+                // on a limit we set; our credit updates already track what the
+                // application reads), but ack-eliciting like any frame other
+                // than ACK, PADDING and CONNECTION_CLOSE.
+                ackEliciting = true
+            }
+
             else -> {
-                // PADDING + DATA_BLOCKED + STREAM_DATA_BLOCKED + STREAMS_BLOCKED
-                // are non-eliciting / cleared during decode.
+                // PADDING is cleared during decode.
             }
         }
     }
