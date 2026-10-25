@@ -1,6 +1,7 @@
 # Server role for `:quic`
 
-> **Status:** in progress — phase S1 (TLS 1.3 server) started 2026-10-25.
+> **Status:** S1–S5 done, S6 partly (compatible version negotiation done; NEW_TOKEN issuance
+> and a server preferred address not yet) — 2026-10-25.
 
 ## Why
 
@@ -62,6 +63,25 @@ address.
    against every runner client.
 6. **S6 — Extras.** Compatible version negotiation to v2 on the server,
    NEW_TOKEN issuance, ECN.
+
+## Where it landed
+
+- `QuicConnection` takes an internal `QuicServerSetup`; the public constructor is still the
+  client's. `handshakeTls` is a `TlsHandshake` (`TlsClient` or `TlsServer`); `tls` stays the
+  client's.
+- `QuicServer` + `QuicServerTransport` (`UdpServerSocket` on JVM/Android). The driver runs on a
+  `QuicDatagramSocket`, which `UdpSocket` and the server's per-client `ServerPeerSocket` implement.
+- Rebinding: the address a server sends to (`sendAddress`) only moves in the writer, with the
+  packet that carries the new path's PATH_CHALLENGE, so nothing built for the old path goes to
+  the new one. An unanswered challenge moves it back after 3 PTO.
+- Not yet: amplification limits on a migrated-to path, NEW_TOKEN issuance, a server preferred
+  address, a cap on concurrent connections or handshakes.
+
+Found on the way and fixed for the client too: stream credit followed arrival rather than
+consumption (a fast sender overflowed the 64-chunk app channel and the connection died), 1-RTT
+CRYPTO was never sent, `extraSecretsListener` never saw traffic secrets (SSLKEYLOGFILE was empty),
+and the client checked `original_destination_connection_id` against its pre-Version-Negotiation
+DCID.
 
 ## Out of scope
 

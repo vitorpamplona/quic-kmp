@@ -1,7 +1,7 @@
 # QUIC for Kotlin Multiplatform
 
-A pure-Kotlin **QUIC v1 client** with **HTTP/3**, **QPACK** and **WebTransport** building blocks,
-for the JVM and Android. No JNI, no BouncyCastle, no native QUIC library: the TLS 1.3 handshake,
+A pure-Kotlin **QUIC** client and server (v1 and v2) with **HTTP/3**, **QPACK** and
+**WebTransport** building blocks, for the JVM and Android. No JNI, no BouncyCastle, no native QUIC library: the TLS 1.3 handshake,
 packet protection, loss recovery, flow control and stream machinery are all Kotlin. The platform's
 JCA does AES-GCM, ChaCha20-Poly1305 and certificate validation.
 
@@ -13,27 +13,27 @@ audio rooms and Marmot agent streams in production.
 
 | Area | What you get |
 |---|---|
-| QUIC v1 (RFC 9000) | Client role. Bidirectional and unidirectional streams with flow control, version negotiation, Retry, connection IDs (`NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID`), path validation and migration, stateless reset detection, ECN on 1-RTT |
-| TLS 1.3 for QUIC (RFC 8446, RFC 9001) | X25519 key exchange; `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`; RSA-PSS, ECDSA and Ed25519 certificates (Ed25519 needs Android 13+); 1-RTT key update (both directions); session resumption and 0-RTT |
-| Recovery (RFC 9002) | RTT estimation, packet- and time-threshold loss detection, PTO, per-frame retransmission |
+| QUIC v1 (RFC 9000) | Client and server. Bidirectional and unidirectional streams with flow control, version negotiation, Retry, connection IDs (`NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID`), path validation, NAT rebinding and migration to a server's preferred address, stateless reset, `NEW_TOKEN`, ECN on 1-RTT, path MTU discovery (RFC 8899), keep-alive |
+| QUIC v2 (RFC 9369, RFC 9368) | Both versions, and compatible version negotiation from v1 to v2 on either side |
+| TLS 1.3 for QUIC (RFC 8446, RFC 9001) | X25519 key exchange; `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`; RSA-PSS, ECDSA and Ed25519 certificates (Ed25519 needs Android 13+); 1-RTT key update (both directions); session resumption and 0-RTT, as client and as server (session tickets, PSK binders, single-use 0-RTT tickets) |
+| Recovery (RFC 9002) | RTT estimation, packet- and time-threshold loss detection, PTO, per-frame retransmission, NewReno congestion control with pacing, persistent congestion and ECN-CE response, delayed ACKs |
 | Datagrams (RFC 9221) | Send and receive unreliable `DATAGRAM` frames |
 | HTTP/3 (RFC 9114) | Frame reader and writer, `SETTINGS`, control and request streams, `GOAWAY` |
 | QPACK (RFC 9204) | Static table and Huffman. The encoder sends literals; the decoder also reads dynamic-table references |
 | WebTransport over HTTP/3 | Extended CONNECT, session streams, capsules (`WT_CLOSE_SESSION`), HTTP datagrams |
 | Debugging | qlog events (`QlogObserver`, viewable in [qvis](https://qvis.quictools.info/)) and TLS secrets for Wireshark (`TlsSecretsListener`) |
 
-Interop is tested against aioquic, picoquic and quic-go with the
-[quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) (see
-[Interop matrix](#interop-matrix)).
+Interop is tested against the implementations in the
+[quic-interop-runner](https://github.com/quic-interop/quic-interop-runner), both as client and as
+server (see [Interop matrix](#interop-matrix)).
 
 ### Not supported
 
-- **Server role.** This is a client.
-- **Congestion control.** Loss is detected and repaired, but the send rate does not back off on
-  loss. That is fine for low-bitrate streams like audio; it is not a good fit for bulk transfers
-  over congested links.
-- **Path MTU discovery.** Packets stay at the 1200-byte minimum datagram size.
-- `TLS_AES_256_GCM_SHA384`, HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
+- `TLS_AES_256_GCM_SHA384` and key shares other than X25519 (so no HelloRetryRequest): both
+  wait on SHA-384 and P-256 in [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp).
+- HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
+- On the server: client certificates, a preferred address of its own, and amplification limits
+  on a path a client migrated to (the handshake's 3x limit is enforced).
 - **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
   (CI compiles it as common code), but the UDP socket, packet ciphers, TLS transcript hash, lock
   and certificate validation exist only for the JVM so far.
@@ -107,9 +107,10 @@ Things to know:
 ## Streams and datagrams
 
 Peer-initiated streams arrive through `awaitIncomingPeerStream()`, which returns `null` once the
-connection closes. **Always consume them.** Each stream buffers a bounded number of chunks, and
-a peer that keeps writing to an unread stream gets the connection closed. An HTTP/3 server opens
-three of these (control and the two QPACK streams) as soon as you connect.
+connection closes. **Always consume them.** A stream's receive window only moves as you read
+`incoming`, so a stream nobody reads stalls the peer once its window is used up, and unread
+streams hold back the connection-level window too. An HTTP/3 server opens three of these (control
+and the two QPACK streams) as soon as you connect.
 
 ```kotlin
 scope.launch {
@@ -230,6 +231,42 @@ WebTransport sub-protocols. Amethyst's
 [`QuicWebTransportFactory`](https://github.com/vitorpamplona/amethyst/blob/main/nestsClient/src/jvmAndroid/kotlin/com/vitorpamplona/nestsclient/transport/QuicWebTransportFactory.kt)
 is a complete client built this way, with timeouts and error reporting.
 
+## Server
+
+`QuicServer` accepts connections on one UDP socket: it routes packets by connection ID, answers
+unknown versions with Version Negotiation, can require a Retry round trip to validate client
+addresses, and sends stateless resets for connections it doesn't know.
+
+```kotlin
+val server =
+    QuicServer(
+        QuicServerConfig(
+            signer = JcaCertificateSigner.fromPem(certPem, keyPem),
+            alpnSelector = { offered -> offered.firstOrNull { it.contentEquals("h3".encodeToByteArray()) } },
+            supportedVersions = listOf(QuicVersion.V1, QuicVersion.V2),
+            ticketKeys = TlsSessionTicketKeys(), // resumption; add maxEarlyDataSize = 0xffffffff for 0-RTT
+        ),
+        UdpServerSocket.bind(host = null, port = 443),
+        scope,
+    )
+server.start()
+while (true) {
+    val accepted = server.accept() ?: break
+    scope.launch {
+        accepted.connection.awaitHandshake()
+        while (true) {
+            val stream = accepted.connection.awaitIncomingPeerStream() ?: break
+            // read stream.incoming, answer on stream.send, then accepted.driver.wakeup()
+        }
+    }
+}
+```
+
+`JcaCertificateSigner` loads PKCS#8, SEC1 and PKCS#1 keys for ECDSA, RSA and Ed25519
+certificates. The interop endpoint's
+[`InteropServer`](quic/interop/src/main/kotlin/com/vitorpamplona/quic/interop/runner/InteropServer.kt)
+is a complete hq-interop and HTTP/3 file server built this way.
+
 ## Configuration
 
 `QuicConnectionConfig` holds the transport parameters this client advertises. The defaults suit a
@@ -310,7 +347,7 @@ Opt-in long runs: `-PquicSoakSeconds=1800` turns on the audio-rooms soak test, a
 
 ## Interop matrix
 
-`quic/interop/` packages the client as a
+`quic/interop/` packages the client and server as a
 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) endpoint image and runs
 it against other implementations:
 
@@ -319,7 +356,9 @@ quic/interop/run-matrix.sh -s aioquic -t handshake,chacha20
 ```
 
 It needs Docker, and it clones the runner next to this repo on first use. Run one peer at a time:
-the runner is not safe to run concurrently.
+the runner is not safe to run concurrently. On a host whose kernel has no IPv6 (some sandboxes and
+CI VMs), `quic/interop/no-ipv6/patch-runner.sh` adapts the runner checkout; the `ipv6` testcase
+and IPv6 preferred addresses can't pass there.
 
 Design notes behind the stack and the interop work live in `quic/plans/` and `quic/interop/plans/`.
 
