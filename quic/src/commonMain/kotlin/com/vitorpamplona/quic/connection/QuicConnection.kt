@@ -1296,6 +1296,16 @@ class QuicConnection internal constructor(
     }
 
     /**
+     * The peer sent a 1-RTT ACK with ECN counts, so it handles ACK_ECN frames:
+     * our 1-RTT ACKs carry counts too from then on. Ours are always zero (the
+     * JVM can't read the ECN bits), so they tell a peer that doesn't do ECN
+     * nothing, and nginx closes the connection with INTERNAL_ERROR on the
+     * first ACK_ECN it receives.
+     */
+    @Volatile
+    internal var peerSendsAckEcn: Boolean = false
+
+    /**
      * RFC 9002 §7.1 / §B.7: a rising ECN-CE count in a 1-RTT ACK is a
      * congestion signal about the packet that ACK's largest number names.
      */

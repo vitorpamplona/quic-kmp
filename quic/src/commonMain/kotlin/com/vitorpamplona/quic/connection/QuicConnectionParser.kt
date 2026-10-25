@@ -772,6 +772,7 @@ private fun dispatchFrames(
     for (frame in frames) {
         when (frame) {
             is AckFrame -> {
+                if (frame.ecnCounts != null && level == EncryptionLevel.APPLICATION) conn.peerSendsAckEcn = true
                 // The peer's `frame.largestAcknowledged` is in OUR
                 // outbound PN space — the inbound `state.ackTracker`
                 // tracks PNs WE RECEIVED from the peer. The previous

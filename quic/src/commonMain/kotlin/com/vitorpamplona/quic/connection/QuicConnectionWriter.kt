@@ -922,33 +922,27 @@ private fun buildApplicationPacket(
     // along on any packet that goes out anyway (see below).
     fun appendAck(): AckFrame? =
         state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt())?.let { plainAck ->
-            // RFC 9000 §13.4.2: emit an ACK_ECN frame (variant 0x03,
-            // ACK with ECN counts) for 1-RTT ACKs once we mark
-            // outbound packets ECT(0) — peers may use the counts in
-            // their own ECN-driven congestion control. We don't
-            // currently read inbound TOS (JDK's DatagramChannel
-            // doesn't expose it without JNI), so all three counters
-            // are 0: that IS accurate reporting under our
-            // observation (we observe zero ECT-marked packets,
-            // because we observe no ECN bits at all). The 2026-05-09
-            // "truthful ECN" change tried to express this honesty by
-            // setting ecnCounts=null, but that downgrades the frame
-            // type to plain ACK and quinn's interop check requires
-            // *some* ACK_ECN to be present (`hasattr(p["quic"],
-            // "ack.ect0_count")` in `testcases_quic.py:_check_ack_ecn`).
-            // The runner explicitly notes "we only check whether the
-            // trace contains any ACK-ECN information, not whether it
-            // is valid", so emitting all-zeros is accepted. Initial
-            // / Handshake-space ACKs stay plain (RFC 9000 §13.4
-            // forbids ECN on long headers).
+            // RFC 9000 §13.4.2: 1-RTT ACKs carry ECN counts (ACK_ECN, 0x03)
+            // once the peer's own ACKs do; see [QuicConnection.peerSendsAckEcn].
+            // We mark outbound packets ECT(0) but can't read inbound TOS (the
+            // JDK's DatagramChannel doesn't expose it), so all three counters
+            // are 0: accurate for what we observe. The runner's ecn check only
+            // looks for some ACK_ECN in the trace (`_check_ack_ecn`: "we only
+            // check whether the trace contains any ACK-ECN information, not
+            // whether it is valid"). Initial / Handshake ACKs stay plain
+            // (RFC 9000 §13.4 forbids ECN on long headers).
             val ackWithCounts =
-                AckFrame(
-                    largestAcknowledged = plainAck.largestAcknowledged,
-                    ackDelay = plainAck.ackDelay,
-                    firstAckRange = plainAck.firstAckRange,
-                    additionalRanges = plainAck.additionalRanges,
-                    ecnCounts = AckEcnCounts(ect0 = 0L, ect1 = 0L, ce = 0L),
-                )
+                if (!conn.peerSendsAckEcn) {
+                    plainAck
+                } else {
+                    AckFrame(
+                        largestAcknowledged = plainAck.largestAcknowledged,
+                        ackDelay = plainAck.ackDelay,
+                        firstAckRange = plainAck.firstAckRange,
+                        additionalRanges = plainAck.additionalRanges,
+                        ecnCounts = AckEcnCounts(ect0 = 0L, ect1 = 0L, ce = 0L),
+                    )
+                }
             frames.add(0, ackWithCounts)
             tokens += RecoveryToken.Ack(level = EncryptionLevel.APPLICATION, largestAcked = ackWithCounts.largestAcknowledged)
             ackWithCounts

@@ -536,13 +536,8 @@ fun decodeFrames(data: ByteArray): List<Frame> {
                     val len = r.readVarint()
                     ranges += AckRange(gap, len)
                 }
-                if (type == FrameType.ACK_ECN) {
-                    // Skip ECT0, ECT1, CE counts.
-                    r.readVarint()
-                    r.readVarint()
-                    r.readVarint()
-                }
-                out += AckFrame(largest, delay, firstRange, ranges)
+                val ecn = if (type == FrameType.ACK_ECN) AckEcnCounts(ect0 = r.readVarint(), ect1 = r.readVarint(), ce = r.readVarint()) else null
+                out += AckFrame(largest, delay, firstRange, ranges, ecn)
             }
 
             type == FrameType.RESET_STREAM -> {
