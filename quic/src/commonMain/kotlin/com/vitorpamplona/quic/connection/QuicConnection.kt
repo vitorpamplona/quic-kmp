@@ -322,6 +322,33 @@ class QuicConnection internal constructor(
     }
 
     /**
+     * Server, before the handshake is confirmed: an Initial or Handshake packet
+     * with the highest packet number came from a new address, e.g. a NAT
+     * rebound while the handshake was still going. There's no migration yet
+     * (RFC 9000 §9), so no PATH_CHALLENGE: answer there, resending the
+     * handshake flight that went to the old address. An Initial
+     * proves nothing about the address, so the amplification limit applies
+     * again until a Handshake packet from it validates it (§8.1). Caller holds
+     * [streamsLock].
+     */
+    internal fun notePeerAddressDuringHandshakeLocked(
+        level: EncryptionLevel,
+        largestReceived: Boolean,
+    ) {
+        val src = datagramPath ?: return
+        if (handshakeConfirmed || !largestReceived || src == peerPath) return
+        QuicLog.d(TAG) { "peer address changed during the handshake: $peerPath -> $src" }
+        peerPath = src
+        sendPath = src
+        if (level == EncryptionLevel.INITIAL) addressValidated = false
+        // What we sent so far went to the old address and is most likely
+        // lost: send it again now rather than wait out a backed-off PTO.
+        for (l in listOf(initial, handshake)) {
+            if (l.sendProtection != null && !l.keysDiscarded) l.cryptoSend.requeueAllInflight()
+        }
+    }
+
+    /**
      * RFC 9000 §9.4 / §14.3: a new path (not just a new port) has unknown
      * capacity, RTT and MTU — start the congestion controller, the RTT
      * estimate and PMTU discovery over.

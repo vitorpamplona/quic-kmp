@@ -396,6 +396,7 @@ private fun feedLongHeaderPacket(
     // authenticated under that version's keys: switch (RFC 9368 §2.3).
     if (candidate != null) conn.commitCompatibleVersion(peeked.version, candidate)
 
+    if (conn.isServer) conn.notePeerAddressDuringHandshakeLocked(level, parsed.packet.packetNumber > state.pnSpace.largestReceived)
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
     // resets the idle timer.

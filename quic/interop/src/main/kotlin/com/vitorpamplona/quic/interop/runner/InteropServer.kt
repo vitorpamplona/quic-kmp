@@ -96,6 +96,9 @@ fun runInteropServer(testcase: String): Int {
     val www = File(System.getenv("WWW")?.takeIf { it.isNotBlank() } ?: "/www").canonicalFile
     val port = System.getenv("PORT")?.toIntOrNull() ?: 443
     val signer = JcaCertificateSigner.fromPem(File(certs, "cert.pem").readText(), File(certs, "priv.key").readText())
+    // Pay the JCA's first-use cost now: otherwise the first handshake takes
+    // ~400 ms, and the rebind tests move the client's NAT mapping at 1 s.
+    signer.sign(signer.signatureSchemes.first(), ByteArray(32))
     val keyLogFile = System.getenv("SSLKEYLOGFILE")?.takeIf { it.isNotBlank() }?.let(::File)
     val qlogDir =
         System

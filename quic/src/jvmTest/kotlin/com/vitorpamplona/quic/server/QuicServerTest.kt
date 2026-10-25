@@ -101,6 +101,17 @@ class QuicServerTest {
             init {
                 synchronized(clients) { clients[address] = inbox }
             }
+
+            /** Once the first datagram is out, move here and drop the old mapping, like a NAT rebinding. */
+            @Volatile
+            var moveAfterFirstSend: UdpPeerAddress? = null
+
+            fun afterSend() {
+                val to = moveAfterFirstSend ?: return
+                moveAfterFirstSend = null
+                synchronized(clients) { clients.remove(address) }
+                address = to
+            }
         }
 
         fun clientSocket(address: UdpPeerAddress): QuicDatagramSocket = clientSocket(Rebindable(address))
@@ -111,6 +122,7 @@ class QuicServerTest {
                 override suspend fun send(payload: ByteArray): Int {
                     clientSends.incrementAndGet()
                     if (!dropToServer) toServer.trySend(ReceivedDatagram(payload, path.address))
+                    path.afterSend()
                     return payload.size
                 }
 
@@ -290,6 +302,22 @@ class QuicServerTest {
             echoOnce(server, client)
             assertEquals(QuicVersion.V2, client.currentVersion)
             assertTrue(network.sentToUnknown.isEmpty)
+        }
+
+    @Test
+    fun `a client whose address changes during the handshake is answered at the new one`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network)
+            val first = UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 5010)
+            val moved = UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 6010)
+            val path = network.Rebindable(first)
+            // Our first flight goes to the old port and is lost; the client's
+            // retransmitted Initial comes from the new one.
+            path.moveAfterFirstSend = moved
+            val client = client(network, 5010, path = path)
+            val accepted = echoOnce(server, client)
+            assertEquals(moved, accepted.peerAddress)
         }
 
     @Test
