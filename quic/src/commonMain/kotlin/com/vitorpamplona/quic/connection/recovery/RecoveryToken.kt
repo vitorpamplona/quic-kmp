@@ -213,6 +213,9 @@ sealed class RecoveryToken {
         val sequenceNumber: Long,
     ) : RecoveryToken()
 
+    /** `HANDSHAKE_DONE` a server sent (RFC 9000 §19.20); resent until acknowledged. */
+    data object HandshakeDone : RecoveryToken()
+
     /**
      * `NEW_CONNECTION_ID` frame we sent (RFC 9000 §19.15). Reliable
      * per §13.3. Same scaffolding-only status — client-issued

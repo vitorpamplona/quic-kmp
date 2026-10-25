@@ -75,18 +75,18 @@ class TlsServer(
     val nowMillisSource: () -> Long = { Clock.System.now().toEpochMilliseconds() },
     /** Deterministic tests only. */
     val fixedKeyPair: X25519KeyPair? = null,
-) {
+) : TlsHandshake {
     enum class State { WAITING_CLIENT_HELLO, WAITING_CLIENT_FINISHED, CONNECTED, FAILED }
 
     var state: State = State.WAITING_CLIENT_HELLO
         private set
 
     /** The protocol picked by [alpnSelector]. */
-    var negotiatedAlpn: ByteArray? = null
+    override var negotiatedAlpn: ByteArray? = null
         private set
 
     /** The client's QUIC transport parameters, from its ClientHello. */
-    var peerTransportParameters: ByteArray? = null
+    override var peerTransportParameters: ByteArray? = null
         private set
 
     /** The SNI host name the client asked for, if any. */
@@ -102,7 +102,7 @@ class TlsServer(
         private set
 
     /** True when we accepted the client's 0-RTT data. */
-    var earlyDataAccepted: Boolean = false
+    override var earlyDataAccepted: Boolean = false
         private set
 
     private val outboundQueues =
@@ -123,9 +123,9 @@ class TlsServer(
     private var negotiatedCipherSuite: Int = -1
     private var ticketNonce: Long = 0L
 
-    fun pollOutbound(level: TlsClient.Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
+    override fun pollOutbound(level: TlsClient.Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
-    fun pushHandshakeBytes(
+    override fun pushHandshakeBytes(
         level: TlsClient.Level,
         bytes: ByteArray,
     ) {

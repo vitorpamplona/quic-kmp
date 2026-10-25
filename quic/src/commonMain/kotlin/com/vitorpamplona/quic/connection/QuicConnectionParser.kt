@@ -172,6 +172,9 @@ private fun feedDatagramInner(
         conn.markClosedExternally("stateless reset received from peer")
         return
     }
+    // RFC 9000 §8.1: what a server may send before the client's address is
+    // validated is bounded by what it received.
+    conn.onDatagramReceived(datagram.size)
     var offset = 0
     while (offset < datagram.size) {
         val first = datagram[offset].toInt() and 0xFF
@@ -187,7 +190,8 @@ private fun feedDatagramInner(
                         ((datagram[offset + 3].toInt() and 0xFF) shl 8) or
                         (datagram[offset + 4].toInt() and 0xFF)
                 if (version == QuicVersion.VERSION_NEGOTIATION) {
-                    feedVersionNegotiationPacket(conn, datagram, offset)
+                    // Only servers send Version Negotiation (RFC 9000 §17.2.1).
+                    if (!conn.isServer) feedVersionNegotiationPacket(conn, datagram, offset)
                     // VN packets MUST be the only packet in their datagram
                     // (RFC 9000 §17.2.1: no length field, body is rest of
                     // datagram). Stop walking.
@@ -307,6 +311,8 @@ private fun feedLongHeaderPacket(
         }
     }
     if (peeked.type == LongHeaderType.RETRY) {
+        // Only servers send Retry (RFC 9000 §17.2.5).
+        if (conn.isServer) return peeked.totalLength
         val retryBytes = datagram.copyOfRange(offset, offset + peeked.totalLength)
         val retryPacket = RetryPacket.parse(retryBytes)
         if (retryPacket != null) {
@@ -326,9 +332,21 @@ private fun feedLongHeaderPacket(
                 EncryptionLevel.HANDSHAKE
             }
 
-            LongHeaderType.ZERO_RTT, LongHeaderType.RETRY -> {
-                // Not supported by client; surface as a drop so qvis can
-                // see we ignored a packet rather than silently moving on.
+            LongHeaderType.ZERO_RTT -> {
+                // A server reads the client's early data when it accepted
+                // 0-RTT; 0-RTT shares the application packet number space
+                // (RFC 9000 §12.3). A client never receives 0-RTT.
+                if (conn.isServer && conn.zeroRttReceiveProtection != null) {
+                    EncryptionLevel.APPLICATION
+                } else {
+                    conn.qlogObserver.onPacketDropped("0-RTT packet without 0-RTT keys", peeked.totalLength)
+                    return null
+                }
+            }
+
+            LongHeaderType.RETRY -> {
+                // Surface as a drop so qvis can see we ignored a packet
+                // rather than silently moving on.
                 conn.qlogObserver.onPacketDropped(
                     "unsupported long-header type ${peeked.type}",
                     peeked.totalLength,
@@ -337,10 +355,12 @@ private fun feedLongHeaderPacket(
             }
         }
     val state = conn.levelState(level)
+    val zeroRtt = peeked.type == LongHeaderType.ZERO_RTT
     val proto =
         when {
             candidate != null -> candidate
             originalVersionInitial -> conn.originalVersionInitialReceive
+            zeroRtt -> conn.zeroRttReceiveProtection
             else -> state.receiveProtection
         }
     if (proto == null) {
@@ -381,6 +401,14 @@ private fun feedLongHeaderPacket(
     // resets the idle timer.
     conn.lastActivityMs = nowMillis
 
+    // RFC 9000 §8.1: a Handshake packet proves the client got our Initial,
+    // which validates its address; and RFC 9001 §4.9.1: a server discards
+    // its Initial keys when it first processes one.
+    if (conn.isServer && level == EncryptionLevel.HANDSHAKE) {
+        conn.addressValidated = true
+        if (!conn.initial.keysDiscarded) conn.initial.discardKeys()
+    }
+
     // RFC 9000 §7.2: the SCID of the server's first Initial becomes our DCID;
     // later long-header packets with a different SCID belong to something
     // else and are dropped.
@@ -399,6 +427,22 @@ private fun feedLongHeaderPacket(
     // dispatch both need the same decoded view. Pre-fix the parser walked
     // the payload twice per inbound packet.
     val decodedFrames = decodeFramesOrClose(conn, parsed.packet.payload) ?: return parsed.consumed
+    if (zeroRtt) {
+        // RFC 9000 §12.4: these never travel in 0-RTT.
+        val illegal =
+            decodedFrames.firstOrNull {
+                it is AckFrame || it is CryptoFrame || it is HandshakeDoneFrame || it is NewTokenFrame ||
+                    it is com.vitorpamplona.quic.frame.PathResponseFrame ||
+                    it is com.vitorpamplona.quic.frame.RetireConnectionIdFrame
+            }
+        if (illegal != null) {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: ${illegal::class.simpleName} in a 0-RTT packet",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return parsed.consumed
+        }
+    }
     if (conn.qlogObserver !== com.vitorpamplona.quic.observability.QlogObserver.NoOp) {
         conn.qlogObserver.onPacketReceived(
             level = level,
@@ -418,6 +462,15 @@ private fun feedShortHeaderPacket(
     nowMillis: Long,
     path: NetworkPath,
 ) {
+    // RFC 9001 §5.7: a server must not process 1-RTT packets before the
+    // handshake completes. Once it has, 0-RTT keys can go (§4.9.3).
+    if (conn.isServer) {
+        if (!conn.handshakeComplete) {
+            conn.qlogObserver.onPacketDropped("1-RTT before the handshake completed", datagram.size - offset)
+            return
+        }
+        conn.zeroRttReceiveProtection = null
+    }
     val state = conn.levelState(EncryptionLevel.APPLICATION)
     val live = state.receiveProtection
     if (live == null) {
@@ -680,6 +733,16 @@ private fun dispatchFrames(
     path: NetworkPath,
 ) {
     val state = conn.levelState(level)
+    // RFC 9000 §19.7 / §19.20: only a server sends these.
+    if (conn.isServer) {
+        frames.firstOrNull { it is HandshakeDoneFrame || it is NewTokenFrame }?.let {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: client sent ${it::class.simpleName}",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+    }
     // RFC 9000 §12.4: Initial and Handshake packets carry only PADDING, PING,
     // ACK, CRYPTO and the transport form of CONNECTION_CLOSE.
     if (level != EncryptionLevel.APPLICATION) {
@@ -831,7 +894,7 @@ private fun dispatchFrames(
                             EncryptionLevel.HANDSHAKE -> TlsClient.Level.HANDSHAKE
                             EncryptionLevel.APPLICATION -> TlsClient.Level.APPLICATION
                         }
-                    conn.tls.pushHandshakeBytes(tlsLevel, contiguous)
+                    conn.handshakeTls.pushHandshakeBytes(tlsLevel, contiguous)
                     // Pull any new outbound CRYPTO bytes out of TLS into our
                     // send queue at the matching encryption level.
                     drainTlsOutbound(conn)
@@ -854,12 +917,12 @@ private fun dispatchFrames(
                 // the close fires on the parallel `transfer` interop test
                 // (3 GETs on streams 0/4/8) and truncates whichever stream
                 // is still mid-receive when the close lands.
-                if (StreamId.isClientInitiated(frame.streamId) &&
+                if (conn.isLocalStream(frame.streamId) &&
                     conn.streamByIdLocked(frame.streamId) == null &&
                     !conn.isStreamIdRetiredLocked(frame.streamId)
                 ) {
                     conn.markClosedExternally(
-                        "peer opened stream ${frame.streamId} on client-initiated id space (STREAM_STATE_ERROR)",
+                        "peer opened stream ${frame.streamId} on our id space (STREAM_STATE_ERROR)",
                         errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
@@ -1059,9 +1122,9 @@ private fun dispatchFrames(
                 // (CLIENT_UNI = id%4==2) is STREAM_STATE_ERROR — they don't
                 // have a send side to abort.
                 ackEliciting = true
-                if (StreamId.kindOf(frame.streamId) == StreamId.Kind.CLIENT_UNI) {
+                if (StreamId.isUnidirectional(frame.streamId) && conn.isLocalStream(frame.streamId)) {
                     conn.markClosedExternally(
-                        "STREAM_STATE_ERROR: peer RESET_STREAM on client-uni id ${frame.streamId} (peer has no send side)",
+                        "STREAM_STATE_ERROR: peer RESET_STREAM on our uni id ${frame.streamId} (peer has no send side)",
                         errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
@@ -1148,11 +1211,7 @@ private fun dispatchFrames(
                 // here) has none, so the call is a defensive no-op.
                 ackEliciting = true
                 conn.streamByIdLocked(frame.streamId)?.let { stream ->
-                    val kind = StreamId.kindOf(frame.streamId)
-                    val hasLocalSend =
-                        kind == StreamId.Kind.CLIENT_BIDI ||
-                            kind == StreamId.Kind.SERVER_BIDI ||
-                            kind == StreamId.Kind.CLIENT_UNI
+                    val hasLocalSend = StreamId.isBidirectional(frame.streamId) || conn.isLocalStream(frame.streamId)
                     if (hasLocalSend) {
                         stream.resetStream(frame.applicationErrorCode)
                     }
@@ -1324,7 +1383,7 @@ private fun dispatchFrames(
 private fun drainTlsOutbound(conn: QuicConnection) {
     for (lvl in TlsClient.Level.entries) {
         while (true) {
-            val bytes = conn.tls.pollOutbound(lvl) ?: break
+            val bytes = conn.handshakeTls.pollOutbound(lvl) ?: break
             val state =
                 when (lvl) {
                     TlsClient.Level.INITIAL -> conn.initial

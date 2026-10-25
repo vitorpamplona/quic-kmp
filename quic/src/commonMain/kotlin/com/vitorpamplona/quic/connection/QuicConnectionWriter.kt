@@ -31,6 +31,7 @@ import com.vitorpamplona.quic.frame.ConnectionCloseFrame
 import com.vitorpamplona.quic.frame.CryptoFrame
 import com.vitorpamplona.quic.frame.DatagramFrame
 import com.vitorpamplona.quic.frame.Frame
+import com.vitorpamplona.quic.frame.HandshakeDoneFrame
 import com.vitorpamplona.quic.frame.MaxDataFrame
 import com.vitorpamplona.quic.frame.MaxStreamDataFrame
 import com.vitorpamplona.quic.frame.MaxStreamsFrame
@@ -116,6 +117,11 @@ fun drainOutbound(
     // CLOSED: nothing more goes out. A local error's CONNECTION_CLOSE was
     // built when the error was detected (QuicConnection.finalCloseDatagram).
     if (conn.status == QuicConnection.Status.CLOSED) return null
+
+    // RFC 9000 §8.1: a server at an unvalidated address stays within three
+    // times what it received. Our datagrams are at most the current PMTU,
+    // so hold off unless a whole one fits.
+    if (conn.amplificationAllowance() < conn.pmtud.currentSize) return null
 
     // Bug-A fix: drive the §8.2.4 3*PTO validation budget on every
     // drain, not just on PTO expiration. The peer ACKs PATH_CHALLENGE
@@ -210,9 +216,14 @@ fun drainOutbound(
     if (firstPass.isEmpty()) return if (allowance == SendAllowance.FULL) buildPmtuProbe(conn, nowMillis) else null
 
     // RFC 9000 §14.1: client datagrams containing Initial MUST pad to ≥ 1200,
-    // via PADDING frames inside the Initial's encryption envelope.
+    // via PADDING frames inside the Initial's encryption envelope. A server
+    // pads only datagrams with an ack-eliciting Initial, sparing its
+    // amplification budget on bare ACKs.
+    val padInitial =
+        initialNatural != null &&
+            (!conn.isServer || initialContents!!.frames.any { it !is AckFrame })
     val datagram =
-        if (initialNatural != null) {
+        if (padInitial) {
             var natural = 0
             for (p in firstPass) natural += p.size
             if (natural < 1200) {
@@ -271,9 +282,12 @@ fun drainOutbound(
     // dropped (initial.receiveProtection == null), which is correct per
     // the same RFC: by the time the client sends a Handshake packet, the
     // server has already moved up encryption levels too.
-    if (handshakeNatural != null && !conn.initial.keysDiscarded) {
+    // A server keeps them until the client's first Handshake packet arrives
+    // (§4.9.1), since its own Initial may still need repeating.
+    if (handshakeNatural != null && !conn.isServer && !conn.initial.keysDiscarded) {
         conn.initial.discardKeys()
     }
+    if (!conn.addressValidated) conn.amplificationBytesSent += datagram.size
     return datagram
 }
 
@@ -1357,6 +1371,12 @@ private fun appendFlowControlUpdates(
         tokens += RecoveryToken.PathChallenge(payload)
     }
 
+    if (conn.pendingHandshakeDone) {
+        conn.pendingHandshakeDone = false
+        frames += HandshakeDoneFrame()
+        tokens += RecoveryToken.HandshakeDone
+    }
+
     // RFC 9000 §19.16 RETIRE_CONNECTION_ID. Drain pending retires;
     // the dispatcher re-queues on loss until the peer ACKs.
     while (conn.pathValidator.pendingRetireSequences.isNotEmpty()) {
@@ -1431,14 +1451,13 @@ private fun appendFlowControlUpdates(
         // uni-only deployment with bidi=0 doesn't accidentally use the bidi
         // window and vice versa.
         val window =
-            when (
+            when {
                 com.vitorpamplona.quic.stream.StreamId
-                    .kindOf(id)
-            ) {
-                com.vitorpamplona.quic.stream.StreamId.Kind.SERVER_UNI -> cfg.initialMaxStreamDataUni
-                com.vitorpamplona.quic.stream.StreamId.Kind.SERVER_BIDI -> cfg.initialMaxStreamDataBidiRemote
-                com.vitorpamplona.quic.stream.StreamId.Kind.CLIENT_BIDI -> cfg.initialMaxStreamDataBidiLocal
-                com.vitorpamplona.quic.stream.StreamId.Kind.CLIENT_UNI -> cfg.initialMaxStreamDataUni
+                    .isUnidirectional(id) -> cfg.initialMaxStreamDataUni
+
+                conn.isLocalStream(id) -> cfg.initialMaxStreamDataBidiLocal
+
+                else -> cfg.initialMaxStreamDataBidiRemote
             }
         // Re-credit when consumed > half the advertised window.
         if (rcv >= stream.receiveLimit - window / 2) {

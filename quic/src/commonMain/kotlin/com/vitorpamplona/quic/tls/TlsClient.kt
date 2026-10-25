@@ -28,6 +28,29 @@ import com.vitorpamplona.quic.QuicWriter
 import kotlin.time.Clock
 
 /**
+ * What the QUIC layer needs from either side of a TLS 1.3 handshake: CRYPTO
+ * bytes in and out per encryption level, and what was negotiated.
+ * Implemented by [TlsClient] and [TlsServer].
+ */
+interface TlsHandshake {
+    fun pushHandshakeBytes(
+        level: TlsClient.Level,
+        bytes: ByteArray,
+    )
+
+    fun pollOutbound(level: TlsClient.Level): ByteArray?
+
+    /** The negotiated application protocol, once known. */
+    val negotiatedAlpn: ByteArray?
+
+    /** The peer's encoded QUIC transport parameters, once received. */
+    val peerTransportParameters: ByteArray?
+
+    /** True when 0-RTT was accepted (by the server). */
+    val earlyDataAccepted: Boolean
+}
+
+/**
  * TLS 1.3 client driven by QUIC's encryption-level CRYPTO stream payloads.
  *
  * The QUIC stack feeds in CRYPTO-frame bytes for each encryption level
@@ -108,7 +131,7 @@ class TlsClient(
      * suite this client offers.
      */
     val resumption: TlsResumptionState? = null,
-) {
+) : TlsHandshake {
     enum class State {
         INITIAL,
         WAITING_SERVER_HELLO,
@@ -125,10 +148,10 @@ class TlsClient(
     var state: State = State.INITIAL
         private set
 
-    var negotiatedAlpn: ByteArray? = null
+    override var negotiatedAlpn: ByteArray? = null
         private set
 
-    var peerTransportParameters: ByteArray? = null
+    override var peerTransportParameters: ByteArray? = null
         private set
 
     /** The handshake message bytes we still owe to the QUIC layer, per encryption level. */
@@ -181,7 +204,7 @@ class TlsClient(
      * Only meaningful on resumption + 0-RTT connections; non-0-RTT
      * connections leave it at false and never check it.
      */
-    var earlyDataAccepted: Boolean = false
+    override var earlyDataAccepted: Boolean = false
         private set
 
     /** The 32-byte ClientHello random, available after [start]. Exposed so
@@ -282,10 +305,10 @@ class TlsClient(
     }
 
     /** Pull buffered outbound handshake bytes for [level], or null if nothing pending. */
-    fun pollOutbound(level: Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
+    override fun pollOutbound(level: Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
     /** Feed inbound CRYPTO-frame bytes at [level]. */
-    fun pushHandshakeBytes(
+    override fun pushHandshakeBytes(
         level: Level,
         bytes: ByteArray,
     ) {
