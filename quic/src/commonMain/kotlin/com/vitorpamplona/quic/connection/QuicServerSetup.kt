@@ -55,4 +55,16 @@ internal class QuicServerSetup(
     val newTokenFactory: (() -> ByteArray)? = null,
     /** Where the client's first Initial came from. */
     val peerAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = null,
+    /** Advertised in `preferred_address` (RFC 9000 §9.6) when non-null. */
+    val preferredAddress: com.vitorpamplona.quic.server.ServerPreferredAddress? = null,
+)
+
+/**
+ * One path of a server connection: which of the endpoint's transports
+ * ([local]: 0 is the one clients connect to, 1 the preferred address's) and
+ * the client's address on it.
+ */
+internal data class ServerPath(
+    val local: Int,
+    val peer: com.vitorpamplona.quic.transport.UdpPeerAddress,
 )

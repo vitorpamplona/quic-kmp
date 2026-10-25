@@ -152,7 +152,8 @@ fun drainOutbound(
         // Cap at a sensible upper bound to avoid issuing huge pools
         // for misbehaving servers; 4 matches our own
         // [QuicConnectionConfig.activeConnectionIdLimit] default.
-        val spareCount = (peerLimit - 1L).coerceIn(0L, 7L).toInt()
+        // Sequence 0 and, on a server, the preferred address's CID are already issued.
+        val spareCount = (peerLimit - conn.issuedSourceConnectionIds.size).coerceIn(0L, 7L).toInt()
         if (spareCount > 0) conn.issueOwnConnectionIdsLocked(spareCount)
     }
 
@@ -1382,7 +1383,7 @@ private fun appendFlowControlUpdates(
             m.challengePending = false
             frames += PathChallengeFrame(m.challenge)
             tokens += RecoveryToken.PathChallenge(m.challenge)
-            conn.sendAddress = m.address
+            conn.sendPath = m.path
         }
     }
 

@@ -33,11 +33,13 @@ import com.vitorpamplona.quic.qpack.QpackEncoder
 import com.vitorpamplona.quic.server.QuicServer
 import com.vitorpamplona.quic.server.QuicServerConfig
 import com.vitorpamplona.quic.server.QuicServerConnection
+import com.vitorpamplona.quic.server.ServerPreferredAddress
 import com.vitorpamplona.quic.stream.QuicStream
 import com.vitorpamplona.quic.stream.StreamId
 import com.vitorpamplona.quic.tls.JcaCertificateSigner
 import com.vitorpamplona.quic.tls.TlsConstants
 import com.vitorpamplona.quic.tls.TlsSessionTicketKeys
+import com.vitorpamplona.quic.transport.UdpPeerAddress
 import com.vitorpamplona.quic.transport.UdpServerSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +51,7 @@ import java.io.File
 
 private const val ALPN_HQ = "hq-interop"
 private const val H3_DATA_FRAME_SIZE = 64 * 1024
+private const val PREFERRED_PORT = 4443
 
 /** Testcases the server plays (https://github.com/quic-interop/quic-interop-runner, `testcases_quic.py`). */
 private val SERVER_TESTCASES =
@@ -74,6 +77,7 @@ private val SERVER_TESTCASES =
         "v2",
         "rebind-port",
         "rebind-addr",
+        "connectionmigration",
         "goodput",
         "crosstraffic",
     )
@@ -103,6 +107,16 @@ fun runInteropServer(testcase: String): Int {
     val hq = ALPN_HQ.encodeToByteArray()
     val preferred = if (testcase == "http3") listOf(TlsConstants.ALPN_H3, hq) else listOf(hq, TlsConstants.ALPN_H3)
 
+    // connectionmigration: offer a second port on our own addresses as the
+    // preferred address, so the client actively migrates there.
+    val preferredAddress =
+        if (testcase == "connectionmigration") {
+            val ipv4 = localAddress(java.net.Inet4Address::class.java)?.let { UdpPeerAddress(it, PREFERRED_PORT) }
+            val ipv6 = localAddress(java.net.Inet6Address::class.java)?.let { UdpPeerAddress(it, PREFERRED_PORT) }
+            if (ipv4 == null && ipv6 == null) null else ipv4 to ipv6
+        } else {
+            null
+        }
     val config =
         QuicServerConfig(
             signer = signer,
@@ -118,13 +132,15 @@ fun runInteropServer(testcase: String): Int {
                     TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
                 ),
             secretsListenerFactory = keyLogFile?.let { file -> { KeyLogListener(SslKeyLogger(file)) } },
+            preferredAddress = preferredAddress?.let { ServerPreferredAddress(ipv4 = it.first, ipv6 = it.second) },
             qlogObserverFactory = qlogDir?.let { dir -> { odcid -> QlogWriter(File(dir, "server-${odcid.toHex()}.sqlog"), odcid.toHex()) } },
         )
 
     return runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val socket = UdpServerSocket.bind(null, port)
-        val server = QuicServer(config, socket, scope)
+        val preferredSocket = preferredAddress?.let { UdpServerSocket.bind(null, PREFERRED_PORT) }
+        val server = QuicServer(config, socket, scope, preferredAddressTransport = preferredSocket)
         server.start()
         System.err.println("server: $testcase on UDP ${socket.localPort}, serving $www, alpn=${preferred.joinToString { it.decodeToString() }}")
         while (true) {
@@ -269,3 +285,13 @@ private fun fileFor(
 private class KeyLogListener(
     val logger: SslKeyLogger,
 ) : com.vitorpamplona.quic.tls.TlsSecretsListener by logger.listener
+
+/** A global (not loopback or link-local) address of ours in [family], as raw bytes. */
+private fun localAddress(family: Class<out java.net.InetAddress>): ByteArray? =
+    java.net.NetworkInterface
+        .getNetworkInterfaces()
+        .toList()
+        .filter { it.isUp && !it.isLoopback }
+        .flatMap { it.inetAddresses.toList() }
+        .firstOrNull { family.isInstance(it) && !it.isLinkLocalAddress && !it.isLoopbackAddress }
+        ?.address

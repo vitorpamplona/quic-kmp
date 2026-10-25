@@ -223,23 +223,26 @@ class QuicConnection internal constructor(
     val isServer: Boolean get() = serverSetup != null
 
     /**
-     * Server: the client address we send to. It only moves inside the
-     * writer, with the datagram that carries the new path's PATH_CHALLENGE,
-     * so nothing built for the old path goes to the new one.
+     * Server: the path we send on. It only moves inside the writer, with the
+     * datagram that carries the new path's PATH_CHALLENGE, so nothing built
+     * for the old path goes to the new one.
      */
     @kotlin.concurrent.Volatile
-    internal var sendAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = serverSetup?.peerAddress
+    internal var sendPath: ServerPath? = serverSetup?.peerAddress?.let { ServerPath(0, it) }
 
-    /** Server: where the client's latest packets come from (RFC 9000 §9.3). */
-    internal var peerAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = serverSetup?.peerAddress
+    /** Server: the client address we send to. */
+    internal val sendAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? get() = sendPath?.peer
 
-    /** Server: the source of the datagram being parsed; the endpoint's socket sets it. */
-    internal var datagramSource: com.vitorpamplona.quic.transport.UdpPeerAddress? = null
+    /** Server: the path the client's latest packets came on (RFC 9000 §9.3). */
+    internal var peerPath: ServerPath? = sendPath
 
-    /** Server: the client moved; we're validating its new address (RFC 9000 §9.3). */
+    /** Server: the path of the datagram being parsed; the endpoint's socket sets it. */
+    internal var datagramPath: ServerPath? = null
+
+    /** Server: the client moved; we're validating its new path (RFC 9000 §9.3). */
     internal class PeerMigration(
-        val address: com.vitorpamplona.quic.transport.UdpPeerAddress,
-        val previous: com.vitorpamplona.quic.transport.UdpPeerAddress,
+        val path: ServerPath,
+        val previous: ServerPath,
         val challenge: ByteArray,
         val startedAtMillis: Long,
     ) {
@@ -250,20 +253,21 @@ class QuicConnection internal constructor(
     internal var peerMigration: PeerMigration? = null
 
     /**
-     * Server: after a short-header packet from [datagramSource] was
-     * processed. RFC 9000 §9.3: a non-probing packet with the highest packet
-     * number from a new address moves the connection there (NAT rebinding,
-     * or the client migrating); we then validate the new address with a
-     * PATH_CHALLENGE, and start its congestion state over unless only the
-     * port changed (§9.4). Caller holds [streamsLock].
+     * Server: after a short-header packet on [datagramPath] was processed.
+     * RFC 9000 §9.3: a non-probing packet with the highest packet number on a
+     * new path moves the connection there — the client's address changed (NAT
+     * rebinding, migration) or it moved to our preferred address (§9.6). We
+     * then validate the path with a PATH_CHALLENGE, and start its congestion
+     * state over unless only the client's port changed (§9.4). Caller holds
+     * [streamsLock].
      */
     internal fun notePeerAddressLocked(
         frames: List<com.vitorpamplona.quic.frame.Frame>,
         largestReceived: Boolean,
         nowMillis: Long,
     ) {
-        val src = datagramSource ?: return
-        val current = peerAddress ?: return
+        val src = datagramPath ?: return
+        val current = peerPath ?: return
         if (src == current || !largestReceived || !handshakeConfirmed) return
         val probing =
             frames.all {
@@ -273,8 +277,8 @@ class QuicConnection internal constructor(
                     it is com.vitorpamplona.quic.frame.PaddingFrame
             }
         if (probing) return
-        peerAddress = src
-        // Returning to the address we were validating away from needs no new challenge.
+        peerPath = src
+        // Returning to the path we were validating away from needs no new challenge.
         val back = peerMigration?.previous == src
         peerMigration =
             if (back) {
@@ -288,19 +292,19 @@ class QuicConnection internal constructor(
                     nowMillis,
                 )
             }
-        if (back) sendAddress = src
-        if (!src.ip.contentEquals(current.ip)) congestion.reset()
+        if (back) sendPath = src
+        if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) congestion.reset()
         QuicLog.d(TAG) { "peer moved $current -> $src" }
     }
 
-    /** Server: a migration whose challenge got no answer in time goes back to the old address. */
+    /** Server: a migration whose challenge got no answer in time goes back to the old path. */
     internal fun checkPeerMigrationTimeoutLocked(nowMillis: Long) {
         val m = peerMigration ?: return
         if (nowMillis - m.startedAtMillis < 3 * pathProbeRetransmitMillis().coerceAtLeast(PEER_MIGRATION_MIN_TIMEOUT_MS)) return
-        QuicLog.d(TAG) { "no PATH_RESPONSE from ${m.address}; back to ${m.previous}" }
+        QuicLog.d(TAG) { "no PATH_RESPONSE on ${m.path}; back to ${m.previous}" }
         peerMigration = null
-        peerAddress = m.previous
-        sendAddress = m.previous
+        peerPath = m.previous
+        sendPath = m.previous
     }
 
     /** Wakes the driver's send loop; set by [QuicConnectionDriver.start]. */
@@ -1632,6 +1636,19 @@ class QuicConnection internal constructor(
             alpnList.any { it.contentEquals(cachedAlpn) }
         }
 
+    /**
+     * Server: the connection ID (sequence 1, RFC 9000 §5.1.1) that comes with
+     * our `preferred_address`; spares are numbered after it.
+     */
+    private val serverPreferredAddressCid: IssuedSourceConnectionIdEntry? =
+        serverSetup?.preferredAddress?.let {
+            val (cid, token) = mintOwnConnectionId()
+            IssuedSourceConnectionIdEntry(PREFERRED_ADDRESS_CID_SEQUENCE, cid, token).also { entry ->
+                issuedSourceConnectionIds[entry.sequenceNumber] = entry
+                nextOwnSourceCidSeq = entry.sequenceNumber + 1
+            }
+        }
+
     /** The TLS side this connection plays: a [TlsClient], or a [TlsServer] on a server. */
     internal val handshakeTls: com.vitorpamplona.quic.tls.TlsHandshake =
         serverSetup?.tlsServerFactory?.invoke(buildLocalTransportParameters().encode(), tlsListener)
@@ -1965,6 +1982,18 @@ class QuicConnection internal constructor(
             originalDestinationConnectionId = serverSetup?.originalDestinationConnectionId?.bytes,
             retrySourceConnectionId = serverSetup?.retrySourceConnectionId?.bytes,
             statelessResetToken = serverSetup?.let { it.statelessResetTokenFor(it.localConnectionId) },
+            preferredAddress =
+                serverPreferredAddressCid?.let { entry ->
+                    val pa = serverSetup!!.preferredAddress!!
+                    PreferredAddress(
+                        ipv4Address = pa.ipv4?.ip ?: ByteArray(4),
+                        ipv4Port = pa.ipv4?.port ?: 0,
+                        ipv6Address = pa.ipv6?.ip ?: ByteArray(16),
+                        ipv6Port = pa.ipv6?.port ?: 0,
+                        connectionId = entry.connectionId,
+                        statelessResetToken = entry.statelessResetToken,
+                    )
+                },
             unknown = if (config.greaseTransportParameters) greaseTransportParameter() else emptyMap(),
         )
 
@@ -3311,9 +3340,6 @@ class QuicConnection internal constructor(
         }
     }
 
-    /** True once the peer retired sequence 0, our handshake SCID. */
-    private var initialSourceCidRetired = false
-
     /**
      * RFC 9000 §19.16: peer asked us to retire one of our own
      * source CIDs.
@@ -3346,10 +3372,6 @@ class QuicConnection internal constructor(
             return
         }
         val removed = issuedSourceConnectionIds.remove(sequenceNumber)
-        if (sequenceNumber == 0L && !initialSourceCidRetired) {
-            initialSourceCidRetired = true
-            serverSetup?.onConnectionIdRetired(sourceConnectionId)
-        }
         removed?.let { serverSetup?.onConnectionIdRetired(ConnectionId(it.connectionId)) }
         if (removed == null) {
             // Already-retired entry; benign §19.16 retransmit.

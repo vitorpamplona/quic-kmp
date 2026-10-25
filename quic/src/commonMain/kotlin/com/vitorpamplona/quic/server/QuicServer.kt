@@ -29,6 +29,7 @@ import com.vitorpamplona.quic.connection.ConnectionId
 import com.vitorpamplona.quic.connection.QuicConnection
 import com.vitorpamplona.quic.connection.QuicConnectionDriver
 import com.vitorpamplona.quic.connection.QuicServerSetup
+import com.vitorpamplona.quic.connection.ServerPath
 import com.vitorpamplona.quic.connection.defaultEpochMillis
 import com.vitorpamplona.quic.connection.defaultMonotonicNowMillis
 import com.vitorpamplona.quic.observability.QlogObserver
@@ -78,7 +79,18 @@ class QuicServer(
     parentScope: CoroutineScope,
     private val nowMillis: () -> Long = defaultMonotonicNowMillis(),
     private val epochMillis: () -> Long = { defaultEpochMillis() },
+    /** Listens at [QuicServerConfig.preferredAddress]; required when one is set. */
+    preferredAddressTransport: QuicServerTransport? = null,
 ) {
+    init {
+        require((config.preferredAddress == null) == (preferredAddressTransport == null)) {
+            "a preferred address and its transport come together"
+        }
+    }
+
+    /** Index 0: where clients connect; 1: the preferred address. */
+    private val transports = listOfNotNull(transport, preferredAddressTransport)
+
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
     private val lock = SynchronizedObject()
@@ -86,27 +98,29 @@ class QuicServer(
     private val accepted = Channel<QuicServerConnection>(Channel.UNLIMITED)
     private val tokens = AddressTokens()
     private val resetTokens = StatelessResetTokens()
-    private var readJob: Job? = null
+    private val readJobs = ArrayList<Job>()
 
     /** Connections currently routed. */
     val connectionCount: Int get() = synchronized(lock) { routes.values.toSet().size }
 
     fun start() {
-        readJob =
-            scope.launch {
-                try {
-                    while (true) {
-                        val datagram = transport.receive() ?: break
-                        try {
-                            onDatagram(datagram)
-                        } catch (e: Exception) {
-                            QuicLog.w(TAG) { "dropped a datagram from ${datagram.from}: ${e.message}" }
+        for ((local, t) in transports.withIndex()) {
+            readJobs +=
+                scope.launch {
+                    try {
+                        while (true) {
+                            val datagram = t.receive() ?: break
+                            try {
+                                onDatagram(datagram, local)
+                            } catch (e: Exception) {
+                                QuicLog.w(TAG) { "dropped a datagram from ${datagram.from}: ${e.message}" }
+                            }
                         }
+                    } finally {
+                        if (local == 0) accepted.close()
                     }
-                } finally {
-                    accepted.close()
                 }
-            }
+        }
     }
 
     /** The next accepted connection; null once the server is closed. */
@@ -116,11 +130,15 @@ class QuicServer(
     fun close() {
         val sockets = synchronized(lock) { routes.values.toSet().also { routes.clear() } }
         for (s in sockets) s.owner?.driver?.close()
-        transport.close()
+        transports.forEach { it.close() }
         accepted.close()
     }
 
-    private suspend fun onDatagram(d: ReceivedDatagram) {
+    private suspend fun onDatagram(
+        d: ReceivedDatagram,
+        local: Int,
+    ) {
+        val transport = transports[local]
         val bytes = d.payload
         if (bytes.isEmpty()) return
         val first = bytes[0].toInt() and 0xFF
@@ -129,21 +147,22 @@ class QuicServer(
             val dcid = ConnectionId(bytes.copyOfRange(1, 1 + config.connectionIdLength))
             val route = synchronized(lock) { routes[dcid] }
             if (route != null) {
-                route.deliver(d)
+                route.deliver(d, local)
             } else {
-                sendStatelessReset(dcid, d)
+                sendStatelessReset(transport, dcid, d)
             }
             return
         }
         val header = parseLongHeader(bytes) ?: return
         synchronized(lock) { routes[header.dcid] }?.let {
-            it.deliver(d)
+            it.deliver(d, local)
             return
         }
         // Only a client Initial can start a connection; the rest of a
         // connection we don't know (0-RTT racing ahead of its Initial, or
         // packets of one already gone) is dropped.
-        if (header.version == QuicVersion.VERSION_NEGOTIATION) return
+        // Connections start at the address clients were given, not the preferred one.
+        if (header.version == QuicVersion.VERSION_NEGOTIATION || local != 0) return
         if (header.version !in config.supportedVersions) {
             // RFC 9000 §6.1 / §14.1: only for datagrams a client Initial could be.
             if (bytes.size >= MIN_INITIAL_DATAGRAM) sendVersionNegotiation(header, d.from)
@@ -178,7 +197,7 @@ class QuicServer(
     ) {
         val localCid = ConnectionId.random(config.connectionIdLength)
         val odcid = retry?.originalDestinationConnectionId ?: header.dcid
-        val socket = ServerPeerSocket(transport, d.from)
+        val socket = ServerPeerSocket(transports, d.from)
         var connRef: QuicConnection? = null
         val setup =
             QuicServerSetup(
@@ -208,6 +227,7 @@ class QuicServer(
                 onConnectionIdRetired = { cid -> synchronized(lock) { if (routes[cid] === socket) routes.remove(cid) } },
                 peerAddress = d.from,
                 newTokenFactory = if (config.issueNewTokens) ({ tokens.mintNewToken(d.from, epochMillis()) }) else null,
+                preferredAddress = config.preferredAddress,
             )
         val conn =
             QuicConnection(
@@ -240,7 +260,7 @@ class QuicServer(
             driver.close()
         }
         driver.start()
-        socket.deliver(d)
+        socket.deliver(d, 0)
         this.accepted.trySend(accepted)
         QuicLog.d(TAG) { "accepted ${d.from} odcid=${odcid.toHex()} version=${QuicVersion.name(header.version)} retry=${retry != null}" }
     }
@@ -289,6 +309,7 @@ class QuicServer(
      * the packet that triggered it, so two endpoints can't loop.
      */
     private suspend fun sendStatelessReset(
+        transport: QuicServerTransport,
         dcid: ConnectionId,
         d: ReceivedDatagram,
     ) {
@@ -345,31 +366,40 @@ class QuicServer(
 
 /** A server's view of one client path: datagrams the endpoint routed here in, sends out the shared transport. */
 internal class ServerPeerSocket(
-    private val transport: QuicServerTransport,
+    private val transports: List<QuicServerTransport>,
     @kotlin.concurrent.Volatile var peer: UdpPeerAddress,
 ) : QuicDatagramSocket {
     var owner: QuicServerConnection? = null
-    private val inbox = Channel<ReceivedDatagram>(INBOX_CAPACITY)
+    private val inbox = Channel<Pair<ReceivedDatagram, Int>>(INBOX_CAPACITY)
     private var datagrams = 0L
     private var bytes = 0L
 
-    /** Queue a datagram for the connection; dropped like a full socket buffer would when it lags. */
-    fun deliver(d: ReceivedDatagram) {
-        inbox.trySend(d)
+    /**
+     * Queue a datagram that arrived on transport [local] for the connection;
+     * dropped like a full socket buffer would when it lags.
+     */
+    fun deliver(
+        d: ReceivedDatagram,
+        local: Int,
+    ) {
+        inbox.trySend(d to local)
     }
 
-    /** To where the connection last pointed us: it moves only with a new path's PATH_CHALLENGE. */
-    override suspend fun send(payload: ByteArray): Int = transport.send(payload, owner?.connection?.sendAddress ?: peer)
+    /** On the path the connection last pointed us to: it moves only with a new path's PATH_CHALLENGE. */
+    override suspend fun send(payload: ByteArray): Int {
+        val path = owner?.connection?.sendPath
+        return if (path == null) transports[0].send(payload, peer) else transports[path.local].send(payload, path.peer)
+    }
 
     /**
      * The next datagram, after telling the connection where it came from
      * (the read loop parses it next, so the two can't interleave).
      */
     override suspend fun receive(): ByteArray? {
-        val d = inbox.receiveCatching().getOrNull() ?: return null
+        val (d, local) = inbox.receiveCatching().getOrNull() ?: return null
         datagrams++
         bytes += d.payload.size
-        owner?.connection?.datagramSource = d.from
+        owner?.connection?.datagramPath = ServerPath(local, d.from)
         return d.payload
     }
 

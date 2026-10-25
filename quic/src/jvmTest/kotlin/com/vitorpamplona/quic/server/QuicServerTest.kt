@@ -279,6 +279,56 @@ class QuicServerTest {
         }
 
     @Test
+    fun `a client moves to the server's preferred address and is challenged there`() =
+        runBlocking<Unit> {
+            val main = Network()
+            val preferred = Network()
+            val preferredAddress = UdpPeerAddress(byteArrayOf(10, 9, 9, 9), 4443)
+            val server =
+                QuicServer(
+                    QuicServerConfig(
+                        signer = signer,
+                        alpnSelector = { offered -> offered.firstOrNull { it.contentEquals(TlsConstants.ALPN_H3) } },
+                        preferredAddress = ServerPreferredAddress(ipv4 = preferredAddress),
+                    ),
+                    main,
+                    scope,
+                    preferredAddressTransport = preferred,
+                ).also { it.start() }
+            val conn =
+                QuicConnection(
+                    serverName = "quic.test",
+                    config = QuicConnectionConfig(),
+                    tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
+                )
+            var opened: Pair<String, Int>? = null
+            QuicConnectionDriver(
+                conn,
+                main.clientSocket(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 5007)),
+                scope,
+                socketFactory = { host, port ->
+                    opened = host to port
+                    preferred.clientSocket(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 5008))
+                },
+            ).start()
+            val accepted = echoOnce(server, conn)
+            withTimeout(5_000) { while (!conn.migratedToPreferredAddress) kotlinx.coroutines.delay(10) }
+            assertEquals("10.9.9.9" to 4443, opened)
+            // The next request rides the preferred path, and the server follows it there.
+            val request = conn.openBidiStream()
+            request.send.enqueue("moved".encodeToByteArray())
+            request.send.finish()
+            val serverSide = withTimeout(5_000) { assertNotNull(accepted.connection.awaitIncomingPeerStream()) }
+            assertEquals("moved", withTimeout(5_000) { serverSide.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }.decodeToString())
+            serverSide.send.enqueue("ok".encodeToByteArray())
+            serverSide.send.finish()
+            accepted.driver.wakeup()
+            assertEquals("ok", withTimeout(5_000) { request.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }.decodeToString())
+            assertEquals(1, accepted.connection.sendPath?.local)
+            withTimeout(5_000) { while (accepted.connection.peerMigration != null) kotlinx.coroutines.delay(10) }
+        }
+
+    @Test
     fun `a short header packet for an unknown connection gets a smaller stateless reset`() =
         runBlocking<Unit> {
             val network = Network()

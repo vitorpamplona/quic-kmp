@@ -58,11 +58,31 @@ class QuicServerConfig(
     val qlogObserverFactory: ((originalDestinationConnectionId: ByteArray) -> QlogObserver)? = null,
     /** A secrets listener per connection, e.g. an SSLKEYLOGFILE writer. */
     val secretsListenerFactory: (() -> TlsSecretsListener?)? = null,
+    /**
+     * Advertised to clients as `preferred_address` (RFC 9000 §9.6); the
+     * [QuicServer] then needs the transport that listens there.
+     */
+    val preferredAddress: ServerPreferredAddress? = null,
 ) {
     init {
         require(connectionIdLength in 8..20) { "connectionIdLength must be 8..20" }
         require(supportedVersions.isNotEmpty() && supportedVersions.all { QuicVersion.isSupported(it) }) {
             "supportedVersions must be non-empty and only list versions this library speaks"
         }
+    }
+}
+
+/**
+ * A server's preferred address (RFC 9000 §9.6): where clients should move
+ * once the handshake is confirmed. Either family may be absent.
+ */
+class ServerPreferredAddress(
+    val ipv4: com.vitorpamplona.quic.transport.UdpPeerAddress? = null,
+    val ipv6: com.vitorpamplona.quic.transport.UdpPeerAddress? = null,
+) {
+    init {
+        require(ipv4 != null || ipv6 != null) { "a preferred address needs at least one family" }
+        require(ipv4 == null || !ipv4.isIpv6) { "ipv4 must be an IPv4 address" }
+        require(ipv6 == null || ipv6.isIpv6) { "ipv6 must be an IPv6 address" }
     }
 }
