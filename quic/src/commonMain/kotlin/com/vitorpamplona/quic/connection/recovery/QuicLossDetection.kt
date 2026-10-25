@@ -73,6 +73,15 @@ class QuicLossDetection {
     var hasFirstRttSample: Boolean = false
         private set
 
+    /** A new path (RFC 9000 §9.4): its RTT is unknown, so start from the initial estimate. */
+    fun resetRttForNewPath() {
+        smoothedRttMs = INITIAL_RTT_MS
+        rttVarMs = INITIAL_RTT_MS / 2
+        latestRttMs = INITIAL_RTT_MS
+        minRttMs = Long.MAX_VALUE
+        hasFirstRttSample = false
+    }
+
     /**
      * Update RTT estimates from a new ACK that newly-acknowledged
      * the largest packet number. Per RFC 9002 §5.2, an RTT sample

@@ -181,17 +181,16 @@ fun drainOutbound(
         buildPmtuProbe(conn, nowMillis)?.let { return it }
     }
 
-    // Drain destructive frame sources into local lists, ONCE.
-    val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis, allowance)
-    val handshakeContents = collectHandshakeLevelFrames(conn, EncryptionLevel.HANDSHAKE, nowMillis, allowance)
-    val applicationPkt = buildApplicationPacket(conn, nowMillis, allowance)
-
+    // One datagram: the PMTU, or less while an amplification limit holds.
+    // Each level's packet is sized from what the ones before it left, so
+    // coalescing never makes the datagram bigger than that.
+    val datagramCap = minOf(conn.pmtud.currentSize.toLong(), conn.amplificationAllowance(), conn.migrationSendAllowance()).toInt()
     val initialState = conn.initial
     val handshakeState = conn.handshake
-    val initialHasContent = initialContents != null && initialState.sendProtection != null
-    val handshakeHasContent = handshakeContents != null && handshakeState.sendProtection != null
 
-    // Build natural-size first.
+    // Drain destructive frame sources into local lists, ONCE, building
+    // natural-size packets as we go.
+    val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis, allowance, room = datagramCap)
     val initialNatural =
         if (initialContents != null && initialState.sendProtection != null) {
             buildLongHeaderFromFrames(
@@ -205,6 +204,8 @@ fun drainOutbound(
         } else {
             null
         }
+    val handshakeContents =
+        collectHandshakeLevelFrames(conn, EncryptionLevel.HANDSHAKE, nowMillis, allowance, room = datagramCap - (initialNatural?.size ?: 0))
     val handshakeNatural =
         if (handshakeContents != null && handshakeState.sendProtection != null) {
             buildLongHeaderFromFrames(
@@ -218,6 +219,11 @@ fun drainOutbound(
         } else {
             null
         }
+
+    val applicationPkt =
+        buildApplicationPacket(conn, nowMillis, allowance, room = datagramCap - (initialNatural?.size ?: 0) - (handshakeNatural?.size ?: 0))
+    val initialHasContent = initialContents != null && initialState.sendProtection != null
+    val handshakeHasContent = handshakeContents != null && handshakeState.sendProtection != null
 
     val firstPass = listOfNotNull(initialNatural, handshakeNatural, applicationPkt)
     if (firstPass.isEmpty()) return if (allowance == SendAllowance.FULL) buildPmtuProbe(conn, nowMillis) else null
@@ -337,6 +343,11 @@ private fun buildPmtuProbe(
     conn.aeadEncryptCount += 1L
     conn.noteAckElicitingSent(nowMillis)
     emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, listOf(PingFrame))
+    // The same accounting as any other datagram: pacing, and a server's
+    // amplification limits.
+    conn.pacer.onSent(built.size)
+    if (!conn.addressValidated) conn.amplificationBytesSent += built.size
+    conn.peerMigration?.let { if (conn.sendPath == it.path) it.sent += built.size }
     return built
 }
 
@@ -669,6 +680,8 @@ private fun collectHandshakeLevelFrames(
     level: EncryptionLevel,
     nowMillis: Long,
     allowance: SendAllowance,
+    /** Bytes left in the datagram this packet joins. */
+    room: Int,
 ): HandshakeLevelContents? {
     val state = conn.levelState(level)
     if (state.sendProtection == null) return null
@@ -678,7 +691,14 @@ private fun collectHandshakeLevelFrames(
         frames += it
         tokens += RecoveryToken.Ack(level = level, largestAcked = it.largestAcknowledged)
     }
-    val cryptoChunk = if (allowance == SendAllowance.FULL) state.cryptoSend.takeChunk(maxBytes = 1100) else null
+    // CRYPTO gets what's left after the long header, the AEAD tag and the
+    // ACK; never more than 1100, which keeps an Initial plus a little else
+    // inside the 1200-byte minimum.
+    val headerAndTag =
+        LONG_HEADER_FIXED_OVERHEAD + conn.destinationConnectionId.length + conn.sourceConnectionId.length +
+            if (level == EncryptionLevel.INITIAL && !conn.isServer) (conn.retryToken ?: conn.addressValidationToken)?.size ?: 0 else 0
+    val cryptoRoom = minOf(1100, room - headerAndTag - (if (frames.isEmpty()) 0 else encodeFrames(frames).size))
+    val cryptoChunk = if (allowance == SendAllowance.FULL && cryptoRoom >= MIN_CRYPTO_CHUNK) state.cryptoSend.takeChunk(maxBytes = cryptoRoom) else null
     if (cryptoChunk != null && cryptoChunk.data.isNotEmpty()) {
         frames += CryptoFrame(cryptoChunk.offset, cryptoChunk.data)
         // Step E: record a Crypto retransmit token at the matching
@@ -852,6 +872,8 @@ private fun buildApplicationPacket(
     conn: QuicConnection,
     nowMillis: Long,
     allowance: SendAllowance = SendAllowance.FULL,
+    /** Bytes left in the datagram this packet joins. */
+    room: Int = Int.MAX_VALUE,
 ): ByteArray? {
     val state = conn.application
     // Prefer 1-RTT keys when available; fall back to 0-RTT keys for the
@@ -897,7 +919,7 @@ private fun buildApplicationPacket(
     // RFC 9000 §13.2.1: application-space ACKs may wait up to
     // max_ack_delay (or for a second ack-eliciting packet); they also ride
     // along on any packet that goes out anyway (see below).
-    fun appendAck() {
+    fun appendAck(): AckFrame? =
         state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt())?.let { plainAck ->
             // RFC 9000 §13.4.2: emit an ACK_ECN frame (variant 0x03,
             // ACK with ECN counts) for 1-RTT ACKs once we mark
@@ -928,8 +950,8 @@ private fun buildApplicationPacket(
                 )
             frames.add(0, ackWithCounts)
             tokens += RecoveryToken.Ack(level = EncryptionLevel.APPLICATION, largestAcked = ackWithCounts.largestAcknowledged)
+            ackWithCounts
         }
-    }
     if (use1Rtt && state.ackTracker.ackDue(nowMillis, conn.localMaxAckDelayMillis)) appendAck()
 
     // Step 7: PTO probe. The driver sets `pendingPing` when its
@@ -992,11 +1014,24 @@ private fun buildApplicationPacket(
     // we cumulatively sent past the cap).
     //
     // Stream room: the validated datagram size (PMTU discovery; 1200 until a
-    // larger size is proven) less ~100 bytes for headers, the AEAD tag and
-    // a coalesced packet, less the frames this packet already carries.
-    val controlBytes = if (frames.isEmpty()) 0 else encodeFrames(frames).size
-    val datagramCap = minOf(conn.pmtud.currentSize.toLong(), conn.migrationSendAllowance()).toInt()
-    var packetBudget = datagramCap - 100 - controlBytes
+    // larger size is proven), or what's left of the datagram this packet
+    // joins, less the packet header and AEAD tag, less the frames this
+    // packet already carries, less an ACK that will ride along.
+    // Frames are encoded once, into a reused writer, as they're added.
+    val w = conn.scratchPayloadWriter.also { it.reset() }
+    for (f in frames) f.encode(w)
+    val ackReserve =
+        if (use1Rtt && (frames.isEmpty() || frames[0] !is AckFrame)) state.ackTracker.pendingAckFrameSize() + ACK_ECN_COUNTS_SIZE else 0
+    val datagramCap = minOf(conn.pmtud.currentSize.toLong(), conn.migrationSendAllowance(), room.toLong()).toInt()
+    val headerAndTag =
+        if (use1Rtt) {
+            1 + conn.destinationConnectionId.length + 4 + proto.aead.tagLength
+        } else {
+            // 0-RTT long header: type, version, both CIDs, length (2), packet number.
+            1 + 4 + 1 + conn.destinationConnectionId.length + 1 + conn.sourceConnectionId.length + 2 + 4 + proto.aead.tagLength
+        }
+    var packetBudget = datagramCap - headerAndTag - w.size - ackReserve
+    var creditLimited = false
     val connRemaining =
         (conn.sendConnectionFlowCredit - conn.sendConnectionFlowConsumed).coerceAtLeast(0L)
     var connBudget = connRemaining
@@ -1068,17 +1103,26 @@ private fun buildApplicationPacket(
             for (k in 0 until tierSize) {
                 if (packetBudget <= 64) break@outer
                 val stream = sorted[tierStart + ((tierRotation + k) % tierSize)]
+                // STREAM frame header: type, stream id, offset (at most the
+                // send frontier), 2-byte length.
+                val frameHeader =
+                    1 +
+                        com.vitorpamplona.quic.Varint
+                            .size(stream.streamId) +
+                        com.vitorpamplona.quic.Varint
+                            .size(stream.send.nextOffset) + 2
                 val streamRemaining = (stream.sendCredit - stream.send.sentOffset).coerceAtLeast(0L)
                 // Skip if both stream and connection have no credit; FIN-only
                 // (zero-byte) chunks may still go through because they don't
                 // consume credit.
+                if (streamRemaining <= 0L || connBudget <= 0L) creditLimited = true
                 if (streamRemaining <= 0L && connBudget <= 0L && !stream.send.finPending) continue
                 val effectiveCap = minOf(streamRemaining, connBudget)
                 val maxBytes =
-                    minOf(packetBudget - 32, effectiveCap.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                    minOf(packetBudget - frameHeader, effectiveCap.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
                 val chunk = stream.send.takeChunk(maxBytes = maxBytes) ?: continue
                 if (chunk.data.isNotEmpty() || chunk.fin) {
-                    frames +=
+                    val streamFrame =
                         StreamFrame(
                             streamId = stream.streamId,
                             offset = chunk.offset,
@@ -1086,6 +1130,8 @@ private fun buildApplicationPacket(
                             fin = chunk.fin,
                             explicitLength = true,
                         )
+                    frames += streamFrame
+                    streamFrame.encode(w)
                     // Step C of the deferred-follow-ups pass: track this
                     // STREAM emission so RFC 9002 retransmit can re-queue
                     // the byte range on loss. SendBuffer.markLost (commit B)
@@ -1098,7 +1144,7 @@ private fun buildApplicationPacket(
                             length = chunk.data.size.toLong(),
                             fin = chunk.fin,
                         )
-                    packetBudget -= chunk.data.size + 32
+                    packetBudget -= chunk.data.size + frameHeader
                     // RFC 9000 §4.1: connection-level flow credit caps
                     // cumulative *new* bytes only — retransmits MUST
                     // NOT debit further. Pre-fix every retransmit
@@ -1113,11 +1159,19 @@ private fun buildApplicationPacket(
             tierStart = tierEnd
         }
         conn.streamRoundRobinStart = (rotation + 1) % streamsView.size
-        appendBlockedSignals(conn, sorted, connBudget, frames)
+        // Only a stream that ran into a credit limit can owe a BLOCKED frame.
+        if (creditLimited) {
+            val before = frames.size
+            appendBlockedSignals(conn, sorted, connBudget, frames, maxBytes = packetBudget + 64)
+            for (i in before until frames.size) frames[i].encode(w)
+        }
     }
 
-    // Piggy-back a not-yet-due ACK on a packet that leaves anyway.
-    if (use1Rtt && frames.isNotEmpty() && frames[0] !is AckFrame && state.ackTracker.hasUnackedAckEliciting()) appendAck()
+    // Piggy-back a not-yet-due ACK on a packet that leaves anyway (its room
+    // was reserved above).
+    if (use1Rtt && frames.isNotEmpty() && frames[0] !is AckFrame && state.ackTracker.hasUnackedAckEliciting()) {
+        appendAck()?.encode(w)
+    }
 
     if (frames.isEmpty()) return null
 
@@ -1139,7 +1193,7 @@ private fun buildApplicationPacket(
         }
     }
 
-    val payload = encodeFrames(frames)
+    val payload = w.toByteArray()
     val pn = state.pnSpace.allocateOutbound()
     // Retain the packet for RFC 9002 loss detection BEFORE the encrypt
     // step so the bookkeeping survives a build/encrypt throw (the PN
@@ -1254,13 +1308,18 @@ private fun appendBlockedSignals(
     streams: List<com.vitorpamplona.quic.stream.QuicStream>,
     connBudget: Long,
     frames: MutableList<Frame>,
+    /** Room in the packet; signals that don't fit wait for the next one. */
+    maxBytes: Int,
 ) {
     var anyFresh = false
+    var room = maxBytes - MAX_BLOCKED_FRAME_SIZE // keep one for DATA_BLOCKED
     for (stream in streams) {
         val send = stream.send
         if (send.nextOffset <= send.sentOffset) continue
         anyFresh = true
+        if (room < MAX_BLOCKED_FRAME_SIZE) continue
         if (stream.sendCredit <= send.sentOffset && stream.blockedReportedAt != stream.sendCredit) {
+            room -= MAX_BLOCKED_FRAME_SIZE
             frames +=
                 com.vitorpamplona.quic.frame
                     .StreamDataBlockedFrame(stream.streamId, stream.sendCredit)
@@ -1268,7 +1327,7 @@ private fun appendBlockedSignals(
         }
     }
     val limit = conn.sendConnectionFlowCredit
-    if (anyFresh && connBudget <= 0L && conn.dataBlockedReportedAt != limit) {
+    if (anyFresh && connBudget <= 0L && conn.dataBlockedReportedAt != limit && maxBytes >= MAX_BLOCKED_FRAME_SIZE) {
         frames +=
             com.vitorpamplona.quic.frame
                 .DataBlockedFrame(limit)
@@ -1604,4 +1663,20 @@ private fun appendFlowControlUpdates(
  * The smallest send worth making to a migrated client under its amplification
  * limit: a 1-RTT packet with an ACK and a PATH_CHALLENGE.
  */
-private const val MIN_MIGRATION_DATAGRAM = 64L
+internal const val MIN_MIGRATION_DATAGRAM = 64L
+
+/** The most a STREAM_DATA_BLOCKED (type, stream id, limit) or DATA_BLOCKED frame takes. */
+private const val MAX_BLOCKED_FRAME_SIZE = 17
+
+/** ACK_ECN's three counts, all zero (one byte each), on top of a plain ACK. */
+private const val ACK_ECN_COUNTS_SIZE = 3
+
+/**
+ * A long header's fixed bytes — first byte, version, two CID lengths, token
+ * length, packet length (2), packet number (up to 4) — plus the AEAD tag and
+ * a CRYPTO frame header (type, offset, length).
+ */
+private const val LONG_HEADER_FIXED_OVERHEAD = 1 + 4 + 1 + 1 + 2 + 2 + 4 + 16 + 1 + 4 + 2
+
+/** Below this, a CRYPTO frame waits for the next datagram rather than ride along tiny. */
+private const val MIN_CRYPTO_CHUNK = 32

@@ -184,6 +184,31 @@ class AckTracker {
     fun largestReceived(): Long = if (ranges.isEmpty()) -1L else ranges[0].endInclusive
 
     /**
+     * The encoded size of the ACK [buildAckFrame] would return now (ack
+     * delay counted at its widest, 4 bytes), without consuming it; 0 when
+     * none is pending. Lets a packet leave room for an ACK that rides along.
+     */
+    fun pendingAckFrameSize(): Int {
+        if (ranges.isEmpty() || !ackElicitingPending) return 0
+        val largest = ranges[0].endInclusive
+        var size =
+            1 +
+                com.vitorpamplona.quic.Varint
+                    .size(largest) + 4 +
+                com.vitorpamplona.quic.Varint
+                    .size((ranges.size - 1).toLong()) +
+                com.vitorpamplona.quic.Varint
+                    .size(largest - ranges[0].start)
+        for (i in 1 until ranges.size) {
+            size += com.vitorpamplona.quic.Varint
+                .size(ranges[i - 1].start - ranges[i].endInclusive - 2) +
+                com.vitorpamplona.quic.Varint
+                    .size(ranges[i].endInclusive - ranges[i].start)
+        }
+        return size
+    }
+
+    /**
      * Build an ACK frame covering everything we've received, OR null if nothing
      * new ack-eliciting has arrived since the last call.
      *

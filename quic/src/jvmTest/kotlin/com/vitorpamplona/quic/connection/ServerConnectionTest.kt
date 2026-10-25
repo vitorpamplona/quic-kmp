@@ -108,6 +108,8 @@ class ServerConnectionTest {
             }
             while (true) {
                 val d = drainOutbound(server, now) ?: break
+                // Coalesced levels never make a datagram bigger than the minimum PMTU.
+                if (!server.handshakeConfirmed) assertTrue(d.size <= 1200, "server handshake datagram of ${d.size} bytes")
                 counts.toClient += d.size
                 feedDatagram(client, d, now)
                 moved = true

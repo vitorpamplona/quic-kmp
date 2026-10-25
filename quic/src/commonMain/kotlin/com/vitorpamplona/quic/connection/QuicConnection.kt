@@ -317,8 +317,19 @@ class QuicConnection internal constructor(
                 )
             }
         if (back) sendPath = src
-        if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) congestion.reset()
+        if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) resetPathStateLocked()
         QuicLog.d(TAG) { "peer moved $current -> $src" }
+    }
+
+    /**
+     * RFC 9000 §9.4 / §14.3: a new path (not just a new port) has unknown
+     * capacity, RTT and MTU — start the congestion controller, the RTT
+     * estimate and PMTU discovery over.
+     */
+    internal fun resetPathStateLocked() {
+        congestion.reset()
+        lossDetection.resetRttForNewPath()
+        pmtud.resetForNewPath()
     }
 
     /** Server: a migration whose challenge got no answer in time goes back to the old path. */
@@ -1347,6 +1358,15 @@ class QuicConnection internal constructor(
         tracker.ackOnReorder = frame.reorderingThreshold != 0L
         localMaxAckDelayMillis = (frame.requestedMaxAckDelayMicros / 1000L).coerceAtLeast(1L)
     }
+
+    /** Whether the writer could send an ACK now: not draining or closed, and no amplification limit in the way. */
+    internal fun canSendAck(): Boolean =
+        (status == Status.CONNECTED || status == Status.HANDSHAKING) &&
+            amplificationAllowance() >= pmtud.currentSize &&
+            migrationSendAllowance() >= MIN_MIGRATION_DATAGRAM
+
+    /** Where the writer encodes a 1-RTT packet's frames; single writer under [streamsLock]. */
+    internal val scratchPayloadWriter = com.vitorpamplona.quic.QuicWriter(2048)
 
     /** A server owes the client this NEW_TOKEN token (RFC 9000 §8.1.3), first send or after a loss. */
     internal var pendingNewToken: ByteArray? = null
@@ -3680,6 +3700,8 @@ class QuicConnection internal constructor(
         if (probe.state != PathProbe.State.PROBING) return
         probe.state = PathProbe.State.VALIDATED
         migratedToPreferredAddress = true
+        // A different server address is a new path.
+        resetPathStateLocked()
         val priorSeq = pathValidator.activeCidSequence
         destinationConnectionId = probe.connectionId
         pathValidator.adoptConnectionId(probe.connectionIdSequence)

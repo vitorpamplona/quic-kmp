@@ -71,4 +71,30 @@ class StreamLimitsAndIdleTest {
         feedDatagram(client, assertNotNull(pipe.buildServerApplicationDatagram(listOf(com.vitorpamplona.quic.frame.PingFrame))), 40_000)
         assertEquals(40_000L, client.lastActivityMs)
     }
+
+    @Test
+    fun a_full_packet_with_many_ack_ranges_still_fits_the_datagram() =
+        runBlocking {
+            val (client, pipe) = newConnectedClient()
+            while (drainOutbound(client, 0L) != null) Unit
+            // Every other server packet lost: the client's next ACK has dozens of ranges.
+            repeat(200) { i ->
+                val d = assertNotNull(pipe.buildServerApplicationDatagram(listOf(com.vitorpamplona.quic.frame.PingFrame)))
+                if (i % 2 == 1) feedDatagram(client, d, 1)
+            }
+            // That ACK goes out now; its ranges stay until it is acknowledged.
+            while (drainOutbound(client, 1) != null) Unit
+            // One more packet, in order: an ACK is pending but not due, so it
+            // rides on the next data packet.
+            feedDatagram(client, assertNotNull(pipe.buildServerApplicationDatagram(listOf(com.vitorpamplona.quic.frame.PingFrame))), 2)
+            val stream = client.openBidiStream()
+            stream.send.enqueue(ByteArray(20_000))
+            var sent = 0
+            while (true) {
+                val d = drainOutbound(client, 2) ?: break
+                assertTrue(d.size <= client.pmtud.currentSize, "datagram of ${d.size} bytes, PMTU ${client.pmtud.currentSize}")
+                sent++
+            }
+            assertTrue(sent > 1)
+        }
 }

@@ -117,6 +117,16 @@ class PmtuDiscovery(
         }
     }
 
+    /** A new path (RFC 9000 §14.3): back to the base size, searching again from scratch. */
+    fun resetForNewPath() {
+        currentSize = BASE_SIZE
+        ceiling = configuredCeiling
+        probeSize = 0
+        failuresAtProbeSize = 0
+        probeInFlight = 0
+        nextSearchAtMillis = 0L
+    }
+
     /** Full-size packets stop arriving: assume the larger size is a black hole (RFC 8899 §4.3). */
     fun onBlackHoleSuspected(nowMillis: Long): Boolean {
         if (currentSize == BASE_SIZE) return false

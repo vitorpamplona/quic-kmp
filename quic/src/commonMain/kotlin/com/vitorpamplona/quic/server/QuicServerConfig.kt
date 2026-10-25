@@ -45,6 +45,12 @@ class QuicServerConfig(
      * CONNECTION_REFUSED (RFC 9000 §20.1) instead of a handshake.
      */
     val maxConnections: Int = 10_000,
+    /**
+     * With this many handshakes in progress, new clients must first prove
+     * their address with a Retry round trip (RFC 9000 §8.1.2), so a flood of
+     * spoofed Initials can't fill the server with half-open connections.
+     */
+    val retryAboveHandshakes: Int = 500,
     /** Give each client a NEW_TOKEN token, so its next connection skips address validation (RFC 9000 §8.1.3). */
     val issueNewTokens: Boolean = true,
     /** Enables session tickets and resumption. */

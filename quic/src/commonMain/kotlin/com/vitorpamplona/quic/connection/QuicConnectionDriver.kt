@@ -306,6 +306,9 @@ class QuicConnectionDriver(
     }
 
     private suspend fun sendLoopUntilClosed() {
+        // When the last keep-alive PING was queued. The idle clock only moves on
+        // the first send after a receive, so keep-alive keeps its own.
+        var lastKeepAliveMs = Long.MIN_VALUE
         while (connection.status != QuicConnection.Status.CLOSED) {
             // Swap paths before building: once a probe validates, the next
             // packets must already go to the preferred address.
@@ -452,7 +455,7 @@ class QuicConnectionDriver(
             val keepAliveMs = connection.config.keepAliveIntervalMillis
             val keepAliveDelta =
                 if (keepAliveMs > 0L && connection.handshakeConfirmed && connection.status == QuicConnection.Status.CONNECTED) {
-                    (connection.lastActivityMs + keepAliveMs - nowForLossTimer).coerceAtLeast(0L)
+                    (maxOf(connection.lastActivityMs, lastKeepAliveMs) + keepAliveMs - nowForLossTimer).coerceAtLeast(0L)
                 } else {
                     null
                 }
@@ -461,7 +464,10 @@ class QuicConnectionDriver(
                 connection.application.ackTracker
                     .ackDeadlineMillis(connection.localMaxAckDelayMillis)
                     ?.let { (it - nowForLossTimer).coerceAtLeast(0L) }
-                    ?.takeIf { connection.application.sendProtection != null }
+                    // Only while a drain could send it: not when draining, nor
+                    // while an amplification limit holds everything back
+                    // (else an overdue ACK spins this loop).
+                    ?.takeIf { connection.application.sendProtection != null && connection.canSendAck() }
             val sleepMillis =
                 minOf(
                     ptoMillis,
@@ -503,8 +509,9 @@ class QuicConnectionDriver(
                     continue
                 }
                 if (keepAliveDelta != null && keepAliveDelta < ptoMillis && (nextLossDelta == null || keepAliveDelta < nextLossDelta) &&
-                    nowMillis() - connection.lastActivityMs >= keepAliveMs
+                    nowMillis() - maxOf(connection.lastActivityMs, lastKeepAliveMs) >= keepAliveMs
                 ) {
+                    lastKeepAliveMs = nowMillis()
                     connection.pendingPing = true
                     continue
                 }

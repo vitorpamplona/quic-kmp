@@ -32,7 +32,12 @@ import com.vitorpamplona.quic.connection.QuicServerSetup
 import com.vitorpamplona.quic.connection.ServerPath
 import com.vitorpamplona.quic.connection.defaultEpochMillis
 import com.vitorpamplona.quic.connection.defaultMonotonicNowMillis
+import com.vitorpamplona.quic.crypto.AesEcbHeaderProtection
+import com.vitorpamplona.quic.crypto.InitialSecrets
+import com.vitorpamplona.quic.crypto.PlatformAesOneBlock
+import com.vitorpamplona.quic.crypto.bestAes128GcmAead
 import com.vitorpamplona.quic.observability.QlogObserver
+import com.vitorpamplona.quic.packet.LongHeaderPacket
 import com.vitorpamplona.quic.packet.LongHeaderType
 import com.vitorpamplona.quic.packet.QuicVersion
 import com.vitorpamplona.quic.packet.RetryPacket
@@ -101,6 +106,9 @@ class QuicServer(
     private val readJobs = ArrayList<Job>()
 
     private var liveConnections = 0
+
+    /** Connections that haven't finished their handshake yet. */
+    private var handshaking = 0
 
     /** Connections currently running. */
     val connectionCount: Int get() = synchronized(lock) { liveConnections }
@@ -181,6 +189,9 @@ class QuicServer(
         // RFC 9000 §14.1: a server discards an Initial in a datagram under
         // 1200 bytes; §7.2: the client's first DCID has at least 8 bytes.
         if (bytes.size < MIN_INITIAL_DATAGRAM || header.dcid.length < 8 && header.token.isEmpty()) return
+        // Spend nothing more on a datagram whose Initial doesn't open with the
+        // keys its DCID derives (RFC 9001 §5.2): junk, or not for us.
+        if (!initialAuthenticates(bytes, header)) return
         val now = epochMillis()
         var retry: AddressTokens.Retry? = null
         var returning = false
@@ -200,7 +211,8 @@ class QuicServer(
             refuse(header, d, com.vitorpamplona.quic.frame.QuicTransportError.CONNECTION_REFUSED, "server at its connection limit")
             return
         }
-        if (retry == null && !returning && config.requireRetry) {
+        val underLoad = synchronized(lock) { handshaking } >= config.retryAboveHandshakes
+        if (retry == null && !returning && (config.requireRetry || underLoad)) {
             sendRetry(header, d.from, now)
             return
         }
@@ -234,17 +246,24 @@ class QuicServer(
         val driver = QuicConnectionDriver(conn, socket, scope)
         val accepted = QuicServerConnection(conn, driver, socket)
         socket.owner = accepted
+        val inHandshake = HandshakeSlot()
         synchronized(lock) {
             routes[header.dcid] = socket
             routes[conn.sourceConnectionId] = socket
             liveConnections++
+            handshaking++
         }
         conn.onTerminated = {
             synchronized(lock) {
                 routes.entries.removeAll { it.value === socket }
                 liveConnections--
+                if (inHandshake.release()) handshaking--
             }
             driver.close()
+        }
+        scope.launch {
+            runCatching { conn.awaitHandshake() }
+            synchronized(lock) { if (inHandshake.release()) handshaking-- }
         }
         driver.start()
         socket.deliver(d, 0)
@@ -377,6 +396,31 @@ class QuicServer(
         packet[0] = ((packet[0].toInt() and 0x3F) or 0x40).toByte()
         resetTokens.tokenFor(dcid).copyInto(packet, size - 16)
         transport.send(packet, d.from)
+    }
+
+    /** True when the datagram's first packet opens with the client Initial keys derived from its DCID. */
+    private fun initialAuthenticates(
+        bytes: ByteArray,
+        header: LongHeader,
+    ): Boolean {
+        val keys = InitialSecrets.derive(header.dcid.bytes, header.version)
+        return LongHeaderPacket.parseAndDecrypt(
+            bytes = bytes,
+            offset = 0,
+            aead = bestAes128GcmAead(keys.clientKey),
+            key = keys.clientKey,
+            iv = keys.clientIv,
+            hp = AesEcbHeaderProtection(PlatformAesOneBlock),
+            hpKey = keys.clientHp,
+            largestReceivedInSpace = -1L,
+        ) != null
+    }
+
+    /** Counts a connection among those handshaking once; guarded by the server's lock. */
+    private class HandshakeSlot {
+        private var held = true
+
+        fun release(): Boolean = held.also { held = false }
     }
 
     internal class LongHeader(
