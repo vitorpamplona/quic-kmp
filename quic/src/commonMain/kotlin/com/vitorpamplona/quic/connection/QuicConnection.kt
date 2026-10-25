@@ -346,8 +346,11 @@ class QuicConnection internal constructor(
     @kotlin.concurrent.Volatile
     internal var sendWakeup: (() -> Unit)? = null
 
-    /** The application read stream data: the writer may owe the peer more credit. */
-    private val onStreamConsumed: () -> Unit = { sendWakeup?.invoke() }
+    /**
+     * The application wrote to a stream, or read from one (the writer may owe
+     * the peer more credit): either way the send loop has work.
+     */
+    private val wakeSender: () -> Unit = { sendWakeup?.invoke() }
 
     /** Called once when the connection terminates; a server endpoint drops its routes. */
     internal var onTerminated: (() -> Unit)? = null
@@ -1391,6 +1394,14 @@ class QuicConnection internal constructor(
      */
     @Volatile
     internal var consecutivePtoCount: Int = 0
+
+    /**
+     * RFC 9002 §6.2.1: the PTO timer runs only while ack-eliciting packets are
+     * in flight, or, on a client, until the handshake is confirmed (the
+     * server may still be blocked by its amplification limit). Without the
+     * check an idle connection sends a PING every PTO.
+     */
+    internal fun ptoArmed(): Boolean = !isServer && !handshakeConfirmed || initial.bytesInFlight > 0L || handshake.bytesInFlight > 0L || application.bytesInFlight > 0L
 
     /**
      * RFC 9002 §6.2.4 probe budget. Set to 2 each time the PTO timer
@@ -2447,7 +2458,8 @@ class QuicConnection internal constructor(
         val stream = QuicStream(id, QuicStream.Direction.BIDIRECTIONAL)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataBidiRemote ?: config.initialMaxStreamDataBidiRemote
         stream.receiveLimit = config.initialMaxStreamDataBidiLocal
-        stream.consumptionListener = onStreamConsumed
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -2483,7 +2495,8 @@ class QuicConnection internal constructor(
         val stream = QuicStream(id, QuicStream.Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE, bestEffort = bestEffort)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataUni ?: config.initialMaxStreamDataUni
         stream.receiveLimit = 0L // can't receive
-        stream.consumptionListener = onStreamConsumed
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -2649,7 +2662,10 @@ class QuicConnection internal constructor(
 
     suspend fun streamById(id: Long): QuicStream? = streamsLock.withLock { streams[id] }
 
-    suspend fun queueDatagram(payload: ByteArray) = streamsLock.withLock { pendingDatagrams.addLast(payload) }
+    suspend fun queueDatagram(payload: ByteArray) {
+        streamsLock.withLock { pendingDatagrams.addLast(payload) }
+        wakeSender()
+    }
 
     suspend fun pollIncomingDatagram(): ByteArray? = streamsLock.withLock { incomingDatagrams.removeFirstOrNull() }
 
@@ -2859,7 +2875,8 @@ class QuicConnection internal constructor(
                 !local -> config.initialMaxStreamDataBidiRemote
                 else -> config.initialMaxStreamDataBidiLocal
             }
-        stream.consumptionListener = onStreamConsumed
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         newPeerStreams.addLast(stream)
@@ -3249,9 +3266,9 @@ class QuicConnection internal constructor(
      *
      * Why retirement is safe even though the QUIC spec requires the peer
      * to deliver retransmits if its ACK never reached us:
-     *  - SEND side waits for `finAcked` / `resetAcked`, i.e. the peer has
-     *    already confirmed receipt of our FIN. After that point the peer
-     *    will not re-send anything on the stream.
+     *  - SEND side waits for `fullyAcked` / `resetAcked`, i.e. the peer has
+     *    confirmed every byte and the FIN (or our RESET_STREAM), so nothing
+     *    is left for us to retransmit.
      *  - RECEIVE side waits for the parser to have pushed every byte to
      *    the application's incoming Channel ([ReceiveBuffer.isFullyRead]).
      *    Retired stream IDs are recorded in [retiredStreamIdSet] so a

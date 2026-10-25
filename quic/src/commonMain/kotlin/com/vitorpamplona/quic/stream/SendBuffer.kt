@@ -180,6 +180,17 @@ class SendBuffer(
     val finAcked: Boolean get() = _finAcked
 
     /**
+     * The FIN and every byte before it were acknowledged. The FIN can be ACK'd
+     * while an earlier range is still lost and waiting for its retransmit, so
+     * [finAcked] alone doesn't mean the peer has the whole stream.
+     */
+    val fullyAcked: Boolean
+        get() =
+            synchronized(lock) {
+                _finAcked && inFlight.isEmpty() && retransmit.isEmpty() && nextSendOffset == _nextOffset
+            }
+
+    /**
      * Bytes the writer would emit on the next [takeChunk] before any
      * flow-control limits. Includes both retransmit-queued bytes (which
      * have priority) and unsent-fresh bytes. Used by the writer's
@@ -204,6 +215,9 @@ class SendBuffer(
      */
     val sentOffset: Long get() = nextSendOffset
 
+    /** Told when [enqueue] or [finish] gave the writer something to send, so the connection can wake it. */
+    internal var onQueued: (() -> Unit)? = null
+
     fun enqueue(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         synchronized(lock) {
@@ -212,11 +226,13 @@ class SendBuffer(
             dataLen += bytes.size
             _nextOffset += bytes.size
         }
+        onQueued?.invoke()
     }
 
     /** Mark the write side as closing; the next [takeChunk] sets FIN once empty. */
     fun finish() {
         synchronized(lock) { _finPending = true }
+        onQueued?.invoke()
     }
 
     /**

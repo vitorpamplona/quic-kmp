@@ -392,7 +392,8 @@ class QuicConnectionDriver(
                     .ptoBaseMs(maxAckDelayMs)
                     .coerceAtLeast(1L)
             val backoff = (1L shl connection.consecutivePtoCount.coerceAtMost(6))
-            val ptoMillis = (ptoBaseMs * backoff).coerceAtMost(60_000L)
+            val ptoArmed = connection.ptoArmed()
+            val ptoMillis = if (ptoArmed) (ptoBaseMs * backoff).coerceAtMost(60_000L) else Long.MAX_VALUE
             // RFC 9002 §6.1.2 timer-driven loss detection: take the
             // earliest of (PTO deadline, next-loss-time across levels).
             // Without this, tail loss waits for the PTO instead of the
@@ -528,7 +529,7 @@ class QuicConnectionDriver(
                 val pickedLossTimer = nextLossDelta != null && nextLossDelta < ptoMillis
                 if (pickedLossTimer) {
                     handleLossTimerFired(connection)
-                } else {
+                } else if (ptoArmed) {
                     handlePtoFired(connection)
                 }
             }

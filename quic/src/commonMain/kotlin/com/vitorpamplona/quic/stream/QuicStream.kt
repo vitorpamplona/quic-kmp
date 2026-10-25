@@ -129,6 +129,13 @@ class QuicStream(
     /** Told when the application consumed bytes, so the connection can extend credit. */
     internal var consumptionListener: (() -> Unit)? = null
 
+    /** Told when the application gave the writer something to send: data, a FIN, a reset or a STOP_SENDING. */
+    internal var sendListener: (() -> Unit)? = null
+        set(value) {
+            field = value
+            send.onQueued = value
+        }
+
     private fun onConsumed(size: Int) {
         consumedBytes += size
         receiveDirtyForFlowControl = true
@@ -220,7 +227,9 @@ class QuicStream(
      * receive bytes (receive side).
      *
      * Lifetime contract:
-     *  - SEND side done: peer has ACK'd our FIN ([SendBuffer.finAcked]) OR
+     *  - SEND side done: peer has ACK'd our FIN and every byte before it
+     *    ([SendBuffer.fullyAcked]; a lost range can still be awaiting its
+     *    retransmit after the FIN is ACK'd) OR
      *    we ABORTed the stream and the peer ACK'd our RESET_STREAM
      *    ([resetAcked]). For [Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL]
      *    there is no send side, so this leg is trivially done.
@@ -254,7 +263,7 @@ class QuicStream(
 
                     Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE,
                     Direction.BIDIRECTIONAL,
-                    -> send.finAcked || resetAcked
+                    -> send.fullyAcked || resetAcked
                 }
             if (!sendSettled) return false
             val recvSettled =
@@ -350,6 +359,7 @@ class QuicStream(
             )
         if (resetState.compareAndSet(null, newState)) {
             resetEmitPending = true
+            sendListener?.invoke()
         }
     }
 
@@ -371,6 +381,7 @@ class QuicStream(
         // Same lock-free first-call-wins rationale as [resetStream].
         if (stopSendingState.compareAndSet(null, StopSendingState(errorCode = errorCode))) {
             stopSendingEmitPending = true
+            sendListener?.invoke()
         }
     }
 
