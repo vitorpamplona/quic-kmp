@@ -51,6 +51,16 @@ Found by the server sweep, and affecting the client as well:
 - A PATH_CHALLENGE that arrived with the PATH_RESPONSE validating our preferred-address probe
   was never answered.
 
+- A resent NEW_CONNECTION_ID for a connection ID we had already retired put it back in the pool,
+  and quinn answered our next packet on it with a stateless reset.
+- Handshake ACKs were sent once: with that ACK lost and the peer's packets ACK-only, picoquic
+  never learned its certificate was lost. Ack-eliciting Initial/Handshake packets now repeat it.
+- A server PATH_CHALLENGE that arrived on our preferred-address probe just before its
+  PATH_RESPONSE went unanswered, and lsquic never moved its sending to the new path.
+- A receiver that sent only ACKs went silent when the peer's packets stopped arriving (after a
+  NAT rebinding), so the peer never learned its new address. A PTO of silence after an ACK-only
+  packet now sends one PING.
+
 Server-only: a client whose NAT rebound before the handshake finished was never answered again;
 with a HelloRetryRequest the server switched versions before the retry (picoquic then restarted its
 handshake) and skipped PSK resumption on ClientHello2 (s2n-quic, xquic, kwik lead with P-256
@@ -78,9 +88,9 @@ runner. Consequences:
   numbers at a random large value; the rebind checks then can't see the PATH_CHALLENGE that is
   there (checked by decrypting the packets by hand, and with tshark 4.6.6).
 - quiche's rebind tests time out against our client: the packets quiche sent just as the NAT
-  rebound are lost, our ACKs (sent on the new path) report the gap, but quiche's log never
-  declares those packets lost, so the data is never resent and the transfer waits forever. Per-path
-  loss detection is the likely cause; unconfirmed.
+  rebound are lost, our ACKs (sent on the new path) report the gap, but quiche never declares
+  those packets lost, so the data is never resent and the transfer waits forever. ngtcp2's and
+  quic-go's clients fail the same tests against quiche here.
 
 ## Interop results: our server against the runner's clients
 
@@ -126,4 +136,40 @@ What the failures are (other than `ipv6`, which this sandbox can't run):
   window was shut and never sent the rest.
 - mvfst handshakeloss / handshakecorruption: its client downloads everything on one connection
   where the test wants one per file.
+
+## Interop results: our client against the runner's servers
+
+2026-10-25, final image (`client-*.json` plus reruns of tests fixed during the sweep).
+
+| server | handshake | transfer | longrtt | chacha20 | multiplexing | retry | resumption | zerortt | http3 | blackhole | keyupdate | ecn | amplificationlimit | handshakeloss | transferloss | handshakecorruption | transfercorruption | ipv6 | v2 | rebind-port | rebind-addr | connectionmigration |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| aioquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | - |
+| go-x-net | ok | ok | ok | - | ok | - | - | - | - | ok | ok | - | ok | - | ok | - | ok | FAIL | - | FAIL | FAIL | - |
+| haproxy | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | FAIL | FAIL | - |
+| kwik | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | - |
+| lsquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | ok |
+| msquic | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | - |
+| mvfst | ok | ok | ok | - | ok | - | ok | ok | ok | ok | ok | - | FAIL | ok | ok | ok | ok | FAIL | - | ok | ok | - |
+| neqo | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | FAIL |
+| nginx | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | ok | ok | - |
+| ngtcp2 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | FAIL | FAIL | FAIL |
+| picoquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | FAIL |
+| quic-go | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | ok | ok | - |
+| quiche | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | FAIL | FAIL | - |
+| quinn | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | - | ok | ok | - |
+| s2n-quic | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | - | ok | ok | FAIL |
+| xquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | ok | ok | - |
+
+What the failures are (other than `ipv6`):
+
+- ngtcp2 rebind-port / rebind-addr: the host's tshark can't decrypt ngtcp2's 1-RTT packets (see
+  above); connectionmigration with ngtcp2, picoquic, neqo: their preferred address is IPv6.
+- quiche rebind-port / rebind-addr: quiche never resends what it lost as the NAT rebound (above);
+  ngtcp2's and quic-go's clients fail the same way.
+- haproxy rebind-port / rebind-addr: haproxy keeps sending to the old address although our
+  packets (PINGs included) come from the new one; ngtcp2's and quic-go's clients fail the same
+  tests, and its resumption test too (ours passed on a rerun).
+- go-x-net rebind-port / rebind-addr: go-x-net never sends to our new address.
+- mvfst amplificationlimit: mvfst's server sends more than three times what it received.
+- s2n-quic connectionmigration: s2n-quic offers no preferred address.
 
