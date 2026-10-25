@@ -35,12 +35,26 @@ class AckTracker {
     private var ackElicitingPending: Boolean = false
     private var largestRecvTimeMillis: Long = 0L
 
+    /** Ack-eliciting packets received since the last ACK we built (RFC 9000 §13.2.2). */
+    private var ackElicitingSinceAck: Int = 0
+
+    /** Arrival time of the oldest ack-eliciting packet the next ACK will cover. */
+    private var firstUnackedAtMillis: Long = Long.MIN_VALUE
+
+    /** An arrival out of order (a gap or a fill) since the last ACK: acknowledge at once (§13.2.1). */
+    private var reorderedSinceAck: Boolean = false
+
     fun receivedPacket(
         packetNumber: Long,
         ackEliciting: Boolean,
         receivedAtMillis: Long,
     ) {
-        if (ackEliciting) ackElicitingPending = true
+        if (ackEliciting) {
+            if (!ackElicitingPending) firstUnackedAtMillis = receivedAtMillis
+            ackElicitingPending = true
+            ackElicitingSinceAck++
+            if (ranges.isNotEmpty() && packetNumber != ranges[0].endInclusive + 1) reorderedSinceAck = true
+        }
         if (ranges.isEmpty()) {
             ranges += LongRange(packetNumber, packetNumber)
             largestRecvTimeMillis = receivedAtMillis
@@ -103,6 +117,25 @@ class AckTracker {
     }
 
     fun hasUnackedAckEliciting(): Boolean = ackElicitingPending
+
+    /**
+     * RFC 9000 §13.2.1–§13.2.2 delayed-ACK policy for the application space:
+     * an ACK is due once two ack-eliciting packets arrived, as soon as one
+     * arrived out of order, or when the oldest unacknowledged one has waited
+     * [maxAckDelayMillis]. Initial and Handshake packets are acknowledged at
+     * once, so callers don't consult this for those spaces.
+     */
+    fun ackDue(
+        nowMillis: Long,
+        maxAckDelayMillis: Long,
+    ): Boolean {
+        if (!ackElicitingPending) return false
+        if (ackElicitingSinceAck >= ACK_ELICITING_THRESHOLD || reorderedSinceAck) return true
+        return nowMillis - firstUnackedAtMillis >= maxAckDelayMillis
+    }
+
+    /** When the pending ACK becomes due on its timer, or null when none is pending. */
+    fun ackDeadlineMillis(maxAckDelayMillis: Long): Long? = if (ackElicitingPending) firstUnackedAtMillis + maxAckDelayMillis else null
 
     /**
      * Drop ranges entirely below [threshold] — typically called after the peer
@@ -173,6 +206,8 @@ class AckTracker {
         val rawDelayMicros = (nowMillis - largestRecvTimeMillis).coerceAtLeast(0L) * 1000L
         val ackDelay = rawDelayMicros ushr ackDelayExponent
         ackElicitingPending = false
+        ackElicitingSinceAck = 0
+        reorderedSinceAck = false
         return AckFrame(
             largestAcknowledged = largest,
             ackDelay = ackDelay,
@@ -182,6 +217,9 @@ class AckTracker {
     }
 
     companion object {
+        /** RFC 9000 §13.2.2: acknowledge at least every second ack-eliciting packet. */
+        const val ACK_ELICITING_THRESHOLD: Int = 2
+
         /**
          * Cap on stored disjoint ranges. 64 is far above any healthy-link
          * count (a single in-order receive needs 1 range; tens of

@@ -39,9 +39,13 @@ import kotlin.test.assertNotNull
  * ACK — the peer would PTO-retransmit forever.
  *
  * Tests drive each frame through a CONNECTED client and assert that a
- * subsequent drainOutbound produces a packet (which contains the ACK).
+ * subsequent drainOutbound produces a packet (which contains the ACK). A
+ * lone ack-eliciting packet is acknowledged within max_ack_delay (RFC 9000
+ * §13.2.1), so the drain happens at that deadline.
  */
 class AckElicitingFramesTest {
+    private val ackDueMs = QuicConnectionConfig().maxAckDelay
+
     private fun connectedClient(): Pair<QuicConnection, InMemoryQuicPipe> {
         val client =
             QuicConnection(
@@ -76,7 +80,7 @@ class AckElicitingFramesTest {
             )!!
         feedDatagram(client, packet, nowMillis = 0L)
         // The client should now want to send an ACK.
-        val out = drainOutbound(client, nowMillis = 0L)
+        val out = drainOutbound(client, nowMillis = ackDueMs)
         assertNotNull(
             out,
             "MAX_DATA must be ack-eliciting; client must produce an ACK packet",
@@ -97,7 +101,7 @@ class AckElicitingFramesTest {
                 ),
             )!!
         feedDatagram(client, packet, nowMillis = 0L)
-        assertNotNull(drainOutbound(client, nowMillis = 0L))
+        assertNotNull(drainOutbound(client, nowMillis = ackDueMs))
     }
 
     @Test
@@ -113,7 +117,7 @@ class AckElicitingFramesTest {
                 ),
             )!!
         feedDatagram(client, packet, nowMillis = 0L)
-        assertNotNull(drainOutbound(client, nowMillis = 0L))
+        assertNotNull(drainOutbound(client, nowMillis = ackDueMs))
     }
 
     @Test
@@ -123,7 +127,7 @@ class AckElicitingFramesTest {
         val pings = List(40) { PaddingFrame }
         val packet = pipe.buildServerApplicationDatagram(listOf(HandshakeDoneFrame()) + pings)!!
         feedDatagram(client, packet, nowMillis = 0L)
-        assertNotNull(drainOutbound(client, nowMillis = 0L))
+        assertNotNull(drainOutbound(client, nowMillis = ackDueMs))
     }
 
     @Test
@@ -133,7 +137,7 @@ class AckElicitingFramesTest {
         val pings = List(40) { PaddingFrame }
         val packet = pipe.buildServerApplicationDatagram(listOf(frame) + pings)!!
         feedDatagram(client, packet, nowMillis = 0L)
-        assertNotNull(drainOutbound(client, nowMillis = 0L))
+        assertNotNull(drainOutbound(client, nowMillis = ackDueMs))
     }
 
     @Test

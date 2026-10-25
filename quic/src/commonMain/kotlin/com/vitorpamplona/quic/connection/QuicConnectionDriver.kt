@@ -430,6 +430,12 @@ class QuicConnectionDriver(
             // which wakes us, or the PTO.)
             val pacingDelta =
                 connection.pacingDelayMillis(nowForLossTimer).takeIf { it > 0L && !connection.congestionBlocked() }
+            // RFC 9000 §13.2.1: a delayed application ACK falls due at max_ack_delay.
+            val ackDelta =
+                connection.application.ackTracker
+                    .ackDeadlineMillis(connection.config.maxAckDelay)
+                    ?.let { (it - nowForLossTimer).coerceAtLeast(0L) }
+                    ?.takeIf { connection.application.sendProtection != null }
             val sleepMillis =
                 minOf(
                     ptoMillis,
@@ -438,6 +444,7 @@ class QuicConnectionDriver(
                     drainingDelta ?: Long.MAX_VALUE,
                     probeDelta ?: Long.MAX_VALUE,
                     pacingDelta ?: Long.MAX_VALUE,
+                    ackDelta ?: Long.MAX_VALUE,
                 )
             // Suspend until either: a wakeup arrives, or the timer expires.
             val woke =
@@ -468,8 +475,9 @@ class QuicConnectionDriver(
                     )
                     continue
                 }
-                // The pacer's timer woke us: just drain again.
-                if (pacingDelta != null && pacingDelta < ptoMillis && (nextLossDelta == null || pacingDelta < nextLossDelta)) {
+                // The pacer's or the ACK timer woke us: just drain again.
+                val softDelta = minOf(pacingDelta ?: Long.MAX_VALUE, ackDelta ?: Long.MAX_VALUE)
+                if (softDelta < ptoMillis && (nextLossDelta == null || softDelta < nextLossDelta)) {
                     continue
                 }
                 // The probe timer woke us: its work happens at the top of the loop.

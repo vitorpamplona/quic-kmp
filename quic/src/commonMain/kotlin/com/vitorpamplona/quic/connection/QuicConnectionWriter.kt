@@ -780,7 +780,10 @@ private fun buildApplicationPacket(
     // signal which encryption level the ACK targets without the
     // application packet number space being established by 1-RTT keys.
     // Skip ACK building when we're about to emit a 0-RTT packet.
-    if (use1Rtt) {
+    // RFC 9000 §13.2.1: application-space ACKs may wait up to
+    // max_ack_delay (or for a second ack-eliciting packet); they also ride
+    // along on any packet that goes out anyway (see below).
+    fun appendAck() {
         state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt())?.let { plainAck ->
             // RFC 9000 §13.4.2: emit an ACK_ECN frame (variant 0x03,
             // ACK with ECN counts) for 1-RTT ACKs once we mark
@@ -809,10 +812,11 @@ private fun buildApplicationPacket(
                     additionalRanges = plainAck.additionalRanges,
                     ecnCounts = AckEcnCounts(ect0 = 0L, ect1 = 0L, ce = 0L),
                 )
-            frames += ackWithCounts
+            frames.add(0, ackWithCounts)
             tokens += RecoveryToken.Ack(level = EncryptionLevel.APPLICATION, largestAcked = ackWithCounts.largestAcknowledged)
         }
     }
+    if (use1Rtt && state.ackTracker.ackDue(nowMillis, conn.config.maxAckDelay)) appendAck()
 
     // Step 7: PTO probe. The driver sets `pendingPing` when its
     // PTO timer fires without intervening ACKs. A PING is the
@@ -990,6 +994,9 @@ private fun buildApplicationPacket(
         }
         conn.streamRoundRobinStart = (rotation + 1) % streamsView.size
     }
+
+    // Piggy-back a not-yet-due ACK on a packet that leaves anyway.
+    if (use1Rtt && frames.isNotEmpty() && frames[0] !is AckFrame && state.ackTracker.hasUnackedAckEliciting()) appendAck()
 
     if (frames.isEmpty()) return null
 
