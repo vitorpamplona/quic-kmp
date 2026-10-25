@@ -43,7 +43,8 @@ import kotlin.time.Clock
  * the client's Finished verifies.
  *
  * A ClientHello that lists X25519 without sending a share for it gets a
- * HelloRetryRequest; one that doesn't list it fails with handshake_failure.
+ * HelloRetryRequest (resumption still works after it, 0-RTT doesn't); one
+ * that doesn't list it fails with handshake_failure.
  * Not supported: client certificates.
  */
 class TlsServer(
@@ -136,6 +137,9 @@ class TlsServer(
     /** We sent a HelloRetryRequest; the next ClientHello is the client's second. */
     private var helloRetried: Boolean = false
 
+    /** After a HelloRetryRequest: message_hash(ClientHello1) and the retry, which a PSK binder also covers. */
+    private var retryTranscriptPrefix: ByteArray = ByteArray(0)
+
     override fun pollOutbound(level: TlsClient.Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
     override fun pushHandshakeBytes(
@@ -218,9 +222,7 @@ class TlsServer(
         onClientTransportParameters?.invoke(tp)?.let { sentTransportParameters = it }
 
         // RFC 8446 §4.2.11: try the offered ticket before deciding on a full handshake.
-        // After a HelloRetryRequest the binder would cover the retry too; a full
-        // handshake is simpler and always allowed, and 0-RTT is off (§4.2.10).
-        val resumed = if (helloRetried) null else tryResume(ch, msg, suite, alpn)
+        val resumed = tryResume(ch, msg, suite, alpn)
         if (resumed != null) {
             pskAccepted = true
             keySchedule.deriveEarlyFromPsk(resumed.psk)
@@ -229,7 +231,8 @@ class TlsServer(
         }
         transcript.append(msg)
 
-        if (resumed != null && ch.earlyData && maxEarlyDataSize > 0 && resumed.maxEarlyDataSize > 0 &&
+        // RFC 8446 §4.2.10: no early data after a HelloRetryRequest.
+        if (resumed != null && !helloRetried && ch.earlyData && maxEarlyDataSize > 0 && resumed.maxEarlyDataSize > 0 &&
             resumed.cipherSuite == suite && resumed.alpn?.contentEquals(alpn) == true &&
             resumed.quicVersion == quicVersion() && ticketKeys!!.claimEarlyData(ch.pskIdentity!!)
         ) {
@@ -297,7 +300,8 @@ class TlsServer(
         helloRetried = true
         // Both suites we offer hash with SHA-256.
         val ch1Hash = TlsRunningSha256().also { it.update(msg) }.snapshot()
-        transcript.append(handshakeMessage(TlsConstants.HS_MESSAGE_HASH) { writeBytes(ch1Hash) })
+        val messageHash = handshakeMessage(TlsConstants.HS_MESSAGE_HASH) { writeBytes(ch1Hash) }
+        transcript.append(messageHash)
         val hrr =
             handshakeMessage(TlsConstants.HS_SERVER_HELLO) {
                 writeUint16(TlsConstants.LEGACY_VERSION_TLS_1_2)
@@ -313,6 +317,7 @@ class TlsServer(
                 }
             }
         transcript.append(hrr)
+        retryTranscriptPrefix = messageHash + hrr
         outboundQueues[TlsClient.Level.INITIAL]!!.addLast(hrr)
     }
 
@@ -334,10 +339,16 @@ class TlsServer(
         // Both suites we support hash with SHA-256, so a ticket from either resumes either (§4.2.11).
         if (ticket.cipherSuite !in cipherSuites) return null
         if (ticket.alpn != null && !ticket.alpn.contentEquals(alpn)) return null
-        // RFC 8446 §4.2.11.2: the binder covers the ClientHello up to the binders list.
+        // RFC 8446 §4.2.11.2: the binder covers the ClientHello up to the binders
+        // list, preceded after a HelloRetryRequest by message_hash and the retry.
         val early = TlsKeySchedule(TlsTranscriptHash()).also { it.deriveEarlyFromPsk(ticket.psk) }
         val binderKey = pskBinderFinishedKey(early.earlySecret!!)
-        val partial = TlsRunningSha256().also { it.update(msg.copyOfRange(0, ch.bindersOffset)) }.snapshot()
+        val partial =
+            TlsRunningSha256()
+                .also {
+                    it.update(retryTranscriptPrefix)
+                    it.update(msg.copyOfRange(0, ch.bindersOffset))
+                }.snapshot()
         val mac =
             com.vitorpamplona.crypto.mac
                 .MacInstance("HmacSHA256", binderKey)

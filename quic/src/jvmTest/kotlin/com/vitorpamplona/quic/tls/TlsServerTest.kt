@@ -225,6 +225,9 @@ class TlsServerTest {
         shareGroup: Int,
         share: ByteArray,
         groups: List<Int> = listOf(GROUP_SECP256R1, TlsConstants.GROUP_X25519),
+        // Offers this ticket, with a binder over [binderPrefix] and the ClientHello (RFC 8446 §4.2.11.2).
+        resume: TlsResumptionState? = null,
+        binderPrefix: ByteArray = ByteArray(0),
     ): ByteArray {
         val w = QuicWriter()
         w.writeByte(TlsConstants.HS_CLIENT_HELLO)
@@ -252,9 +255,39 @@ class TlsServerTest {
                 withUint16Length { withUint16Length { writeTlsOpaque1(alpnH3) } }
                 writeUint16(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS)
                 writeTlsOpaque2(byteArrayOf(9, 8, 7))
+                if (resume != null) {
+                    writeUint16(TlsConstants.EXT_PSK_KEY_EXCHANGE_MODES)
+                    withUint16Length { writeTlsOpaque1(byteArrayOf(TlsConstants.PSK_MODE_DHE_KE.toByte())) }
+                    // Must be last; the binder (32 zero bytes for now) is the final field.
+                    writeUint16(TlsConstants.EXT_PRE_SHARED_KEY)
+                    withUint16Length {
+                        withUint16Length {
+                            writeTlsOpaque2(resume.ticket)
+                            writeUint32(0)
+                        }
+                        withUint16Length { writeTlsOpaque1(ByteArray(32)) }
+                    }
+                }
             }
         }
-        return w.toByteArray()
+        val out = w.toByteArray()
+        if (resume != null) {
+            // Everything before the binders list: its 2-byte length, the binder's 1-byte length and 32 bytes.
+            val partialEnd = out.size - 35
+            val early = TlsKeySchedule(TlsTranscriptHash()).also { it.deriveEarlyFromPsk(resume.psk) }
+            val partial =
+                TlsRunningSha256()
+                    .also {
+                        it.update(binderPrefix)
+                        it.update(out.copyOfRange(0, partialEnd))
+                    }.snapshot()
+            val mac =
+                com.vitorpamplona.crypto.mac
+                    .MacInstance("HmacSHA256", pskBinderFinishedKey(early.earlySecret!!))
+            mac.update(partial)
+            mac.doFinal().copyInto(out, out.size - 32)
+        }
+        return out
     }
 
     private fun serverHello(msg: ByteArray): TlsServerHello {
@@ -300,6 +333,32 @@ class TlsServerTest {
         expected.deriveHandshakeTraffic()
         assertContentEquals(expected.clientHandshakeSecret, sl.handshake!!.first)
         assertContentEquals(expected.serverHandshakeSecret, sl.handshake!!.second)
+    }
+
+    @Test
+    fun a_ticket_resumes_after_a_hello_retry_request() {
+        // s2n-quic's ClientHello carries only a P-256 share, so it always gets a retry.
+        val tickets = TlsSessionTicketKeys()
+        val cl = Recorder()
+        run(client(cl), server(Recorder(), tickets = tickets))
+        val ticket = cl.tickets.single()
+
+        val sl = Recorder()
+        val s = server(sl, tickets = tickets)
+        val random = ByteArray(32) { 7 }
+        val ch1 = clientHello(random, GROUP_SECP256R1, ByteArray(65) { 4 }, resume = ticket)
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch1)
+        val hrr = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
+        val ch1Hash = TlsRunningSha256().also { it.update(ch1) }.snapshot()
+        val prefix = byteArrayOf(TlsConstants.HS_MESSAGE_HASH.toByte(), 0, 0, 32) + ch1Hash + hrr
+
+        val ch2 = clientHello(random, TlsConstants.GROUP_X25519, X25519.generateKeyPair().publicKey, resume = ticket, binderPrefix = prefix)
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch2)
+        assertTrue(s.pskAccepted, "the binder over the retry verified")
+        assertFalse(s.earlyDataAccepted)
+        // EncryptedExtensions and Finished only: no Certificate on a resumption.
+        val handshakeTypes = generateSequence { s.pollOutbound(TlsClient.Level.HANDSHAKE) }.map { it[0].toInt() and 0xFF }.toList()
+        assertEquals(listOf(TlsConstants.HS_ENCRYPTED_EXTENSIONS, TlsConstants.HS_FINISHED), handshakeTypes)
     }
 
     @Test
