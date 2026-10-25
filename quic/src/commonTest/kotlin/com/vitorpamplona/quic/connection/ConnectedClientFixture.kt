@@ -61,6 +61,9 @@ fun newConnectedClient(
      * [QuicConnection.handshakeConfirmed] = false.
      */
     deliverHandshakeDone: Boolean = true,
+    /** Server `preferred_address` transport parameter (RFC 9000 §9.6). */
+    preferredAddress: PreferredAddress? = null,
+    migrateToPreferredAddress: Boolean = true,
 ): Pair<QuicConnection, InMemoryQuicPipe> =
     runBlocking {
         val client =
@@ -74,6 +77,7 @@ fun newConnectedClient(
                         initialMaxStreamDataBidiLocal = maxStreamData,
                         initialMaxStreamDataBidiRemote = maxStreamData,
                         initialMaxStreamDataUni = maxStreamData,
+                        migrateToPreferredAddress = migrateToPreferredAddress,
                     ),
                 tlsCertificateValidator = PermissiveCertificateValidator(),
             )
@@ -90,6 +94,7 @@ fun newConnectedClient(
                         initialMaxStreamsUni = maxStreamsUni,
                         initialSourceConnectionId = serverScid.bytes,
                         originalDestinationConnectionId = client.destinationConnectionId.bytes,
+                        preferredAddress = preferredAddress,
                     ).encode(),
             )
         val pipe =

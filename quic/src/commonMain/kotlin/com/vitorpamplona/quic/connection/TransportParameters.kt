@@ -57,6 +57,69 @@ object TransportParameterId {
 }
 
 /**
+ * RFC 9000 §18.2 `preferred_address`: a server address (per family) the client
+ * may migrate to once the handshake is confirmed, plus the connection ID
+ * (sequence number 1, §5.1.1) and stateless-reset token to use there.
+ */
+class PreferredAddress(
+    val ipv4Address: ByteArray,
+    val ipv4Port: Int,
+    val ipv6Address: ByteArray,
+    val ipv6Port: Int,
+    val connectionId: ByteArray,
+    val statelessResetToken: ByteArray,
+) {
+    /** Dotted-quad IPv4 address, or null when the server offered none (all-zero address or port). */
+    val ipv4Host: String?
+        get() =
+            if (ipv4Port == 0 || ipv4Address.all { it == 0.toByte() }) {
+                null
+            } else {
+                ipv4Address.joinToString(".") { (it.toInt() and 0xFF).toString() }
+            }
+
+    /** Colon-hex IPv6 address, or null when the server offered none. */
+    val ipv6Host: String?
+        get() =
+            if (ipv6Port == 0 || ipv6Address.all { it == 0.toByte() }) {
+                null
+            } else {
+                (0 until 8).joinToString(":") { i ->
+                    (((ipv6Address[2 * i].toInt() and 0xFF) shl 8) or (ipv6Address[2 * i + 1].toInt() and 0xFF)).toString(16)
+                }
+            }
+
+    fun encode(): ByteArray {
+        val w = QuicWriter()
+        w.writeBytes(ipv4Address)
+        w.writeUint16(ipv4Port)
+        w.writeBytes(ipv6Address)
+        w.writeUint16(ipv6Port)
+        w.writeByte(connectionId.size)
+        w.writeBytes(connectionId)
+        w.writeBytes(statelessResetToken)
+        return w.toByteArray()
+    }
+
+    companion object {
+        fun decode(bytes: ByteArray): PreferredAddress {
+            val r = QuicReader(bytes)
+            val v4 = r.readBytes(4)
+            val v4Port = r.readUint16()
+            val v6 = r.readBytes(16)
+            val v6Port = r.readUint16()
+            val cidLen = r.readByte()
+            // §18.2: a server that uses zero-length connection IDs MUST NOT send a preferred address.
+            if (cidLen !in 1..20) throw QuicCodecException("preferred_address connection ID length $cidLen")
+            val cid = r.readBytes(cidLen)
+            val token = r.readBytes(16)
+            if (r.hasMore()) throw QuicCodecException("preferred_address has ${r.remaining} trailing bytes")
+            return PreferredAddress(v4, v4Port, v6, v6Port, cid, token)
+        }
+    }
+}
+
+/**
  * RFC 9368 §3 Version Information: the version the sender chose for the
  * connection, plus the versions it offers (client) or has fully deployed
  * (server).
@@ -138,6 +201,7 @@ data class TransportParameters(
     val maxDatagramFrameSize: Long? = null,
     val unknown: Map<Long, ByteArray> = emptyMap(),
     val versionInformation: VersionInformation? = null,
+    val preferredAddress: PreferredAddress? = null,
 ) {
     fun encode(): ByteArray {
         val w = QuicWriter()
@@ -183,6 +247,7 @@ data class TransportParameters(
         statelessResetToken?.let { writeBytesParam(TransportParameterId.STATELESS_RESET_TOKEN, it) }
         maxDatagramFrameSize?.let { writeVarintParam(TransportParameterId.MAX_DATAGRAM_FRAME_SIZE, it) }
         versionInformation?.let { writeBytesParam(TransportParameterId.VERSION_INFORMATION, it.encode()) }
+        preferredAddress?.let { writeBytesParam(TransportParameterId.PREFERRED_ADDRESS, it.encode()) }
         for ((id, bytes) in unknown) writeBytesParam(id, bytes)
 
         return w.toByteArray()
@@ -209,6 +274,7 @@ data class TransportParameters(
             var statelessResetToken: ByteArray? = null
             var maxDatagramFrameSize: Long? = null
             var versionInformation: VersionInformation? = null
+            var preferredAddress: PreferredAddress? = null
             val unknown = mutableMapOf<Long, ByteArray>()
 
             while (r.hasMore()) {
@@ -234,6 +300,7 @@ data class TransportParameters(
                     TransportParameterId.STATELESS_RESET_TOKEN -> statelessResetToken = sub.src.copyOfRange(0, len)
                     TransportParameterId.MAX_DATAGRAM_FRAME_SIZE -> maxDatagramFrameSize = sub.readVarint()
                     TransportParameterId.VERSION_INFORMATION -> versionInformation = VersionInformation.decode(sub.src.copyOfRange(0, len))
+                    TransportParameterId.PREFERRED_ADDRESS -> preferredAddress = PreferredAddress.decode(sub.src.copyOfRange(0, len))
                     else -> unknown[id] = sub.src.copyOfRange(0, len)
                 }
             }
@@ -257,6 +324,7 @@ data class TransportParameters(
                 maxDatagramFrameSize = maxDatagramFrameSize,
                 unknown = unknown,
                 versionInformation = versionInformation,
+                preferredAddress = preferredAddress,
             )
         }
     }

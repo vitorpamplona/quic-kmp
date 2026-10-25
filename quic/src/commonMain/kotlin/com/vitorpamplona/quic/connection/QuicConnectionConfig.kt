@@ -75,4 +75,10 @@ data class QuicConnectionConfig(
      * Advertised in the `version_information` transport parameter.
      */
     val compatibleVersions: List<Int> = listOf(com.vitorpamplona.quic.packet.QuicVersion.V1),
+    /**
+     * RFC 9000 §9.6: once the handshake is confirmed, validate and move to the
+     * server's `preferred_address` when it sends one. Needs a
+     * [QuicConnectionDriver], which opens the socket toward the new address.
+     */
+    val migrateToPreferredAddress: Boolean = true,
 )

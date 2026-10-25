@@ -529,6 +529,22 @@ class PathValidator(
     }
 
     /**
+     * Start stamping the connection ID with [sequenceNumber], which didn't
+     * come through the unused pool (the preferred address's CID, RFC 9000
+     * §9.6), and queue the one in use until now for retirement. Abandons any
+     * CID-rotation validation in progress: the new path supersedes it.
+     */
+    internal fun adoptConnectionId(sequenceNumber: Long) {
+        val prior = activeCidSequence
+        if (prior != sequenceNumber) queueRetireSequence(prior)
+        activeCidSequence = sequenceNumber
+        if (state is PathValidationState.Validating) {
+            pendingChallenges.clear()
+            state = PathValidationState.Idle
+        }
+    }
+
+    /**
      * Process an inbound `PATH_RESPONSE` payload. Confirms the
      * outstanding challenge: state transitions to
      * [PathValidationState.Succeeded] and a [ValidationOutcome.Validated]

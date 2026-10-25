@@ -54,9 +54,26 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 @OptIn(ExperimentalAtomicApi::class)
 class QuicConnectionDriver(
     val connection: QuicConnection,
-    private val socket: UdpSocket,
+    socket: UdpSocket,
     private val parentScope: CoroutineScope,
+    /**
+     * Opens the extra socket a preferred-address migration (RFC 9000 §9.6)
+     * needs toward the server's new address. Tests substitute their own.
+     */
+    private val socketFactory: suspend (host: String, port: Int) -> UdpSocket = { host, port -> UdpSocket.connect(host, port) },
 ) {
+    /** The socket the connection sends on. Swapped to [probeSocket] when a preferred-address probe validates. */
+    @kotlin.concurrent.Volatile
+    private var activeSocket: UdpSocket = socket
+
+    /** Socket toward the preferred address while its path is being validated. */
+    @kotlin.concurrent.Volatile
+    private var probeSocket: UdpSocket? = null
+
+    /** Sockets of paths we left; still read for stragglers, closed with the driver. */
+    private val retiredSockets = ArrayList<UdpSocket>()
+    private var probeSocketRequested = false
+
     /**
      * Single time source: defer to the connection's [QuicConnection.nowMillis]
      * (monotonic by default). Pre-fix the driver had its own
@@ -120,13 +137,16 @@ class QuicConnectionDriver(
         // kernel-delivered datagram counters alongside the QUIC
         // flow-control fields.
         connection.udpStatsSupplier = {
+            val socket = activeSocket
             UdpSocketStats(
                 receivedDatagrams = socket.receivedDatagramCount,
                 receivedBytes = socket.receivedByteCount,
                 receiveBufferSizeBytes = socket.receiveBufferSizeBytes,
             )
         }
-        readJob = scope.launch { readLoop() }
+        connection.activePathIsIpv6 = runCatching { activeSocket.remoteIsIpv6 }.getOrDefault(false)
+        val initialSocket = activeSocket
+        readJob = scope.launch { readLoop(initialSocket) }
         sendJob = scope.launch { sendLoop() }
         // Initial nudge so the ClientHello goes out immediately.
         sendWakeup.trySend(Unit)
@@ -137,14 +157,22 @@ class QuicConnectionDriver(
         sendWakeup.trySend(Unit)
     }
 
-    private suspend fun readLoop() {
+    /** Which path [socket] currently carries. */
+    private fun pathOf(socket: UdpSocket): NetworkPath =
+        when {
+            socket === activeSocket -> NetworkPath.ACTIVE
+            socket === probeSocket -> NetworkPath.PROBE
+            else -> NetworkPath.RETIRED
+        }
+
+    private suspend fun readLoop(socket: UdpSocket) {
         try {
             while (connection.status != QuicConnection.Status.CLOSED) {
                 val datagram = socket.receive() ?: break
                 // Phase 1 of the lock-split refactor: parser holds
                 // streamsLock for a single datagram-feed pass.
                 connection.streamsLock.withLock {
-                    feedDatagram(connection, datagram, nowMillis())
+                    feedDatagram(connection, datagram, nowMillis(), pathOf(socket))
                 }
                 // Inbound data may have produced new outbound (acks, crypto, etc.).
                 wakeup()
@@ -152,9 +180,66 @@ class QuicConnectionDriver(
         } finally {
             // If the read loop exits while the handshake is still pending,
             // unblock anyone awaiting the handshake — otherwise awaitHandshake()
-            // suspends forever.
-            connection.markClosedExternally("read loop exited (socket closed or peer closed)")
+            // suspends forever. Only the active path's socket closing ends the
+            // connection; a probe or retired socket going away doesn't.
+            if (socket === activeSocket) {
+                connection.markClosedExternally("read loop exited (socket closed or peer closed)")
+            }
             wakeup() // let the send loop notice CLOSED and exit
+        }
+    }
+
+    /**
+     * Drive the preferred-address probe (RFC 9000 §9.6) from the send loop:
+     * open its socket when the connection asks for one, swap to it once the
+     * path validated, drop it if validation failed, and flush its datagrams.
+     */
+    private suspend fun servicePathProbe() {
+        val probe = connection.pathProbe ?: return
+        when (probe.state) {
+            PathProbe.State.AWAITING_SOCKET -> {
+                if (probeSocketRequested) return
+                probeSocketRequested = true
+                scope.launch {
+                    val opened =
+                        try {
+                            socketFactory(probe.host, probe.port)
+                        } catch (t: Throwable) {
+                            connection.streamsLock.withLock {
+                                connection.failPathProbeLocked("socket: ${t.message ?: t::class.simpleName}")
+                            }
+                            return@launch
+                        }
+                    probeSocket = opened
+                    launch { readLoop(opened) }
+                    connection.streamsLock.withLock { probe.onSocketReady() }
+                    wakeup()
+                }
+            }
+
+            PathProbe.State.PROBING -> {
+                val socket = probeSocket ?: return
+                while (true) {
+                    val out = connection.streamsLock.withLock { drainProbe(connection, nowMillis()) } ?: break
+                    // A send failure on the probe path just means the probe fails by timeout.
+                    runCatching { socket.send(out) }
+                }
+            }
+
+            PathProbe.State.VALIDATED -> {
+                val socket = probeSocket ?: return
+                retiredSockets += activeSocket
+                activeSocket = socket
+                probeSocket = null
+                connection.activePathIsIpv6 = runCatching { socket.remoteIsIpv6 }.getOrDefault(false)
+            }
+
+            PathProbe.State.FAILED -> {
+                probeSocket?.let {
+                    probeSocket = null
+                    it.close()
+                }
+            }
         }
     }
 
@@ -194,7 +279,19 @@ class QuicConnectionDriver(
     }
 
     private suspend fun sendLoopBody() {
+        try {
+            sendLoopUntilClosed()
+        } finally {
+            // A locally detected error closed the connection: tell the peer.
+            connection.takeFinalCloseDatagram()?.let { runCatching { activeSocket.send(it) } }
+        }
+    }
+
+    private suspend fun sendLoopUntilClosed() {
         while (connection.status != QuicConnection.Status.CLOSED) {
+            // Swap paths before building: once a probe validates, the next
+            // packets must already go to the preferred address.
+            servicePathProbe()
             // Phase 1 of the lock-split refactor: the writer holds
             // streamsLock for the build, releases it for the actual
             // socket.send() so a slow socket doesn't stall app
@@ -204,7 +301,7 @@ class QuicConnectionDriver(
                     connection.streamsLock.withLock {
                         drainOutbound(connection, nowMillis())
                     } ?: break
-                socket.send(out)
+                activeSocket.send(out)
                 // RFC 9002 §6.2.4 probe budget: when the PTO timer
                 // fired we set `pendingProbePackets = 2`; consume one
                 // slot per probe-bearing datagram. If budget remains,
@@ -306,12 +403,35 @@ class QuicConnectionDriver(
                 connection.drainingDeadlineMs?.let {
                     (it - nowForLossTimer).coerceAtLeast(0L)
                 }
+            // A probe re-sends its challenge on its own timer and gives up at its deadline.
+            servicePathProbe()
+            val probeDelta =
+                connection.pathProbe?.let { probe ->
+                    val now = nowMillis()
+                    when (probe.state) {
+                        PathProbe.State.PROBING -> {
+                            minOf(
+                                probe.millisUntilNextChallenge(now, connection.pathProbeRetransmitMillis()) ?: Long.MAX_VALUE,
+                                (probe.startedAtMillis + probe.timeoutMillis - now).coerceAtLeast(0L),
+                            )
+                        }
+
+                        PathProbe.State.AWAITING_SOCKET -> {
+                            (probe.startedAtMillis + probe.timeoutMillis - now).coerceAtLeast(0L)
+                        }
+
+                        else -> {
+                            null
+                        }
+                    }
+                }
             val sleepMillis =
                 minOf(
                     ptoMillis,
                     nextLossDelta ?: Long.MAX_VALUE,
                     idleDelta ?: Long.MAX_VALUE,
                     drainingDelta ?: Long.MAX_VALUE,
+                    probeDelta ?: Long.MAX_VALUE,
                 )
             // Suspend until either: a wakeup arrives, or the timer expires.
             val woke =
@@ -340,6 +460,11 @@ class QuicConnectionDriver(
                     connection.markClosedExternally(
                         "idle timeout ($idleTimeoutMs ms with no activity)",
                     )
+                    continue
+                }
+                // The probe timer woke us: its work happens at the top of the loop.
+                if (probeDelta != null && probeDelta < ptoMillis && (nextLossDelta == null || probeDelta < nextLossDelta)) {
+                    connection.streamsLock.withLock { connection.checkPathProbeTimeoutLocked(nowMillis()) }
                     continue
                 }
                 val pickedLossTimer = nextLossDelta != null && nextLossDelta < ptoMillis
@@ -441,9 +566,11 @@ class QuicConnectionDriver(
                     listOfNotNull(readJob, send).joinAll()
                 }
                 // Final teardown — cancel guarantees both jobs are done
-                // before we close the socket.
+                // before we close the sockets.
                 scope.cancel()
-                socket.close()
+                activeSocket.close()
+                probeSocket?.close()
+                retiredSockets.forEach { it.close() }
             }
         if (closeJob.compareAndSet(null, teardown)) {
             teardown.start()

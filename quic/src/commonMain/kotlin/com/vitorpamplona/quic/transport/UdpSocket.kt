@@ -24,8 +24,8 @@ package com.vitorpamplona.quic.transport
  * Connected UDP socket abstraction used by the QUIC connection.
  *
  * The socket is bound to an ephemeral local port and connected to one remote
- * peer. We do not support unconnected sockets, multipath, or address migration
- * — the QUIC connection uses exactly one 4-tuple for its lifetime.
+ * peer. A connection normally lives on one socket; moving to a server's
+ * preferred address (RFC 9000 §9.6) opens a second one toward the new address.
  *
  * Implementations:
  *  - jvmAndroid: NIO `DatagramChannel` wrapped in suspend functions.
@@ -67,6 +67,9 @@ expect class UdpSocket {
      * `rmem_max`, so this is what the kernel actually allocates.
      */
     val receiveBufferSizeBytes: Int
+
+    /** True when the connected peer address is IPv6. */
+    val remoteIsIpv6: Boolean
 
     companion object {
         /** Open a UDP socket connected to [host]:[port]. Throws on resolution / bind / connect failure. */

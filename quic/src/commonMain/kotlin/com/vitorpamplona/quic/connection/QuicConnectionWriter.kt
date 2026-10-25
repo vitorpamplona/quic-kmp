@@ -98,6 +98,9 @@ fun drainOutbound(
     // status to CLOSED once the 3 * PTO grace elapses; until then
     // drainOutbound returns null on every call.
     if (conn.status == QuicConnection.Status.DRAINING) return null
+    // CLOSED: nothing more goes out. A local error's CONNECTION_CLOSE was
+    // built when the error was detected (QuicConnection.finalCloseDatagram).
+    if (conn.status == QuicConnection.Status.CLOSED) return null
 
     // Bug-A fix: drive the §8.2.4 3*PTO validation budget on every
     // drain, not just on PTO expiration. The peer ACKs PATH_CHALLENGE
@@ -129,6 +132,12 @@ fun drainOutbound(
         val spareCount = (peerLimit - 1L).coerceIn(0L, 7L).toInt()
         if (spareCount > 0) conn.issueOwnConnectionIdsLocked(spareCount)
     }
+
+    // RFC 9000 §9.6: once confirmed, start validating the server's preferred
+    // address (the probe's datagrams come out of [drainProbe]); give up on a
+    // probe whose validation budget ran out.
+    conn.maybeStartPreferredAddressProbeLocked(nowMillis)
+    conn.checkPathProbeTimeoutLocked(nowMillis)
 
     // Drain destructive frame sources into local lists, ONCE.
     val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis)
@@ -235,6 +244,59 @@ fun drainOutbound(
     return datagram
 }
 
+/**
+ * Build the next datagram for the preferred-address probe path, or null when it
+ * owes nothing right now: a PATH_CHALLENGE when one is due, plus PATH_RESPONSEs
+ * to the server's challenges received on that path, in a 1-RTT packet carrying
+ * the preferred address's connection ID and expanded to 1200 bytes (RFC 9000
+ * §8.2.1). Only probing frames go here: until the path validates, all other
+ * traffic stays on the active path (§9.6.2).
+ *
+ * The packet takes an application packet number but isn't retained for loss
+ * recovery — the challenge repeats on its own timer instead.
+ *
+ * Caller must hold [QuicConnection.streamsLock].
+ */
+fun drainProbe(
+    conn: QuicConnection,
+    nowMillis: Long,
+): ByteArray? {
+    val probe = conn.pathProbe ?: return null
+    if (probe.state != PathProbe.State.PROBING || conn.status != QuicConnection.Status.CONNECTED) return null
+    conn.checkPathProbeTimeoutLocked(nowMillis)
+    if (probe.state != PathProbe.State.PROBING) return null
+    val proto = conn.application.sendProtection ?: return null
+    val frames = mutableListOf<Frame>()
+    while (probe.pendingResponses.isNotEmpty()) frames += PathResponseFrame(probe.pendingResponses.removeFirst())
+    probe.pendingChallenge(nowMillis, conn.pathProbeRetransmitMillis())?.let { frames += PathChallengeFrame(it) }
+    if (frames.isEmpty()) return null
+    val pn = conn.application.pnSpace.allocateOutbound()
+    val body = encodeFrames(frames)
+    // Same packet-number length the builder will pick (largestAcked = -1).
+    val pnLen = PacketNumberSpaceState.encodeLength(pn, -1L)
+    val unpadded = 1 + probe.connectionId.length + pnLen + body.size + proto.aead.tagLength
+    val payload = if (unpadded < PROBE_DATAGRAM_SIZE) body.copyOf(body.size + PROBE_DATAGRAM_SIZE - unpadded) else body
+    val built =
+        ShortHeaderPacket.build(
+            ShortHeaderPlaintextPacket(probe.connectionId, pn, payload, keyPhase = conn.currentSendKeyPhase),
+            proto.aead,
+            proto.key,
+            proto.iv,
+            proto.hp,
+            proto.hpKey,
+            largestAckedInSpace = -1L,
+            nonceScratch = proto.nonceScratch,
+            hpScratch = proto.hpScratch,
+            hpMask = proto.hpMask,
+        )
+    conn.aeadEncryptCount += 1L
+    emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, frames)
+    return built
+}
+
+/** RFC 9000 §8.2.1: datagrams carrying PATH_CHALLENGE are expanded to at least this size. */
+private const val PROBE_DATAGRAM_SIZE = 1200
+
 private fun concat(parts: List<ByteArray>): ByteArray {
     var totalLen = 0
     for (p in parts) totalLen += p.size
@@ -267,12 +329,35 @@ private fun concat(parts: List<ByteArray>): ByteArray {
 private fun buildClosingDatagram(
     conn: QuicConnection,
     nowMillis: Long,
+): ByteArray? = buildCloseDatagram(conn, nowMillis, conn.closeErrorCode, conn.closeReason ?: "", application = true)
+
+/**
+ * The datagram that tells the peer we closed on a transport error we detected
+ * ([errorCode], RFC 9000 §10.2 immediate close), at the highest level we have
+ * keys for. Caller must hold [QuicConnection.streamsLock].
+ */
+internal fun buildTransportCloseDatagram(
+    conn: QuicConnection,
+    nowMillis: Long,
+    errorCode: Long,
+    reason: String,
+): ByteArray? = buildCloseDatagram(conn, nowMillis, errorCode, reason.take(MAX_CLOSE_REASON_CHARS), application = false)
+
+/** Keeps a CONNECTION_CLOSE comfortably inside one packet. */
+private const val MAX_CLOSE_REASON_CHARS = 256
+
+private fun buildCloseDatagram(
+    conn: QuicConnection,
+    nowMillis: Long,
+    errorCode: Long,
+    reason: String,
+    application: Boolean,
 ): ByteArray? {
     val app = conn.application
     if (app.sendProtection != null) {
         // 1-RTT level reached: app close (0x1d) is allowed and carries the
-        // original error code + reason.
-        val frame = ConnectionCloseFrame(conn.closeErrorCode, null, conn.closeReason ?: "")
+        // original error code + reason; a transport error uses 0x1c.
+        val frame = ConnectionCloseFrame(errorCode, if (application) null else 0L, reason)
         return buildBestLevelPacket(conn, listOf(frame))
     }
 
@@ -280,11 +365,15 @@ private fun buildClosingDatagram(
     // APPLICATION_ERROR = 0x0c — "the application or application protocol
     // caused the connection to be closed during the handshake".
     val transportFrame =
-        ConnectionCloseFrame(
-            errorCode = APPLICATION_ERROR,
-            frameType = 0L,
-            reason = "",
-        )
+        if (application) {
+            ConnectionCloseFrame(
+                errorCode = APPLICATION_ERROR,
+                frameType = 0L,
+                reason = "",
+            )
+        } else {
+            ConnectionCloseFrame(errorCode = errorCode, frameType = 0L, reason = reason)
+        }
 
     val hs = conn.handshake
     if (hs.sendProtection != null) {
@@ -984,6 +1073,7 @@ private fun buildApplicationPacket(
             // under a key whose confidentiality is no longer assured.
             conn.markClosedExternally(
                 "AEAD_LIMIT_REACHED: 1-RTT encryption count ${conn.aeadEncryptCount} >= confidentiality limit $limit",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.AEAD_LIMIT_REACHED,
             )
         }
     }

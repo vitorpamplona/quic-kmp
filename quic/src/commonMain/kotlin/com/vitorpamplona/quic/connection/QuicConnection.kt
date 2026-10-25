@@ -473,6 +473,17 @@ class QuicConnection(
      */
     internal val closingDrainSignal: CompletableDeferred<Unit> = CompletableDeferred()
 
+    /**
+     * The CONNECTION_CLOSE a locally detected error left to send (see
+     * [markClosedExternally]); the driver sends it once via
+     * [takeFinalCloseDatagram]. Null when the close was silent (idle timeout,
+     * stateless reset, the peer's own CONNECTION_CLOSE).
+     */
+    @Volatile
+    internal var finalCloseDatagram: ByteArray? = null
+
+    internal fun takeFinalCloseDatagram(): ByteArray? = finalCloseDatagram.also { finalCloseDatagram = null }
+
     /** App-level error code for graceful close. */
     var closeReason: String? = null
         private set
@@ -820,6 +831,30 @@ class QuicConnection(
      * Caller must hold [streamsLock] for any read/write.
      */
     internal val pendingPathChallengePayloads: ArrayDeque<ByteArray> = ArrayDeque()
+
+    /**
+     * RFC 9000 §9.6 probe toward the server's preferred address; null when
+     * there is none in flight. The writer builds its datagrams with
+     * [drainProbe], the driver sends them on a second socket. Lifecycle:
+     * created by [maybeStartPreferredAddressProbeLocked] once the handshake is
+     * confirmed, finished by a matching PATH_RESPONSE
+     * ([completePreferredAddressMigrationLocked]) or by its timeout.
+     */
+    @Volatile
+    var pathProbe: PathProbe? = null
+        internal set
+
+    /** True once the connection moved to the server's preferred address. */
+    @Volatile
+    var migratedToPreferredAddress: Boolean = false
+        internal set
+
+    /**
+     * Set by the driver when the connection's socket talks IPv6, so the
+     * preferred address of the same family is picked (RFC 9000 §9.6.3).
+     */
+    @Volatile
+    internal var activePathIsIpv6: Boolean = false
 
     /**
      * RFC 9000 §9 client-initiated path validation + DCID rotation.
@@ -1514,6 +1549,7 @@ class QuicConnection(
         if (iscid == null || !iscid.contentEquals(destinationConnectionId.bytes)) {
             markClosedExternally(
                 "TRANSPORT_PARAMETER_ERROR: peer initial_source_connection_id mismatch",
+                errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
             )
             return
         }
@@ -1524,6 +1560,7 @@ class QuicConnection(
         if (odcid != null && !odcid.contentEquals(originalDestinationConnectionId.bytes)) {
             markClosedExternally(
                 "TRANSPORT_PARAMETER_ERROR: peer original_destination_connection_id mismatch",
+                errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
             )
             return
         }
@@ -1543,6 +1580,7 @@ class QuicConnection(
             if (v < 1200L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: max_udp_payload_size $v < 1200",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
@@ -1551,6 +1589,7 @@ class QuicConnection(
             if (v > 20L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: ack_delay_exponent $v > 20",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
@@ -1559,6 +1598,7 @@ class QuicConnection(
             if (v < 2L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: active_connection_id_limit $v < 2",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
@@ -2054,6 +2094,12 @@ class QuicConnection(
         // to call after the monitor — complete() is idempotent and the
         // CLOSED transition has already been published via @Volatile.
         if (firstClose) closingDrainSignal.complete(Unit)
+        // RFC 9000 §10.2: an error we detected is an immediate close — tell the
+        // peer why instead of leaving it to time out. Built now, while the
+        // caller still holds the lock, and sent by the driver on its way out.
+        if (firstClose && errorCode != QuicTransportError.NO_ERROR) {
+            finalCloseDatagram = runCatching { buildTransportCloseDatagram(this, nowMillis(), errorCode, reason) }.getOrNull()
+        }
         if (firstClose) {
             // "remote" covers both peer-initiated CONNECTION_CLOSE and
             // local invariant violations (CID mismatch, frame decode
@@ -2662,6 +2708,7 @@ class QuicConnection(
             PathValidator.RecordResult.RetirePriorToExceedsSequence -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID retire_prior_to ($retirePriorTo) > sequence_number ($sequenceNumber)",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2669,6 +2716,7 @@ class QuicConnection(
             PathValidator.RecordResult.DuplicateSequenceMismatch -> {
                 markClosedExternally(
                     "PROTOCOL_VIOLATION: NEW_CONNECTION_ID seq=$sequenceNumber re-issued with different bytes",
+                    errorCode = QuicTransportError.PROTOCOL_VIOLATION,
                 )
                 return
             }
@@ -2676,6 +2724,7 @@ class QuicConnection(
             PathValidator.RecordResult.InvalidCidLength -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID has invalid cid length",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2683,6 +2732,7 @@ class QuicConnection(
             PathValidator.RecordResult.InvalidStatelessResetToken -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID has invalid stateless reset token length",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2704,6 +2754,7 @@ class QuicConnection(
                 // CONNECTION_ID_LIMIT_ERROR is the canonical close.
                 markClosedExternally(
                     "CONNECTION_ID_LIMIT_ERROR: peer retired our active CID with no spare available",
+                    errorCode = QuicTransportError.CONNECTION_ID_LIMIT_ERROR,
                 )
             }
 
@@ -2782,6 +2833,7 @@ class QuicConnection(
         if (sequenceNumber >= nextOwnSourceCidSeq) {
             markClosedExternally(
                 "PROTOCOL_VIOLATION: RETIRE_CONNECTION_ID seq=$sequenceNumber ≥ next-issued seq=$nextOwnSourceCidSeq",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
             )
             return
         }
@@ -2801,6 +2853,7 @@ class QuicConnection(
             markClosedExternally(
                 "PROTOCOL_VIOLATION: peer retired our initial SCID (seq=0) and no spare " +
                     "is left in the issued pool",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
             )
             return
         }
@@ -2928,6 +2981,87 @@ class QuicConnection(
         }
         return result
     }
+
+    /**
+     * Start probing the server's preferred address (RFC 9000 §9.6.1) if it
+     * offered one, the handshake is confirmed and no probe ran yet. Picks the
+     * address of the active path's family, falling back to the other.
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun maybeStartPreferredAddressProbeLocked(nowMillis: Long) {
+        if (!config.migrateToPreferredAddress || !handshakeConfirmed || status != Status.CONNECTED) return
+        if (pathProbe != null || migratedToPreferredAddress) return
+        val pa = peerTransportParameters?.preferredAddress ?: return
+        val v4 = pa.ipv4Host?.let { it to pa.ipv4Port }
+        val v6 = pa.ipv6Host?.let { it to pa.ipv6Port }
+        val (host, port) = (if (activePathIsIpv6) v6 ?: v4 else v4 ?: v6) ?: return
+        val ptoMs = lossDetection.ptoBaseMs(peerTransportParameters?.maxAckDelay ?: 0L)
+        pathProbe =
+            PathProbe(
+                host = host,
+                port = port,
+                connectionId = ConnectionId(pa.connectionId),
+                connectionIdSequence = PREFERRED_ADDRESS_CID_SEQUENCE,
+                startedAtMillis = nowMillis,
+                timeoutMillis = maxOf(3L * ptoMs * PathProbe.MAX_CHALLENGES / 2, PathProbe.MIN_TIMEOUT_MILLIS),
+            )
+        QuicLog.d(TAG) { "probing preferred address $host:$port" }
+    }
+
+    /**
+     * A PATH_RESPONSE matched the probe: send everything to the preferred
+     * address from now on, with its connection ID, and retire the one the old
+     * path used (RFC 9000 §9.5: a connection ID is not reused across paths).
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun completePreferredAddressMigrationLocked() {
+        val probe = pathProbe ?: return
+        if (probe.state != PathProbe.State.PROBING) return
+        probe.state = PathProbe.State.VALIDATED
+        migratedToPreferredAddress = true
+        val priorSeq = pathValidator.activeCidSequence
+        destinationConnectionId = probe.connectionId
+        pathValidator.adoptConnectionId(probe.connectionIdSequence)
+        // Path state that belonged to the old path. The new path's RTT is
+        // unknown, so restart PTO backoff from the estimator's baseline.
+        pendingPathChallengePayloads.clear()
+        consecutivePtoCount = 0
+        // §9.6.2: the server moves its own sending once it sees a non-probing
+        // packet from us at the preferred address; make the next one go now.
+        pendingPing = true
+        qlogObserver.onPathValidationSucceeded(probe.connectionIdSequence)
+        qlogObserver.onConnectionIdActivated("peer", probe.connectionIdSequence, probe.connectionId.bytes)
+        qlogObserver.onConnectionIdRetired("peer", priorSeq)
+        QuicLog.d(TAG) { "migrated to preferred address ${probe.host}:${probe.port}" }
+    }
+
+    /**
+     * Abandon a probe that ran out of time or couldn't open its socket. The
+     * connection keeps using its original path (RFC 9000 §9.6.1).
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun failPathProbeLocked(reason: String) {
+        val probe = pathProbe ?: return
+        if (probe.state == PathProbe.State.VALIDATED || probe.state == PathProbe.State.FAILED) return
+        probe.state = PathProbe.State.FAILED
+        QuicLog.d(TAG) { "preferred address ${probe.host}:${probe.port} unusable: $reason" }
+    }
+
+    /** Fails the probe once its validation budget is spent. Caller must hold [streamsLock]. */
+    internal fun checkPathProbeTimeoutLocked(nowMillis: Long) {
+        val probe = pathProbe ?: return
+        if (probe.state != PathProbe.State.PROBING && probe.state != PathProbe.State.AWAITING_SOCKET) return
+        if (probe.isTimedOut(nowMillis)) failPathProbeLocked("no PATH_RESPONSE within ${probe.timeoutMillis} ms")
+    }
+
+    /**
+     * Re-send cadence for probe challenges: the active path's PTO, floored so a
+     * near-zero RTT estimate can't turn the probe into a flood.
+     */
+    internal fun pathProbeRetransmitMillis(): Long = lossDetection.ptoBaseMs(peerTransportParameters?.maxAckDelay ?: 0L).coerceAtLeast(MIN_PROBE_RETRANSMIT_MS)
 
     /**
      * Public counterpart to [triggerPathMigrationLocked] — acquires
@@ -3074,6 +3208,11 @@ class QuicConnection(
                 anyMatch = true
             }
         }
+        peerTransportParameters?.preferredAddress?.statelessResetToken?.let { tok ->
+            if (tok.size == 16 && constantTimeEqualsRange(tok, datagram, tokenStart)) {
+                anyMatch = true
+            }
+        }
         for (token in pathValidator.allKnownStatelessResetTokens()) {
             if (token.size != 16) continue
             if (constantTimeEqualsRange(token, datagram, tokenStart)) {
@@ -3169,7 +3308,25 @@ class QuicConnection(
      *
      * Caller must hold [streamsLock].
      */
-    internal fun queuePathResponseLocked(challengeData: ByteArray) {
+    internal fun queuePathResponseLocked(
+        challengeData: ByteArray,
+        path: NetworkPath = NetworkPath.ACTIVE,
+    ) {
+        // RFC 9000 §8.2.2: answer on the path the challenge arrived on. A
+        // challenge on the path we just left has no socket to answer on.
+        when (path) {
+            NetworkPath.ACTIVE -> {}
+
+            NetworkPath.PROBE -> {
+                val probe = pathProbe ?: return
+                if (probe.pendingResponses.size < MAX_PENDING_PATH_RESPONSES) probe.pendingResponses.addLast(challengeData)
+                return
+            }
+
+            NetworkPath.RETIRED -> {
+                return
+            }
+        }
         if (pendingPathChallengePayloads.size >= MAX_PENDING_PATH_RESPONSES) return
         // The parser produces a fresh ByteArray per PATH_CHALLENGE
         // (see [com.vitorpamplona.quic.Buffer.QuicReader.readBytes],
@@ -3399,6 +3556,13 @@ class QuicConnection(
     }
 
     companion object {
+        private const val TAG = "QuicConnection"
+
+        /** RFC 9000 §5.1.1: the connection ID in `preferred_address` has sequence number 1. */
+        internal const val PREFERRED_ADDRESS_CID_SEQUENCE: Long = 1L
+
+        private const val MIN_PROBE_RETRANSMIT_MS: Long = 100L
+
         /**
          * RFC 9000 §10.2.2 floor on the draining-period grace. The
          * spec mandates "at least 3 * PTO" which can be vanishingly

@@ -105,6 +105,9 @@ actual class UdpSocket private constructor(
     actual val receiveBufferSizeBytes: Int
         get() = channel.getOption(StandardSocketOptions.SO_RCVBUF)
 
+    actual val remoteIsIpv6: Boolean
+        get() = remote.address is java.net.Inet6Address
+
     actual suspend fun send(payload: ByteArray): Int {
         // Fail fast without dispatching onto a possibly shut-down executor.
         if (closed.get()) throw ClosedChannelException()

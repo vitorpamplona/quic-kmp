@@ -100,9 +100,10 @@ fun feedDatagram(
     conn: QuicConnection,
     datagram: ByteArray,
     nowMillis: Long,
+    path: NetworkPath = NetworkPath.ACTIVE,
 ) {
     try {
-        feedDatagramInner(conn, datagram, nowMillis)
+        feedDatagramInner(conn, datagram, nowMillis, path)
     } catch (e: com.vitorpamplona.quic.QuicProtocolViolationException) {
         // RFC 9000 §17.2 / §17.3.1: peer set reserved bits in the
         // header after HP unmask (or a similar invariant violation
@@ -147,6 +148,7 @@ private fun feedDatagramInner(
     conn: QuicConnection,
     datagram: ByteArray,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
     // RFC 9000 §10.2.2: while in the DRAINING state, late inbound
     // packets MUST be discarded silently. Same goes for CLOSED.
@@ -198,11 +200,11 @@ private fun feedDatagramInner(
             // that's totally unparseable (then we don't know where the next
             // packet starts).
             val peeked = LongHeaderPacket.peekHeader(datagram, offset) ?: break
-            val consumed = feedLongHeaderPacket(conn, datagram, offset, nowMillis)
+            val consumed = feedLongHeaderPacket(conn, datagram, offset, nowMillis, path)
             offset += consumed ?: peeked.totalLength
         } else {
             // Short-header — consumes the rest of the datagram.
-            feedShortHeaderPacket(conn, datagram, offset, nowMillis)
+            feedShortHeaderPacket(conn, datagram, offset, nowMillis, path)
             return
         }
     }
@@ -273,6 +275,7 @@ private fun feedLongHeaderPacket(
     datagram: ByteArray,
     offset: Int,
     nowMillis: Long,
+    path: NetworkPath,
 ): Int? {
     val peeked = LongHeaderPacket.peekHeader(datagram, offset) ?: return null
     // RFC 9000 §17.2.5 + RFC 9001 §5.8: Retry has no PN space, no AEAD
@@ -395,7 +398,7 @@ private fun feedLongHeaderPacket(
             frames = frameNamesFor(decodedFrames),
         )
     }
-    dispatchFrames(conn, level, decodedFrames, parsed.packet.packetNumber, nowMillis)
+    dispatchFrames(conn, level, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
     return parsed.consumed
 }
 
@@ -404,6 +407,7 @@ private fun feedShortHeaderPacket(
     datagram: ByteArray,
     offset: Int,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
     val state = conn.levelState(EncryptionLevel.APPLICATION)
     val live = state.receiveProtection
@@ -575,6 +579,7 @@ private fun feedShortHeaderPacket(
         if (conn.aeadDecryptFailureCount >= limit) {
             conn.markClosedExternally(
                 "AEAD_LIMIT_REACHED: 1-RTT decrypt-failure count ${conn.aeadDecryptFailureCount} >= integrity limit $limit",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.AEAD_LIMIT_REACHED,
             )
         }
         return
@@ -621,7 +626,7 @@ private fun feedShortHeaderPacket(
             frames = frameNamesFor(decodedFrames),
         )
     }
-    dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis)
+    dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
 }
 
 /**
@@ -653,7 +658,7 @@ private fun decodeFramesOrClose(
     try {
         decodeFrames(payload)
     } catch (e: QuicCodecException) {
-        conn.markClosedExternally("frame decode failed: ${e.message}")
+        conn.markClosedExternally("frame decode failed: ${e.message}", errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FRAME_ENCODING_ERROR)
         null
     }
 
@@ -663,6 +668,7 @@ private fun dispatchFrames(
     frames: List<com.vitorpamplona.quic.frame.Frame>,
     packetNumber: Long,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
     val state = conn.levelState(level)
     var ackEliciting = false
@@ -822,6 +828,7 @@ private fun dispatchFrames(
                 ) {
                     conn.markClosedExternally(
                         "peer opened stream ${frame.streamId} on client-initiated id space (STREAM_STATE_ERROR)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -854,6 +861,7 @@ private fun dispatchFrames(
                 if (stream.peerResetReceived) {
                     conn.markClosedExternally(
                         "STREAM_STATE_ERROR: stream ${frame.streamId} STREAM after RESET_STREAM",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -864,6 +872,7 @@ private fun dispatchFrames(
                 if (frameEnd > stream.receiveLimit) {
                     conn.markClosedExternally(
                         "peer exceeded stream ${frame.streamId} receive limit ($frameEnd > ${stream.receiveLimit})",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                     )
                     return
                 }
@@ -882,6 +891,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FLOW_CONTROL_ERROR: peer exceeded connection MAX_DATA " +
                                 "(${conn.connectionInboundOffsetSum} > ${conn.advertisedMaxData})",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                         )
                         return
                     }
@@ -899,6 +909,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} frame ends at " +
                                 "${frame.offset + frame.data.size} past final size ${stream.receive.finOffset}",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -907,6 +918,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} second FIN at " +
                                 "${frame.offset + frame.data.size} disagrees with prior final size ${stream.receive.finOffset}",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -928,6 +940,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "INTERNAL_ERROR: stream ${frame.streamId} consumer overflowed " +
                                 "incoming channel (slow consumer)",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.INTERNAL_ERROR,
                         )
                         return
                     }
@@ -991,6 +1004,7 @@ private fun dispatchFrames(
                 if (frame.maxStreams > MAX_STREAMS_LIMIT) {
                     conn.markClosedExternally(
                         "STREAM_LIMIT_ERROR: peer MAX_STREAMS=${frame.maxStreams} exceeds RFC 9000 §19.11 cap of 2^60",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_LIMIT_ERROR,
                     )
                     return
                 }
@@ -1016,6 +1030,7 @@ private fun dispatchFrames(
                 if (StreamId.kindOf(frame.streamId) == StreamId.Kind.CLIENT_UNI) {
                     conn.markClosedExternally(
                         "STREAM_STATE_ERROR: peer RESET_STREAM on client-uni id ${frame.streamId} (peer has no send side)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -1030,6 +1045,7 @@ private fun dispatchFrames(
                     conn.markClosedExternally(
                         "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                             "${frame.finalSize} outside [0, 2^62-1]",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                     )
                     return
                 }
@@ -1041,6 +1057,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                                 "${frame.finalSize} disagrees with prior FIN size $priorFin",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -1048,6 +1065,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                                 "${frame.finalSize} below already-observed offset $highestSeen",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -1067,6 +1085,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FLOW_CONTROL_ERROR: peer RESET_STREAM finalSize pushed connection past MAX_DATA " +
                                 "(${conn.connectionInboundOffsetSum} > ${conn.advertisedMaxData})",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                         )
                         return
                     }
@@ -1152,7 +1171,7 @@ private fun dispatchFrames(
                 // The PATH_RESPONSE we queue here is itself
                 // ack-eliciting; the regular ACK path covers both.
                 ackEliciting = true
-                conn.queuePathResponseLocked(frame.data)
+                conn.queuePathResponseLocked(frame.data, path)
             }
 
             is PathResponseFrame -> {
@@ -1165,7 +1184,14 @@ private fun dispatchFrames(
                 // (no outstanding challenge OR an attacker echoing
                 // random bytes) are silently ignored after the ACK.
                 ackEliciting = true
-                conn.applyPeerPathResponseLocked(frame.data)
+                // A response to a preferred-address probe completes that
+                // migration (RFC 9000 §9.6.1); any path may carry it.
+                val probe = conn.pathProbe
+                if (probe != null && probe.matches(frame.data)) {
+                    conn.completePreferredAddressMigrationLocked()
+                } else {
+                    conn.applyPeerPathResponseLocked(frame.data)
+                }
             }
 
             is RetireConnectionIdFrame -> {
@@ -1200,6 +1226,7 @@ private fun dispatchFrames(
                 if (level != EncryptionLevel.APPLICATION) {
                     conn.markClosedExternally(
                         "HANDSHAKE_DONE at $level (PROTOCOL_VIOLATION; allowed only at APPLICATION)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
                     )
                     return
                 }

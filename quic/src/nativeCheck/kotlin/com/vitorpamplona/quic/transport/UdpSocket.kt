@@ -37,6 +37,8 @@ actual class UdpSocket {
 
     actual val receiveBufferSizeBytes: Int get() = throw NotImplementedError("native check stub")
 
+    actual val remoteIsIpv6: Boolean get() = throw NotImplementedError("native check stub")
+
     actual companion object {
         actual suspend fun connect(
             host: String,
