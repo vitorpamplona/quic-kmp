@@ -384,6 +384,9 @@ class QuicServerTest {
             val accepted = echoOnce(server, conn)
             withTimeout(5_000) { while (!conn.migratedToPreferredAddress) kotlinx.coroutines.delay(10) }
             assertEquals("10.9.9.9" to 4443, opened)
+            // Our PATH_RESPONSE to the client's probe carried a PATH_CHALLENGE, so its
+            // address on that path is validated before it moves there (RFC 9000 §8.2).
+            withTimeout(5_000) { while (accepted.connection.validatedServerPaths.isEmpty()) kotlinx.coroutines.delay(10) }
             // The next request rides the preferred path, and the server follows it there.
             val request = conn.openBidiStream()
             request.send.enqueue("moved".encodeToByteArray())

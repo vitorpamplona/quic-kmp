@@ -1315,6 +1315,8 @@ private fun dispatchFrames(
                     conn.peerMigration = null
                 } else if (probe != null && probe.matches(frame.data)) {
                     conn.completePreferredAddressMigrationLocked()
+                } else if (conn.isServer && conn.onServerPathResponseLocked(frame.data)) {
+                    // A path the client probed is validated; nothing moves yet.
                 } else {
                     conn.applyPeerPathResponseLocked(frame.data)
                 }

@@ -414,7 +414,8 @@ internal fun drainServerProbeResponse(
     val (path, data) = conn.serverProbeResponses.removeFirstOrNull() ?: return null
     val proto = conn.application.sendProtection ?: return null
     val pn = conn.application.pnSpace.allocateOutbound()
-    val frames = listOf<Frame>(PathResponseFrame(data))
+    val challenge = conn.serverPathChallengeFor(path)
+    val frames = if (challenge == null) listOf<Frame>(PathResponseFrame(data)) else listOf(PathResponseFrame(data), PathChallengeFrame(challenge))
     val body = encodeFrames(frames)
     val pnLen = PacketNumberSpaceState.encodeLength(pn, -1L)
     val unpadded = 1 + conn.destinationConnectionId.length + pnLen + body.size + proto.aead.tagLength

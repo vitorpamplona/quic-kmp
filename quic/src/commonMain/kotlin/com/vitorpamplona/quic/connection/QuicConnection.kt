@@ -270,6 +270,35 @@ class QuicConnection internal constructor(
     /** Server: PATH_RESPONSEs owed on paths other than [sendPath], with the path to send each on. */
     internal val serverProbeResponses = ArrayDeque<Pair<ServerPath, ByteArray>>()
 
+    /**
+     * Server: the PATH_CHALLENGE that rode with our PATH_RESPONSE on a path the
+     * client probed (RFC 9000 §8.2), so the client's address there is validated
+     * before it moves (it probes our preferred address first, §9.6).
+     */
+    internal val serverPathChallenges = HashMap<ServerPath, ByteArray>()
+
+    /** Server: paths whose challenge was answered; a client moving to one is followed at once. */
+    internal val validatedServerPaths = HashSet<ServerPath>()
+
+    /** Server: the PATH_CHALLENGE to send with a probe response on [path], or null for none. */
+    internal fun serverPathChallengeFor(path: ServerPath): ByteArray? {
+        if (path == sendPath || path in validatedServerPaths) return null
+        serverPathChallenges[path]?.let { return it }
+        if (serverPathChallenges.size >= MAX_PENDING_PATH_RESPONSES) return null
+        return com.vitorpamplona.crypto.random.RandomInstance
+            .bytes(8)
+            .also { serverPathChallenges[path] = it }
+    }
+
+    /** Server: a PATH_RESPONSE answering one of [serverPathChallenges]; true when it did. */
+    internal fun onServerPathResponseLocked(data: ByteArray): Boolean {
+        val path = serverPathChallenges.entries.firstOrNull { it.value.contentEquals(data) }?.key ?: return false
+        serverPathChallenges.remove(path)
+        if (validatedServerPaths.size >= MAX_PENDING_PATH_RESPONSES) validatedServerPaths.clear()
+        validatedServerPaths += path
+        return true
+    }
+
     /** Server: sends a datagram on a given path; the endpoint sets it. */
     @kotlin.concurrent.Volatile
     internal var sendOnServerPath: (suspend (ServerPath, ByteArray) -> Unit)? = null
@@ -301,6 +330,14 @@ class QuicConnection internal constructor(
             }
         if (probing) return
         peerPath = src
+        if (src in validatedServerPaths) {
+            // Its PATH_CHALLENGE was answered while the client probed it.
+            peerMigration = null
+            sendPath = src
+            if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) resetPathStateLocked()
+            QuicLog.d(TAG) { "peer moved $current -> $src (already validated)" }
+            return
+        }
         // Returning to the path we were validating away from needs no new challenge.
         val back = peerMigration?.previous == src
         peerMigration =
@@ -4053,8 +4090,13 @@ class QuicConnection internal constructor(
 
             NetworkPath.PROBE -> {
                 val probe = pathProbe ?: return
-                if (probe.pendingResponses.size < MAX_PENDING_PATH_RESPONSES) probe.pendingResponses.addLast(challengeData)
-                return
+                // A PATH_RESPONSE earlier in the same packet may have validated
+                // the probe, which makes its path the active one: answer there.
+                if (probe.state == PathProbe.State.PROBING) {
+                    if (probe.pendingResponses.size < MAX_PENDING_PATH_RESPONSES) probe.pendingResponses.addLast(challengeData)
+                    return
+                }
+                if (probe.state != PathProbe.State.VALIDATED) return
             }
 
             NetworkPath.RETIRED -> {
