@@ -80,6 +80,27 @@ class UdpSocketTest {
     }
 
     @Test
+    fun `an ICMP port unreachable does not end receive`() {
+        runBlocking {
+            // Nobody listens there: the kernel answers our datagram with ICMP
+            // port unreachable, which a connected channel reports on receive.
+            val deadPort = DatagramSocket(InetSocketAddress("127.0.0.1", 0)).use { it.localPort }
+            val socket = UdpSocket.connect("127.0.0.1", deadPort)
+            try {
+                socket.send(byteArrayOf(1))
+                val pending = async(Dispatchers.IO) { runCatching { socket.receive() } }
+                delay(300)
+                assertTrue(pending.isActive, "receive keeps waiting: ${if (pending.isCompleted) pending.await() else ""}")
+                socket.close()
+                val result = withTimeoutOrNull(2_000) { pending.await() }
+                assertTrue(result != null && result.isSuccess && result.getOrNull() == null, "receive() returns null once closed, got $result")
+            } finally {
+                socket.close()
+            }
+        }
+    }
+
+    @Test
     fun `blocking receive runs on a dedicated thread, not Dispatchers-IO`() {
         runBlocking {
             val socket = UdpSocket.connect("127.0.0.1", peer.localPort)

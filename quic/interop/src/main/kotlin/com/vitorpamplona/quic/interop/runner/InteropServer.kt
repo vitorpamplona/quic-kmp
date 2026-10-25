@@ -21,7 +21,9 @@
 package com.vitorpamplona.quic.interop.runner
 
 import com.vitorpamplona.quic.QuicWriter
+import com.vitorpamplona.quic.connection.QuicConnection
 import com.vitorpamplona.quic.connection.QuicConnectionConfig
+import com.vitorpamplona.quic.connection.QuicConnectionDriver
 import com.vitorpamplona.quic.http3.Http3Frame
 import com.vitorpamplona.quic.http3.Http3FrameReader
 import com.vitorpamplona.quic.http3.Http3FrameType
@@ -37,16 +39,19 @@ import com.vitorpamplona.quic.server.ServerPreferredAddress
 import com.vitorpamplona.quic.stream.QuicStream
 import com.vitorpamplona.quic.stream.StreamId
 import com.vitorpamplona.quic.tls.JcaCertificateSigner
+import com.vitorpamplona.quic.tls.PinnedCertificateValidator
 import com.vitorpamplona.quic.tls.TlsConstants
 import com.vitorpamplona.quic.tls.TlsSessionTicketKeys
 import com.vitorpamplona.quic.transport.UdpPeerAddress
 import com.vitorpamplona.quic.transport.UdpServerSocket
+import com.vitorpamplona.quic.transport.UdpSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.io.File
 
 private const val ALPN_HQ = "hq-interop"
@@ -96,9 +101,6 @@ fun runInteropServer(testcase: String): Int {
     val www = File(System.getenv("WWW")?.takeIf { it.isNotBlank() } ?: "/www").canonicalFile
     val port = System.getenv("PORT")?.toIntOrNull() ?: 443
     val signer = JcaCertificateSigner.fromPem(File(certs, "cert.pem").readText(), File(certs, "priv.key").readText())
-    // Pay the JCA's first-use cost now: otherwise the first handshake takes
-    // ~400 ms, and the rebind tests move the client's NAT mapping at 1 s.
-    signer.sign(signer.signatureSchemes.first(), ByteArray(32))
     val keyLogFile = System.getenv("SSLKEYLOGFILE")?.takeIf { it.isNotBlank() }?.let(::File)
     val qlogDir =
         System
@@ -125,7 +127,9 @@ fun runInteropServer(testcase: String): Int {
             signer = signer,
             alpnSelector = { offered -> preferred.firstOrNull { p -> offered.any { it.contentEquals(p) } } },
             connectionConfig = QuicConnectionConfig(),
-            supportedVersions = listOf(QuicVersion.V1, QuicVersion.V2),
+            // Most preferred first: the v2 test expects a client that offers v2
+            // compatibly to be moved there (RFC 9368).
+            supportedVersions = if (testcase == "v2") listOf(QuicVersion.V2, QuicVersion.V1) else listOf(QuicVersion.V1, QuicVersion.V2),
             requireRetry = testcase == "retry",
             ticketKeys = TlsSessionTicketKeys(),
             maxEarlyDataSize = if (testcase == "zerortt") 0xffffffffL else 0L,
@@ -141,6 +145,7 @@ fun runInteropServer(testcase: String): Int {
 
     return runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        warmUp(signer, scope)
         val socket = UdpServerSocket.bind(null, port)
         val preferredSocket = preferredAddress?.let { UdpServerSocket.bind(null, PREFERRED_PORT) }
         val server = QuicServer(config, socket, scope, preferredAddressTransport = preferredSocket)
@@ -152,6 +157,55 @@ fun runInteropServer(testcase: String): Int {
         }
         0
     }
+}
+
+/**
+ * One handshake and request over loopback before we listen. A cold JVM takes
+ * ~350 ms over the first handshake (class loading, JIT, the JCA's first use),
+ * and the rebind tests move the client's NAT mapping at 1 s: a client that
+ * starts late gets rebound before our first reply, and the runner then sees
+ * no PATH_CHALLENGE on the new path (there can't be one mid-handshake).
+ */
+private suspend fun warmUp(
+    signer: JcaCertificateSigner,
+    scope: CoroutineScope,
+) {
+    val started = System.nanoTime()
+    val result =
+        runCatching {
+            withTimeout(5_000) {
+                val socket = UdpServerSocket.bind("127.0.0.1", 0)
+                val server = QuicServer(QuicServerConfig(signer = signer, alpnSelector = { it.firstOrNull() }), socket, scope)
+                server.start()
+                try {
+                    scope.launch {
+                        val accepted = server.accept() ?: return@launch
+                        val stream = accepted.connection.awaitIncomingPeerStream() ?: return@launch
+                        stream.send.enqueue(readAll(stream))
+                        stream.send.finish()
+                    }
+                    val conn =
+                        QuicConnection(
+                            serverName = "warm.up",
+                            config = QuicConnectionConfig(),
+                            tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
+                            alpnList = listOf(ALPN_HQ.encodeToByteArray()),
+                        )
+                    val driver = QuicConnectionDriver(conn, UdpSocket.connect("127.0.0.1", socket.localPort), scope)
+                    driver.start()
+                    conn.awaitHandshakeConfirmed()
+                    val stream = conn.openBidiStream()
+                    stream.send.enqueue("warm".encodeToByteArray())
+                    stream.send.finish()
+                    readAll(stream)
+                    driver.close()
+                } finally {
+                    server.close()
+                }
+            }
+        }
+    val ms = (System.nanoTime() - started) / 1_000_000
+    System.err.println("server: warm-up ${if (result.isSuccess) "done" else "failed (${result.exceptionOrNull()?.message})"} in $ms ms")
 }
 
 private suspend fun serveConnection(

@@ -128,21 +128,27 @@ actual class UdpSocket private constructor(
     actual override suspend fun receive(): ByteArray? {
         if (closed.get()) return null
         return withContext(recvDispatcher) {
-            if (closed.get()) return@withContext null
-            try {
-                // No synchronized — only the read loop touches readBuf, by
-                // contract. The previous synchronized block was pointless.
-                readBuf.clear()
-                channel.receive(readBuf) ?: return@withContext null
-                readBuf.flip()
-                val out = ByteArray(readBuf.remaining())
-                readBuf.get(out)
-                receivedDatagrams.incrementAndGet()
-                receivedBytes.addAndGet(out.size.toLong())
-                out
-            } catch (_: ClosedChannelException) {
-                null
+            while (!closed.get()) {
+                try {
+                    // No synchronized — only the read loop touches readBuf, by
+                    // contract. The previous synchronized block was pointless.
+                    readBuf.clear()
+                    channel.receive(readBuf) ?: return@withContext null
+                    readBuf.flip()
+                    val out = ByteArray(readBuf.remaining())
+                    readBuf.get(out)
+                    receivedDatagrams.incrementAndGet()
+                    receivedBytes.addAndGet(out.size.toLong())
+                    return@withContext out
+                } catch (_: ClosedChannelException) {
+                    return@withContext null
+                } catch (_: java.net.PortUnreachableException) {
+                    // An ICMP error on the connected socket. Anyone on the path
+                    // can forge one, so it ends nothing: the idle timeout or
+                    // the peer's CONNECTION_CLOSE does (RFC 9000 §10).
+                }
             }
+            null
         }
     }
 
