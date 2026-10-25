@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quic.transport.QuicDatagramSocket
 import com.vitorpamplona.quic.transport.UdpSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,24 +55,32 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 @OptIn(ExperimentalAtomicApi::class)
 class QuicConnectionDriver(
     val connection: QuicConnection,
-    socket: UdpSocket,
+    socket: QuicDatagramSocket,
     private val parentScope: CoroutineScope,
     /**
      * Opens the extra socket a preferred-address migration (RFC 9000 §9.6)
      * needs toward the server's new address. Tests substitute their own.
      */
-    private val socketFactory: suspend (host: String, port: Int) -> UdpSocket = { host, port -> UdpSocket.connect(host, port) },
+    private val socketFactory: suspend (host: String, port: Int) -> QuicDatagramSocket = { host, port -> UdpSocket.connect(host, port) },
 ) {
+    /** A client connection over a connected [UdpSocket]. */
+    constructor(
+        connection: QuicConnection,
+        socket: UdpSocket,
+        parentScope: CoroutineScope,
+        socketFactory: suspend (host: String, port: Int) -> UdpSocket = { host, port -> UdpSocket.connect(host, port) },
+    ) : this(connection, socket as QuicDatagramSocket, parentScope, socketFactory)
+
     /** The socket the connection sends on. Swapped to [probeSocket] when a preferred-address probe validates. */
     @kotlin.concurrent.Volatile
-    private var activeSocket: UdpSocket = socket
+    private var activeSocket: QuicDatagramSocket = socket
 
     /** Socket toward the preferred address while its path is being validated. */
     @kotlin.concurrent.Volatile
-    private var probeSocket: UdpSocket? = null
+    private var probeSocket: QuicDatagramSocket? = null
 
     /** Sockets of paths we left; still read for stragglers, closed with the driver. */
-    private val retiredSockets = ArrayList<UdpSocket>()
+    private val retiredSockets = ArrayList<QuicDatagramSocket>()
     private var probeSocketRequested = false
 
     /**
@@ -158,14 +167,14 @@ class QuicConnectionDriver(
     }
 
     /** Which path [socket] currently carries. */
-    private fun pathOf(socket: UdpSocket): NetworkPath =
+    private fun pathOf(socket: QuicDatagramSocket): NetworkPath =
         when {
             socket === activeSocket -> NetworkPath.ACTIVE
             socket === probeSocket -> NetworkPath.PROBE
             else -> NetworkPath.RETIRED
         }
 
-    private suspend fun readLoop(socket: UdpSocket) {
+    private suspend fun readLoop(socket: QuicDatagramSocket) {
         try {
             while (connection.status != QuicConnection.Status.CLOSED) {
                 val datagram = socket.receive() ?: break

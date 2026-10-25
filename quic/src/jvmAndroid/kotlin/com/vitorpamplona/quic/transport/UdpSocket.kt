@@ -59,7 +59,7 @@ import java.util.concurrent.atomic.AtomicLong
 actual class UdpSocket private constructor(
     private val channel: DatagramChannel,
     private val remote: InetSocketAddress,
-) {
+) : QuicDatagramSocket {
     private val closed = AtomicBoolean(false)
 
     // Dedicated single-thread executors so the blocking socket calls never
@@ -96,19 +96,19 @@ actual class UdpSocket private constructor(
     actual val localPort: Int
         get() = (channel.localAddress as InetSocketAddress).port
 
-    actual val receivedDatagramCount: Long
+    actual override val receivedDatagramCount: Long
         get() = receivedDatagrams.get()
 
-    actual val receivedByteCount: Long
+    actual override val receivedByteCount: Long
         get() = receivedBytes.get()
 
-    actual val receiveBufferSizeBytes: Int
+    actual override val receiveBufferSizeBytes: Int
         get() = channel.getOption(StandardSocketOptions.SO_RCVBUF)
 
-    actual val remoteIsIpv6: Boolean
+    actual override val remoteIsIpv6: Boolean
         get() = remote.address is java.net.Inet6Address
 
-    actual suspend fun send(payload: ByteArray): Int {
+    actual override suspend fun send(payload: ByteArray): Int {
         // Fail fast without dispatching onto a possibly shut-down executor.
         if (closed.get()) throw ClosedChannelException()
         return withContext(sendDispatcher) {
@@ -125,7 +125,7 @@ actual class UdpSocket private constructor(
         }
     }
 
-    actual suspend fun receive(): ByteArray? {
+    actual override suspend fun receive(): ByteArray? {
         if (closed.get()) return null
         return withContext(recvDispatcher) {
             if (closed.get()) return@withContext null
@@ -146,7 +146,7 @@ actual class UdpSocket private constructor(
         }
     }
 
-    actual fun close() {
+    actual override fun close() {
         if (closed.compareAndSet(false, true)) {
             try {
                 channel.close()

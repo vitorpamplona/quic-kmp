@@ -222,6 +222,9 @@ class QuicConnection internal constructor(
     /** True for the server side of a connection. */
     val isServer: Boolean get() = serverSetup != null
 
+    /** Called once when the connection terminates; a server endpoint drops its routes. */
+    internal var onTerminated: (() -> Unit)? = null
+
     /** True when [id] is in our stream id space (RFC 9000 §2.1: bit 0 names the initiator). */
     internal fun isLocalStream(id: Long): Boolean = StreamId.isServerInitiated(id) == isServer
 
@@ -232,9 +235,11 @@ class QuicConnection internal constructor(
     /**
      * The DCID of the client's very first Initial: ours on a client; on a
      * server, the one the client chose (echoed in the
-     * `original_destination_connection_id` transport parameter).
+     * `original_destination_connection_id` transport parameter). A client
+     * that restarts after Version Negotiation starts over with a new one.
      */
-    val originalDestinationConnectionId: ConnectionId = serverSetup?.originalDestinationConnectionId ?: destinationConnectionId
+    var originalDestinationConnectionId: ConnectionId = serverSetup?.originalDestinationConnectionId ?: destinationConnectionId
+        private set
 
     /**
      * Version the writer stamps into the long-header version field on the
@@ -1558,6 +1563,12 @@ class QuicConnection internal constructor(
 
     /** Begin the handshake — emits ClientHello into Initial CRYPTO. */
     fun start() {
+        // A server's handshake starts with the client's Initial, which its
+        // endpoint feeds in.
+        if (isServer) {
+            qlogObserver.onTransportParametersSet("local", localTransportParametersSummary())
+            return
+        }
         // qlog: emit connection_started + initial transport_parameters_set
         // before any wire traffic so the trace makes chronological sense
         // when handed to qvis.
@@ -1628,6 +1639,9 @@ class QuicConnection internal constructor(
         // cryptographically isolated from the pre-VN exchange.
         val newDcid = ConnectionId.random(8)
         destinationConnectionId = newDcid
+        // RFC 9000 §7.3: original_destination_connection_id names the first
+        // Initial of this attempt, and the new attempt starts here (§6.2).
+        originalDestinationConnectionId = newDcid
 
         // Reset Initial-level state in place: fresh PN space (next
         // allocateOutbound returns 0), fresh ackTracker, fresh
@@ -2464,6 +2478,10 @@ class QuicConnection internal constructor(
      * delivered are surfaced to the collector before the Flow completes.
      */
     private fun closeAllSignals() {
+        onTerminated?.let {
+            onTerminated = null
+            it()
+        }
         closedSignal.close()
         peerStreamSignal.close()
         incomingDatagramSignal.close()
@@ -3974,7 +3992,7 @@ class QuicConnection internal constructor(
  * fresh [kotlin.time.TimeSource.Monotonic.markNow] mark. Only differences are
  * meaningful; an NTP step / suspend-resume does not affect the values.
  */
-private fun defaultMonotonicNowMillis(): () -> Long {
+internal fun defaultMonotonicNowMillis(): () -> Long {
     val anchor =
         kotlin.time.TimeSource.Monotonic
             .markNow()
@@ -3987,7 +4005,7 @@ private fun defaultMonotonicNowMillis(): () -> Long {
  * stamp `TlsResumptionState.issuedAtMillis`, so deltas across the pair are
  * meaningful even across process restarts.
  */
-private fun defaultEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
+internal fun defaultEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
 
 /**
  * One source CID we've issued to the peer (RFC 9000 §5.1.1 +
