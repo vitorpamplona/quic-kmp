@@ -61,6 +61,15 @@ class QuicServerTest {
         val clients = HashMap<UdpPeerAddress, Channel<ByteArray>>()
         val sentToUnknown = Channel<Pair<UdpPeerAddress, ByteArray>>(Channel.UNLIMITED)
 
+        /** Drop everything clients send, as if the path to the server went dark. */
+        @Volatile
+        var dropToServer = false
+
+        /** Datagrams clients tried to send. */
+        val clientSends =
+            java.util.concurrent.atomic
+                .AtomicInteger()
+
         override suspend fun receive(): ReceivedDatagram? = toServer.receiveCatching().getOrNull()
 
         override suspend fun send(
@@ -100,7 +109,8 @@ class QuicServerTest {
             val inbox = path.inbox
             return object : QuicDatagramSocket {
                 override suspend fun send(payload: ByteArray): Int {
-                    toServer.trySend(ReceivedDatagram(payload, path.address))
+                    clientSends.incrementAndGet()
+                    if (!dropToServer) toServer.trySend(ReceivedDatagram(payload, path.address))
                     return payload.size
                 }
 
@@ -142,11 +152,12 @@ class QuicServerTest {
         path: Network.Rebindable = network.Rebindable(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), port)),
         token: ByteArray? = null,
         onNewToken: ((ByteArray) -> Unit)? = null,
+        config: QuicConnectionConfig = QuicConnectionConfig(compatibleVersions = compatibleVersions),
     ): QuicConnection {
         val conn =
             QuicConnection(
                 serverName = "quic.test",
-                config = QuicConnectionConfig(compatibleVersions = compatibleVersions),
+                config = config,
                 tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
                 addressValidationToken = token,
                 onNewToken = onNewToken,
@@ -235,6 +246,20 @@ class QuicServerTest {
             assertTrue(refused.status == QuicConnection.Status.DRAINING || refused.status == QuicConnection.Status.CLOSED)
             assertTrue(refused.closeReason?.contains("connection limit") == true, "closed with: ${refused.closeReason}")
             assertEquals(1, server.connectionCount)
+        }
+
+    @Test
+    fun `keep-alive into a dead path sends a few probes, not a flood`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network)
+            val client = client(network, 5011, config = QuicConnectionConfig(keepAliveIntervalMillis = 100, maxIdleTimeoutMillis = 2_000))
+            echoOnce(server, client)
+            network.dropToServer = true
+            val before = network.clientSends.get()
+            kotlinx.coroutines.delay(1_500)
+            val sent = network.clientSends.get() - before
+            assertTrue(sent in 1..60, "client sent $sent datagrams in 1.5 s into a dead path")
         }
 
     @Test
