@@ -1475,7 +1475,21 @@ class QuicConnection internal constructor(
      * server may still be blocked by its amplification limit). Without the
      * check an idle connection sends a PING every PTO.
      */
-    internal fun ptoArmed(): Boolean = !isServer && !handshakeConfirmed || initial.bytesInFlight > 0L || handshake.bytesInFlight > 0L || application.bytesInFlight > 0L
+    internal fun ptoArmed(): Boolean =
+        !isServer && !handshakeConfirmed || lastAppPacketAckOnly ||
+            initial.bytesInFlight > 0L || handshake.bytesInFlight > 0L || application.bytesInFlight > 0L
+
+    /**
+     * Our latest 1-RTT packet carried only ACKs. The PTO timer stays armed, so
+     * a PTO of silence after it brings one PING (RFC 9000 §13.2.4 suggests a
+     * receiver make a packet ack-eliciting now and then). A receiver that only
+     * sends ACKs otherwise goes silent when the peer's packets stop reaching it,
+     * as after a NAT rebinding, and the peer never learns its new address: our
+     * client against haproxy's rebind tests. Once the PING is acknowledged the
+     * connection is quiet again.
+     */
+    @Volatile
+    internal var lastAppPacketAckOnly: Boolean = false
 
     /**
      * RFC 9002 §6.2.4 probe budget. Set to 2 each time the PTO timer

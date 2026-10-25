@@ -1278,6 +1278,7 @@ private fun buildApplicationPacket(
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)
     if (ackEliciting) conn.noteAckElicitingSent(nowMillis)
+    if (use1Rtt) conn.lastAppPacketAckOnly = !ackEliciting
     // RFC 9001 §6.6 / §B.1 confidentiality limit. Track per-key
     // encryption count for the active 1-RTT send key. At half the
     // AEAD's confidentiality limit we soft-trigger a key update; at

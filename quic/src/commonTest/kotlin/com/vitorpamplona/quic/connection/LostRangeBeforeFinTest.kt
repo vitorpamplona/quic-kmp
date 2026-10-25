@@ -26,6 +26,7 @@ import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -130,6 +131,26 @@ class LostRangeBeforeFinTest {
 
             drainAndAckEverything(client, pipe)
             assertFalse(client.ptoArmed())
+        }
+
+    @Test
+    fun `after sending only ACKs one PING follows a PTO of silence`() =
+        runBlocking {
+            // A receiver that only ACKs goes silent if the peer's packets stop
+            // arriving (a NAT rebinding drops them); the PING is what tells the
+            // peer our new address (our client against haproxy's rebind tests).
+            val (client, pipe) = newConnectedClient()
+            drainAndAckEverything(client, pipe)
+            repeat(2) { feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(com.vitorpamplona.quic.frame.PingFrame))!!, nowMillis = 0L) }
+            val ackOnly = pipe.decryptClientApplicationFrames(assertNotNull(drainOutbound(client, nowMillis = 0L)))!!
+            assertTrue(ackOnly.all { it is AckFrame }, "an ACK-only packet: $ackOnly")
+            assertTrue(client.ptoArmed(), "an ACK-only packet keeps the PTO timer running")
+
+            handlePtoFired(client)
+            val probe = pipe.decryptClientApplicationFrames(assertNotNull(drainOutbound(client, nowMillis = 1_000L)))!!
+            assertTrue(probe.any { it is com.vitorpamplona.quic.frame.PingFrame }, "the PTO sent a PING: $probe")
+            drainAndAckEverything(client, pipe)
+            assertFalse(client.ptoArmed(), "quiet once the PING is acknowledged")
         }
 
     private fun drainAndAckEverything(
