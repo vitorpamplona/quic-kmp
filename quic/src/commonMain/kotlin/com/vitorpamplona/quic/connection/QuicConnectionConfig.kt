@@ -94,4 +94,10 @@ data class QuicConnectionConfig(
      * stacks do to keep the extension point from ossifying.
      */
     val greaseTransportParameters: Boolean = true,
+    /**
+     * RFC 9000 §17.4 latency spin bit, which lets on-path observers measure
+     * RTT. Even when on, a random one in 16 connections leaves it off, as the
+     * RFC requires; off, it carries a random value per connection.
+     */
+    val spinBit: Boolean = true,
 )

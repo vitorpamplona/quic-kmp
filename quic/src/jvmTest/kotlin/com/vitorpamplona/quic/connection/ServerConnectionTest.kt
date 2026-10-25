@@ -177,6 +177,31 @@ class ServerConnectionTest {
         }
 
     @Test
+    fun `the spin bit flips once per round trip`() {
+        val client = client()
+        client.start()
+        val server = serverFor(client)
+        pump(client, server)
+        client.spinEnabled = true
+        server.spinEnabled = true
+        client.spinValue = false
+        server.spinValue = false
+        val seen = ArrayList<Boolean>()
+        repeat(4) {
+            client.pendingPing = true
+            val toServer = assertNotNull(drainOutbound(client, now))
+            seen += (toServer[0].toInt() and 0x20) != 0
+            feedDatagram(server, toServer, now)
+            // The server echoes what it saw; the client answers with the inverse.
+            assertEquals(seen.last(), server.spinValue)
+            server.pendingPing = true
+            feedDatagram(client, assertNotNull(drainOutbound(server, now)), now)
+            now += 30
+        }
+        assertEquals(listOf(false, true, false, true), seen)
+    }
+
+    @Test
     fun `an unvalidated server sends at most three times what it received`() {
         val client = client()
         client.start()

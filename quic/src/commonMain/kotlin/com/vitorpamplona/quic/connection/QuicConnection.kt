@@ -1230,6 +1230,35 @@ class QuicConnection internal constructor(
      */
     internal fun amplificationAllowance(): Long = if (addressValidated) Long.MAX_VALUE else 3L * amplificationBytesReceived - amplificationBytesSent
 
+    /**
+     * RFC 9000 §17.4: whether this connection spins (a random one in 16 doesn't,
+     * even with [QuicConnectionConfig.spinBit]).
+     */
+    internal var spinEnabled: Boolean =
+        config.spinBit &&
+            (
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes(1)[0]
+                    .toInt() and 0x0F
+            ) != 0
+
+    /** The spin bit our 1-RTT packets carry; a random constant when [spinEnabled] is off. */
+    internal var spinValue: Boolean =
+        !spinEnabled &&
+            (
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes(1)[0]
+                    .toInt() and 1
+            ) == 1
+
+    /**
+     * RFC 9000 §17.4: on a 1-RTT packet that raised the highest packet number
+     * seen, a server echoes the peer's spin bit and a client inverts it.
+     */
+    internal fun onSpinBitReceived(spin: Boolean) {
+        if (spinEnabled) spinValue = if (isServer) spin else !spin
+    }
+
     /** A server owes the client this NEW_TOKEN token (RFC 9000 §8.1.3), first send or after a loss. */
     internal var pendingNewToken: ByteArray? = null
 

@@ -314,7 +314,7 @@ private fun buildPmtuProbe(
     val payload = ping.copyOf((size - overhead).coerceAtLeast(ping.size))
     val built =
         ShortHeaderPacket.build(
-            ShortHeaderPlaintextPacket(conn.destinationConnectionId, pn, payload, keyPhase = conn.currentSendKeyPhase),
+            ShortHeaderPlaintextPacket(conn.destinationConnectionId, pn, payload, keyPhase = conn.currentSendKeyPhase, spin = conn.spinValue),
             proto.aead,
             proto.key,
             proto.iv,
@@ -367,7 +367,7 @@ fun drainProbe(
     val payload = if (unpadded < PROBE_DATAGRAM_SIZE) body.copyOf(body.size + PROBE_DATAGRAM_SIZE - unpadded) else body
     val built =
         ShortHeaderPacket.build(
-            ShortHeaderPlaintextPacket(probe.connectionId, pn, payload, keyPhase = conn.currentSendKeyPhase),
+            ShortHeaderPlaintextPacket(probe.connectionId, pn, payload, keyPhase = conn.currentSendKeyPhase, spin = conn.spinValue),
             proto.aead,
             proto.key,
             proto.iv,
@@ -532,6 +532,7 @@ private fun buildBestLevelPacket(
                     pn,
                     payload,
                     keyPhase = conn.currentSendKeyPhase,
+                    spin = conn.spinValue,
                 ),
                 proto.aead,
                 proto.key,
@@ -1112,6 +1113,7 @@ private fun buildApplicationPacket(
                         pn,
                         payload,
                         keyPhase = conn.currentSendKeyPhase,
+                        spin = conn.spinValue,
                     ),
                     proto.aead,
                     proto.key,

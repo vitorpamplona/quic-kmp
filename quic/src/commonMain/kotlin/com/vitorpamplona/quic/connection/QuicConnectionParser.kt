@@ -663,6 +663,11 @@ private fun feedShortHeaderPacket(
     if (rotateOnSuccess != null && parsed.packet.packetNumber > state.pnSpace.largestReceived) {
         conn.commitKeyUpdate(rotateOnSuccess)
     }
+    // RFC 9000 §17.4: the spin bit isn't header-protected; it follows the
+    // packet that raises the highest packet number.
+    if (parsed.packet.packetNumber > state.pnSpace.largestReceived) {
+        conn.onSpinBitReceived((datagram[offset].toInt() and 0x20) != 0)
+    }
     // RFC 9001 §6.4: clear the in-flight-rotation gate once an inbound
     // packet decrypts under the live (post-rotation) keys. That confirms
     // the peer has rolled forward in lockstep, so it's safe to permit

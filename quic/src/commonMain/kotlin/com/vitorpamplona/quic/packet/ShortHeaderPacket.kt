@@ -43,6 +43,8 @@ data class ShortHeaderPlaintextPacket(
     val packetNumber: Long,
     val payload: ByteArray,
     val keyPhase: Boolean = false,
+    /** RFC 9000 §17.4 latency spin bit. */
+    val spin: Boolean = false,
 )
 
 object ShortHeaderPacket {
@@ -72,6 +74,7 @@ object ShortHeaderPacket {
         val firstByteOffset = w.size
         var firstByte = 0x40 or (pnLen - 1) // 01..0..PP
         if (plain.keyPhase) firstByte = firstByte or 0x04
+        if (plain.spin) firstByte = firstByte or 0x20
         w.writeByte(firstByte)
         w.writeBytes(plain.dcid.bytes)
         val pnOffset = w.size
