@@ -1076,7 +1076,7 @@ class QuicConnection internal constructor(
      */
     val congestion: com.vitorpamplona.quic.connection.recovery.CongestionController =
         com.vitorpamplona.quic.connection.recovery
-            .CongestionController()
+            .CongestionController(algorithm = config.congestionControl)
 
     /** RFC 9002 §7.7 pacer, spreading ack-eliciting sends over the round trip. */
     internal val pacer: com.vitorpamplona.quic.connection.recovery.Pacer =
@@ -1134,7 +1134,7 @@ class QuicConnection internal constructor(
         val before = bytesInFlight()
         state.onLeftFlight(acked)
         for (p in acked) if (p.mtuProbeSize > 0) pmtud.onProbeAcked(p.mtuProbeSize)
-        congestion.onPacketsAcked(acked, before)
+        congestion.onPacketsAcked(acked, before, nowMillis(), lossDetection.smoothedRttMs)
     }
 
     /** [lost] were declared lost in [state]: release their bytes and react. Caller holds [streamsLock]. */

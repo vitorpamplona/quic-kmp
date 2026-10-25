@@ -20,10 +20,23 @@
  */
 package com.vitorpamplona.quic.connection.recovery
 
+/** How the window grows in congestion avoidance and shrinks on congestion. */
+enum class CongestionAlgorithm {
+    /** RFC 9002 Appendix B: one datagram per window acknowledged, halve on congestion. */
+    NEW_RENO,
+
+    /**
+     * RFC 9438: the window follows a cubic function of the time since the
+     * last congestion event, back toward the window where it happened, and
+     * shrinks to 0.7 of it; never slower than Reno would be.
+     */
+    CUBIC,
+}
+
 /**
- * RFC 9002 §7 / Appendix B NewReno congestion control: slow start, congestion
- * avoidance, one window reduction per recovery period, persistent congestion,
- * and the ECN-CE response.
+ * RFC 9002 §7 / Appendix B congestion control: slow start, congestion
+ * avoidance (NewReno, or CUBIC per RFC 9438), one window reduction per
+ * recovery period, persistent congestion, and the ECN-CE response.
  *
  * Bytes in flight live on the packet-number spaces
  * ([com.vitorpamplona.quic.connection.LevelState.bytesInFlight]) so that
@@ -32,6 +45,7 @@ package com.vitorpamplona.quic.connection.recovery
  */
 class CongestionController(
     val maxDatagramSize: Int = DEFAULT_MAX_DATAGRAM_SIZE,
+    val algorithm: CongestionAlgorithm = CongestionAlgorithm.NEW_RENO,
 ) {
     /** RFC 9002 §7.2: min(10 * max_datagram_size, max(2 * max_datagram_size, 14720)). */
     val initialWindow: Long = minOf(10L * maxDatagramSize, maxOf(2L * maxDatagramSize, 14_720L))
@@ -63,7 +77,23 @@ class CongestionController(
         congestionWindow = initialWindow
         slowStartThreshold = Long.MAX_VALUE
         recoveryStartTimeMs = null
+        cubicEpochStartMs = Long.MIN_VALUE
+        cubicWindowMax = 0.0
     }
+
+    // RFC 9438 state, in datagrams (the RFC's "segments").
+
+    /** §4.2 t's origin: when the current congestion-avoidance epoch began; MIN_VALUE before one. */
+    private var cubicEpochStartMs: Long = Long.MIN_VALUE
+
+    /** §4.1 W_max: the window just before the last reduction. */
+    private var cubicWindowMax: Double = 0.0
+
+    /** §4.2 K: when, after the epoch began, the cubic curve gets back to [cubicWindowMax]. */
+    private var cubicK: Double = 0.0
+
+    /** §4.3 W_est: what Reno would have grown the window to in this epoch. */
+    private var cubicRenoEstimate: Double = 0.0
 
     /** Congestion-avoidance byte counter: the window grows one datagram per window's worth acked. */
     private var bytesAckedInAvoidance: Long = 0L
@@ -82,6 +112,8 @@ class CongestionController(
     fun onPacketsAcked(
         acked: List<SentPacket>,
         bytesInFlightBeforeAck: Long,
+        nowMillis: Long = 0L,
+        smoothedRttMs: Long = 0L,
     ) {
         val appLimited = bytesInFlightBeforeAck + maxDatagramSize < congestionWindow
         for (packet in acked) {
@@ -90,6 +122,8 @@ class CongestionController(
             if (appLimited) continue
             if (inSlowStart) {
                 congestionWindow += packet.sizeBytes
+            } else if (algorithm == CongestionAlgorithm.CUBIC) {
+                cubicAvoidance(packet.sizeBytes, nowMillis, smoothedRttMs)
             } else {
                 bytesAckedInAvoidance += packet.sizeBytes
                 if (bytesAckedInAvoidance >= congestionWindow) {
@@ -98,6 +132,52 @@ class CongestionController(
                 }
             }
         }
+    }
+
+    /** RFC 9438 §4.2–§4.4: grow toward W_cubic(t + RTT), or along W_est when that's ahead. */
+    private fun cubicAvoidance(
+        ackedBytes: Int,
+        nowMillis: Long,
+        smoothedRttMs: Long,
+    ) {
+        val mss = maxDatagramSize.toDouble()
+        val cwnd = congestionWindow / mss
+        if (cubicEpochStartMs == Long.MIN_VALUE) {
+            // §4.8: an epoch that starts without a reduction (leaving slow
+            // start) has its plateau where it is.
+            cubicEpochStartMs = nowMillis
+            if (cubicWindowMax < cwnd) {
+                cubicWindowMax = cwnd
+                cubicK = 0.0
+            } else {
+                cubicK = cubicKFor(cubicWindowMax, cwnd)
+            }
+            cubicRenoEstimate = cwnd
+        }
+        val t = (nowMillis - cubicEpochStartMs + smoothedRttMs) / 1000.0
+        val target = (CUBIC_C * cube(t - cubicK) + cubicWindowMax).coerceIn(cwnd, 1.5 * cwnd)
+        val acked = ackedBytes / mss
+        cubicRenoEstimate += CUBIC_ALPHA * acked / cwnd
+        val next =
+            if (cubicRenoEstimate > target) {
+                // §4.3 Reno-friendly region.
+                cubicRenoEstimate
+            } else {
+                // §4.4: (target - cwnd) / cwnd per datagram acknowledged.
+                cwnd + (target - cwnd) * acked / cwnd
+            }
+        congestionWindow = maxOf(congestionWindow, (next * mss).toLong())
+    }
+
+    private fun cube(x: Double): Double = x * x * x
+
+    /** §4.2 K = cbrt((W_max - cwnd_epoch) / C). */
+    private fun cubicKFor(
+        windowMax: Double,
+        cwndEpoch: Double,
+    ): Double {
+        val d = (windowMax - cwndEpoch) / CUBIC_C
+        return if (d <= 0.0) 0.0 else kotlin.math.cbrt(d)
     }
 
     /**
@@ -112,8 +192,22 @@ class CongestionController(
     ) {
         if (inRecovery(sentAtMillis)) return
         recoveryStartTimeMs = nowMillis
-        slowStartThreshold = maxOf(congestionWindow / 2, minimumWindow)
-        congestionWindow = slowStartThreshold
+        if (algorithm == CongestionAlgorithm.CUBIC) {
+            // RFC 9438 §4.6–§4.7: remember where it happened (lower, with fast
+            // convergence, when the window was already below the last one),
+            // shrink to beta of it, and start a new epoch there.
+            val cwnd = congestionWindow / maxDatagramSize.toDouble()
+            cubicWindowMax = if (cwnd < cubicWindowMax) cwnd * (1.0 + CUBIC_BETA) / 2.0 else cwnd
+            slowStartThreshold = maxOf((congestionWindow * CUBIC_BETA).toLong(), minimumWindow)
+            congestionWindow = slowStartThreshold
+            val reduced = congestionWindow / maxDatagramSize.toDouble()
+            cubicK = cubicKFor(cubicWindowMax, reduced)
+            cubicRenoEstimate = reduced
+            cubicEpochStartMs = nowMillis
+        } else {
+            slowStartThreshold = maxOf(congestionWindow / 2, minimumWindow)
+            congestionWindow = slowStartThreshold
+        }
         bytesAckedInAvoidance = 0L
         congestionEvents++
     }
@@ -147,6 +241,9 @@ class CongestionController(
             congestionWindow = minimumWindow
             recoveryStartTimeMs = null
             bytesAckedInAvoidance = 0L
+            // RFC 9438 §4.9: a fresh start, as after an idle period.
+            cubicEpochStartMs = Long.MIN_VALUE
+            cubicWindowMax = 0.0
             persistentCongestionEvents++
         }
     }
@@ -157,6 +254,15 @@ class CongestionController(
 
         /** RFC 9002 §7.6.1 kPersistentCongestionThreshold. */
         const val PERSISTENT_CONGESTION_THRESHOLD: Long = 3L
+
+        /** RFC 9438 §5.1 C, in datagrams per second cubed. */
+        private const val CUBIC_C = 0.4
+
+        /** RFC 9438 §4.6 beta_cubic: the multiplicative decrease. */
+        private const val CUBIC_BETA = 0.7
+
+        /** RFC 9438 §4.3 alpha_cubic = 3 * (1 - beta) / (1 + beta): Reno's growth at this beta. */
+        private const val CUBIC_ALPHA = 3.0 * (1.0 - CUBIC_BETA) / (1.0 + CUBIC_BETA)
     }
 }
 

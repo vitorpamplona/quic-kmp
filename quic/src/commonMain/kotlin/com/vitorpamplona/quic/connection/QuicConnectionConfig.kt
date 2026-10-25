@@ -100,4 +100,7 @@ data class QuicConnectionConfig(
      * RFC requires; off, it carries a random value per connection.
      */
     val spinBit: Boolean = true,
+    /** RFC 9002 / RFC 9438: how the congestion window grows and shrinks. */
+    val congestionControl: com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm =
+        com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm.CUBIC,
 )
