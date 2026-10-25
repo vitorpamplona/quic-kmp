@@ -3799,6 +3799,11 @@ class QuicConnection internal constructor(
         // Path state that belonged to the old path. The new path's RTT is
         // unknown, so restart PTO backoff from the estimator's baseline.
         pendingPathChallengePayloads.clear()
+        // Challenges the server sent on the probed path and we haven't answered
+        // yet are now owed on the active path: the probe sends nothing more, and
+        // lsquic kept sending on the old path while its challenge went unanswered.
+        pendingPathChallengePayloads.addAll(probe.pendingResponses)
+        probe.pendingResponses.clear()
         consecutivePtoCount = 0
         // §9.6.2: the server moves its own sending once it sees a non-probing
         // packet from us at the preferred address; make the next one go now.

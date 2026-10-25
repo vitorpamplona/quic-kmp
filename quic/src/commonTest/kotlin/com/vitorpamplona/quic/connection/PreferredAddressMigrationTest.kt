@@ -127,6 +127,24 @@ class PreferredAddressMigrationTest {
     }
 
     @Test
+    fun server_challenge_still_unanswered_when_the_probe_validates_is_answered_on_the_new_path() {
+        // lsquic: its PATH_CHALLENGE on the probed path came 3 ms before its
+        // PATH_RESPONSE; the answer queued on the probe was dropped once the
+        // probe validated, and lsquic never moved its sending to the new path.
+        val (client, pipe) = newConnectedClient(preferredAddress = preferredAddress())
+        drainOutbound(client, 0L)
+        val probe = client.pathProbe!!
+        probe.onSocketReady()
+        val ourChallenge = pipe.decryptClientApplicationFrames(drainProbe(client, 0L)!!)!!.filterIsInstance<PathChallengeFrame>().single()
+        val serverChallenge = ByteArray(8) { (it + 1).toByte() }
+        feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(PathChallengeFrame(serverChallenge)))!!, 1L, NetworkPath.PROBE)
+        feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(PathResponseFrame(ourChallenge.data)))!!, 1L, NetworkPath.PROBE)
+        assertEquals(PathProbe.State.VALIDATED, probe.state)
+        val frames = pipe.decryptClientApplicationFrames(assertNotNull(drainOutbound(client, 2L)))!!
+        assertContentEquals(serverChallenge, frames.filterIsInstance<PathResponseFrame>().single().data)
+    }
+
+    @Test
     fun unanswered_probe_times_out_and_the_connection_stays() {
         val (client, _) = newConnectedClient(preferredAddress = preferredAddress())
         val originalDcid = client.destinationConnectionId
