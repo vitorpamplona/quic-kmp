@@ -240,19 +240,6 @@ object LongHeaderPacket {
         // path was dead code.
         packet[0] = (first xor (mask[0].toInt() and 0x0F)).toByte()
         val unmaskedFirst = packet[0].toInt() and 0xFF
-        // RFC 9000 §17.2: long header layout is `1|1|T|T|R|R|P|P` —
-        // the two reserved bits at 0x0C MUST be zero after HP unmasking.
-        // A peer that sets either bit is in protocol violation. The
-        // form-bit (0x80) and fixed-bit (0x40) are not header-protected,
-        // so they're already correct; we skip the AEAD here on
-        // reserved-bit set rather than letting a malformed-but-AEAD-OK
-        // packet drift our state.
-        if ((unmaskedFirst and 0x0C) != 0) {
-            throw com.vitorpamplona.quic.QuicProtocolViolationException(
-                "PROTOCOL_VIOLATION: long-header reserved bits set " +
-                    "(0x${unmaskedFirst.toString(16)})",
-            )
-        }
         val pnLen = (unmaskedFirst and 0x03) + 1
 
         // Step 2: unmask exactly `pnLen` packet-number bytes.
@@ -293,6 +280,17 @@ object LongHeaderPacket {
                 ciphertextOffset = aadEnd,
                 ciphertextLength = packet.size - aadEnd,
             ) ?: return null
+        // RFC 9000 §17.2: long header layout is `1|1|T|T|R|R|P|P`; the two
+        // reserved bits at 0x0C MUST be zero once packet and header
+        // protection are removed. Checked only after the AEAD opened: with
+        // the wrong keys (a packet from another version, or forged) the
+        // unmasked bits are noise, and such a packet is dropped, not fatal.
+        if ((unmaskedFirst and 0x0C) != 0) {
+            throw com.vitorpamplona.quic.QuicProtocolViolationException(
+                "PROTOCOL_VIOLATION: long-header reserved bits set " +
+                    "(0x${unmaskedFirst.toString(16)})",
+            )
+        }
 
         return ParseResult(
             packet =
