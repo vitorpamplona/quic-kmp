@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 import com.vitorpamplona.quic.Varint
@@ -50,6 +51,46 @@ object TransportParameterId {
 
     /** RFC 9221 — `max_datagram_frame_size`. */
     const val MAX_DATAGRAM_FRAME_SIZE: Long = 0x20
+
+    /** RFC 9368 §3 — `version_information`. */
+    const val VERSION_INFORMATION: Long = 0x11
+}
+
+/**
+ * RFC 9368 §3 Version Information: the version the sender chose for the
+ * connection, plus the versions it offers (client) or has fully deployed
+ * (server).
+ */
+data class VersionInformation(
+    val chosenVersion: Int,
+    val availableVersions: List<Int>,
+) {
+    fun encode(): ByteArray {
+        val w = QuicWriter()
+        w.writeUint32(chosenVersion)
+        for (v in availableVersions) w.writeUint32(v)
+        return w.toByteArray()
+    }
+
+    companion object {
+        /**
+         * RFC 9368 §4: a length that isn't a positive multiple of four, or a zero
+         * version anywhere, is a parsing failure (TRANSPORT_PARAMETER_ERROR).
+         */
+        fun decode(bytes: ByteArray): VersionInformation {
+            if (bytes.isEmpty() || bytes.size % 4 != 0) {
+                throw QuicCodecException("version_information length ${bytes.size} is not a positive multiple of 4")
+            }
+            val r = QuicReader(bytes)
+            val chosen = r.readUint32().toInt()
+            val available = ArrayList<Int>(bytes.size / 4 - 1)
+            while (r.hasMore()) available += r.readUint32().toInt()
+            if (chosen == 0 || available.any { it == 0 }) {
+                throw QuicCodecException("version_information carries version 0")
+            }
+            return VersionInformation(chosen, available)
+        }
+    }
 }
 
 /**
@@ -96,6 +137,7 @@ data class TransportParameters(
     val statelessResetToken: ByteArray? = null,
     val maxDatagramFrameSize: Long? = null,
     val unknown: Map<Long, ByteArray> = emptyMap(),
+    val versionInformation: VersionInformation? = null,
 ) {
     fun encode(): ByteArray {
         val w = QuicWriter()
@@ -140,6 +182,7 @@ data class TransportParameters(
         retrySourceConnectionId?.let { writeBytesParam(TransportParameterId.RETRY_SOURCE_CONNECTION_ID, it) }
         statelessResetToken?.let { writeBytesParam(TransportParameterId.STATELESS_RESET_TOKEN, it) }
         maxDatagramFrameSize?.let { writeVarintParam(TransportParameterId.MAX_DATAGRAM_FRAME_SIZE, it) }
+        versionInformation?.let { writeBytesParam(TransportParameterId.VERSION_INFORMATION, it.encode()) }
         for ((id, bytes) in unknown) writeBytesParam(id, bytes)
 
         return w.toByteArray()
@@ -165,6 +208,7 @@ data class TransportParameters(
             var retrySourceConnectionId: ByteArray? = null
             var statelessResetToken: ByteArray? = null
             var maxDatagramFrameSize: Long? = null
+            var versionInformation: VersionInformation? = null
             val unknown = mutableMapOf<Long, ByteArray>()
 
             while (r.hasMore()) {
@@ -189,6 +233,7 @@ data class TransportParameters(
                     TransportParameterId.RETRY_SOURCE_CONNECTION_ID -> retrySourceConnectionId = sub.src.copyOfRange(0, len)
                     TransportParameterId.STATELESS_RESET_TOKEN -> statelessResetToken = sub.src.copyOfRange(0, len)
                     TransportParameterId.MAX_DATAGRAM_FRAME_SIZE -> maxDatagramFrameSize = sub.readVarint()
+                    TransportParameterId.VERSION_INFORMATION -> versionInformation = VersionInformation.decode(sub.src.copyOfRange(0, len))
                     else -> unknown[id] = sub.src.copyOfRange(0, len)
                 }
             }
@@ -211,6 +256,7 @@ data class TransportParameters(
                 statelessResetToken = statelessResetToken,
                 maxDatagramFrameSize = maxDatagramFrameSize,
                 unknown = unknown,
+                versionInformation = versionInformation,
             )
         }
     }

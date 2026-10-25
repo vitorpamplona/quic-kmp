@@ -222,12 +222,17 @@ fun deriveQuicKeys(
     keyLen: Int,
     ivLen: Int,
     hpLen: Int,
-): QuicProtectionKeys =
-    QuicProtectionKeys(
-        key = expandLabel(secret, "quic key", keyLen),
-        iv = expandLabel(secret, "quic iv", ivLen),
-        hp = expandLabel(secret, "quic hp", hpLen),
+    version: Int = com.vitorpamplona.quic.packet.QuicVersion.V1,
+): QuicProtectionKeys {
+    val label =
+        com.vitorpamplona.quic.packet.QuicVersion
+            .labelPrefix(version)
+    return QuicProtectionKeys(
+        key = expandLabel(secret, "$label key", keyLen),
+        iv = expandLabel(secret, "$label iv", ivLen),
+        hp = expandLabel(secret, "$label hp", hpLen),
     )
+}
 
 /**
  * Compute the Finished MAC per RFC 8446 §4.4.4:

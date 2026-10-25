@@ -279,6 +279,30 @@ private fun feedLongHeaderPacket(
     // payload protection, and cannot be coalesced with anything else
     // (it consumes the rest of the datagram via peekHeader.totalLength).
     // Branch out before the standard parse-and-decrypt path.
+    // RFC 9369 §4.1: once the version is settled, packets in any other
+    // version are dropped — except the server's original-version Initials
+    // that can trail a compatible switch.
+    var candidate: PacketProtection? = null
+    var originalVersionInitial = false
+    if (peeked.version != conn.currentVersion) {
+        if (conn.compatibleVersionSwitched &&
+            peeked.version == conn.initialVersion &&
+            peeked.type == LongHeaderType.INITIAL &&
+            conn.originalVersionInitialReceive != null &&
+            !conn.initial.keysDiscarded
+        ) {
+            originalVersionInitial = true
+        } else if (peeked.type == LongHeaderType.INITIAL) {
+            candidate = conn.compatibleVersionCandidate(peeked.version)
+        }
+        if (!originalVersionInitial && candidate == null) {
+            conn.qlogObserver.onPacketDropped(
+                "long header in version ${QuicVersion.name(peeked.version)}, connection runs ${QuicVersion.name(conn.currentVersion)}",
+                peeked.totalLength,
+            )
+            return null
+        }
+    }
     if (peeked.type == LongHeaderType.RETRY) {
         val retryBytes = datagram.copyOfRange(offset, offset + peeked.totalLength)
         val retryPacket = RetryPacket.parse(retryBytes)
@@ -310,7 +334,12 @@ private fun feedLongHeaderPacket(
             }
         }
     val state = conn.levelState(level)
-    val proto = state.receiveProtection
+    val proto =
+        when {
+            candidate != null -> candidate
+            originalVersionInitial -> conn.originalVersionInitialReceive
+            else -> state.receiveProtection
+        }
     if (proto == null) {
         conn.qlogObserver.onPacketDropped(
             "no receive keys at level $level",
@@ -339,6 +368,10 @@ private fun feedLongHeaderPacket(
         )
         return null
     }
+
+    // The server answered in a compatible version and the packet
+    // authenticated under that version's keys: switch (RFC 9368 §2.3).
+    if (candidate != null) conn.commitCompatibleVersion(peeked.version, candidate)
 
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet

@@ -48,7 +48,6 @@ import com.vitorpamplona.quic.observability.qlogFrameName
 import com.vitorpamplona.quic.packet.LongHeaderPacket
 import com.vitorpamplona.quic.packet.LongHeaderPlaintextPacket
 import com.vitorpamplona.quic.packet.LongHeaderType
-import com.vitorpamplona.quic.packet.QuicVersion
 import com.vitorpamplona.quic.packet.ShortHeaderPacket
 import com.vitorpamplona.quic.packet.ShortHeaderPlaintextPacket
 
@@ -396,7 +395,7 @@ private fun buildLongHeaderPacket(
         LongHeaderPacket.build(
             LongHeaderPlaintextPacket(
                 type = type,
-                version = QuicVersion.V1,
+                version = conn.currentVersion,
                 dcid = conn.destinationConnectionId,
                 scid = conn.sourceConnectionId,
                 packetNumber = pn,
@@ -933,7 +932,8 @@ private fun buildApplicationPacket(
                 LongHeaderPacket.build(
                     LongHeaderPlaintextPacket(
                         type = LongHeaderType.ZERO_RTT,
-                        version = conn.currentVersion,
+                        // RFC 9369 §4.1: 0-RTT stays in the version its keys came from.
+                        version = conn.zeroRttVersion,
                         dcid = conn.destinationConnectionId,
                         scid = conn.sourceConnectionId,
                         packetNumber = pn,

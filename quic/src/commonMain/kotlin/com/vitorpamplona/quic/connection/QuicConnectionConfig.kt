@@ -66,4 +66,13 @@ data class QuicConnectionConfig(
     val maxDatagramFrameSize: Long = 1200L,
     val ackDelayExponent: Long = 3L,
     val maxAckDelay: Long = 25L,
+    /**
+     * RFC 9368 compatible version negotiation: the versions the first flight
+     * may be upgraded to, most preferred first. The first Initial always goes
+     * out in [QuicConnection.initialVersion]; listing
+     * [com.vitorpamplona.quic.packet.QuicVersion.V2] here lets a server that
+     * prefers QUIC v2 switch the connection to it without a round trip.
+     * Advertised in the `version_information` transport parameter.
+     */
+    val compatibleVersions: List<Int> = listOf(com.vitorpamplona.quic.packet.QuicVersion.V1),
 )

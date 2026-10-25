@@ -112,6 +112,13 @@ object QuicTransportError {
     const val AEAD_LIMIT_REACHED: Long = 0x0f
 
     const val NO_VIABLE_PATH: Long = 0x10
+
+    /**
+     * RFC 9368 §10.2: version negotiation failed or a downgrade was
+     * detected (the server's Version Information disagrees with the
+     * version the connection actually ended up on).
+     */
+    const val VERSION_NEGOTIATION_ERROR: Long = 0x11
 }
 
 sealed class Frame {

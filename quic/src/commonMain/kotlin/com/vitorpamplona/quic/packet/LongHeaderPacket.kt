@@ -38,7 +38,7 @@ import com.vitorpamplona.quic.crypto.applyHeaderProtectionMask
  * Wire layout:
  *
  *   first_byte          (1 byte)  — header form, type, packet number length
- *   version             (4 bytes) — 0x00000001 for QUIC v1
+ *   version             (4 bytes) — 0x00000001 for QUIC v1, 0x6b3343cf for v2
  *   dcid                (1 + dcid_len bytes)
  *   scid                (1 + scid_len bytes)
  *   token               (varint length + bytes; only Initial)
@@ -90,7 +90,7 @@ object LongHeaderPacket {
         // Build the unprotected header
         val w = QuicWriter()
         val firstByteOffset = w.size
-        val firstByte = 0xC0 or (plain.type.code shl 4) or (pnLen - 1)
+        val firstByte = 0xC0 or (plain.type.wireBits(plain.version) shl 4) or (pnLen - 1)
         w.writeByte(firstByte)
         w.writeUint32(plain.version)
         w.writeByte(plain.dcid.length)
@@ -197,8 +197,8 @@ object LongHeaderPacket {
         // parseAndDecrypt is required to have fixed-bit=1.
         if ((first and 0x40) == 0) return null
         val typeBits = (first ushr 4) and 0x03
-        val type = LongHeaderType.fromTypeBits(typeBits)
         val version = r.readUint32().toInt()
+        val type = LongHeaderType.fromWireBits(typeBits, version)
         val dcidLen = r.readByte()
         if (dcidLen !in 0..20) return null // RFC 9000 §17.2 caps CID at 20 bytes
         val dcidBytes = r.readBytes(dcidLen)
@@ -323,8 +323,8 @@ object LongHeaderPacket {
             val first = r.readByte()
             if ((first and 0x80) == 0) return null
             val typeBits = (first ushr 4) and 0x03
-            val type = LongHeaderType.fromTypeBits(typeBits)
             val version = r.readUint32().toInt()
+            val type = LongHeaderType.fromWireBits(typeBits, version)
             val dcidLen = r.readByte()
             if (dcidLen !in 0..20) return null
             val dcid = r.readBytes(dcidLen)

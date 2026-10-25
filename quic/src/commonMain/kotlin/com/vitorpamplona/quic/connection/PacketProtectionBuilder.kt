@@ -31,17 +31,19 @@ import com.vitorpamplona.quic.tls.deriveQuicKeys
 /**
  * Build [PacketProtection] for one direction at one encryption level given a
  * TLS traffic secret + TLS cipher-suite identifier. The QUIC labels in
- * RFC 9001 §5.1 (`quic key`, `quic iv`, `quic hp`) drive the expansion.
+ * RFC 9001 §5.1 (`quic key`, `quic iv`, `quic hp`) drive the expansion, or
+ * their `quicv2` twins (RFC 9369 §3.3.2) when [version] is v2.
  *
  * Supports the two SHA-256-keyed cipher suites required for QUIC v1
  * interop with nests / aioquic / picoquic: TLS_AES_128_GCM_SHA256
  * (16/12/16) and TLS_CHACHA20_POLY1305_SHA256. AES-256-GCM-SHA384 is
- * omitted — Quartz's primitives don't ship SHA-384 and no interop target
+ * omitted — crypto-kmp doesn't ship SHA-384 and no interop target
  * we've encountered requires it.
  */
 fun packetProtectionFromSecret(
     cipherSuite: Int,
     secret: ByteArray,
+    version: Int = com.vitorpamplona.quic.packet.QuicVersion.V1,
 ): PacketProtection {
     val keyLen: Int
     val ivLen: Int
@@ -68,7 +70,7 @@ fun packetProtectionFromSecret(
             error("unsupported cipher suite 0x${cipherSuite.toString(16)}")
         }
     }
-    val keys = deriveQuicKeys(secret, keyLen, ivLen, hpLen)
+    val keys = deriveQuicKeys(secret, keyLen, ivLen, hpLen, version)
     // For AES-128-GCM, prefer the platform's cached-cipher implementation
     // which avoids `Cipher.getInstance` per-packet (audit-1, audit-3 finding).
     val aead: Aead =

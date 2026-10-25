@@ -193,6 +193,42 @@ class QuicConnection(
         internal set
 
     /**
+     * Versions our first flight is compatible with (RFC 9368 §3), most preferred
+     * first, always including the version the first Initial uses. Empty when
+     * [initialVersion] is not a version we speak (the forced Version Negotiation
+     * probe), in which case we send no `version_information`.
+     */
+    internal val offeredVersions: List<Int> =
+        if (QuicVersion.isSupported(initialVersion)) {
+            (config.compatibleVersions.filter { QuicVersion.isSupported(it) } + initialVersion).distinct()
+        } else {
+            emptyList()
+        }
+
+    /**
+     * The DCID the current Initial keys were derived from: our random first
+     * DCID, then the fresh one after Version Negotiation, then the server's
+     * SCID after a Retry. A compatible version switch re-derives Initial keys
+     * from this same value (RFC 9368 §2.3).
+     */
+    internal var initialKeysDcid: ConnectionId = destinationConnectionId
+
+    /**
+     * RFC 9368 §2.3 / RFC 9369 §4.1: set once the server switched us to a
+     * compatible version by answering in it. The original version's Initial
+     * receive keys stay in [originalVersionInitialReceive] so the server's
+     * early original-version Initials (sent before it read our transport
+     * parameters) still decrypt.
+     */
+    @Volatile
+    internal var compatibleVersionSwitched: Boolean = false
+
+    internal var originalVersionInitialReceive: PacketProtection? = null
+
+    /** Version the 0-RTT keys were derived for. RFC 9369 §4.1: 0-RTT never moves to the negotiated version. */
+    internal var zeroRttVersion: Int = initialVersion
+
+    /**
      * RFC 9000 §17.2.5.1: the Retry token the server handed us in a Retry
      * packet, which we must echo verbatim in the Token field of every
      * subsequent Initial we send. Null until [applyRetry] runs.
@@ -965,8 +1001,8 @@ class QuicConnection(
                 clientSecret: ByteArray,
                 serverSecret: ByteArray,
             ) {
-                handshake.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret)
-                handshake.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret)
+                handshake.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret, currentVersion)
+                handshake.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret, currentVersion)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.HANDSHAKE)
                 qlogObserver.onKeyUpdated("server", EncryptionLevel.HANDSHAKE)
             }
@@ -981,7 +1017,8 @@ class QuicConnection(
                 // keys arrive. Cleared in onApplicationKeysReady (RFC
                 // 9001 §4.10 forbids using 0-RTT keys once 1-RTT is
                 // available).
-                zeroRttSendProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret)
+                zeroRttVersion = currentVersion
+                zeroRttSendProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret, currentVersion)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.APPLICATION)
             }
 
@@ -1035,8 +1072,8 @@ class QuicConnection(
                     application.cryptoSend.requeueAllInflight()
                     application.sentPackets.clear()
                 }
-                application.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret)
-                application.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret)
+                application.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret, currentVersion)
+                application.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret, currentVersion)
                 // Drop 0-RTT keys — the writer must use 1-RTT short
                 // headers from here on (RFC 9001 §4.10).
                 zeroRttSendProtection = null
@@ -1184,15 +1221,9 @@ class QuicConnection(
 
     init {
         // Install Initial keys based on the random destination CID we just generated.
-        val proto = InitialSecrets.derive(destinationConnectionId.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
-        // Initial packets always use AES-128-GCM (RFC 9001 §5). Use the
-        // platform's cached-cipher implementation so per-packet seal/open
-        // doesn't pay for `Cipher.getInstance`.
-        initial.sendProtection =
-            PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp)
-        initial.receiveProtection =
-            PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+        val (send, receive) = initialProtections(destinationConnectionId, initialVersion)
+        initial.sendProtection = send
+        initial.receiveProtection = receive
 
         // Resumption + 0-RTT: pre-load flow-control limits from the
         // remembered transport parameters so streams opened BEFORE the
@@ -1230,9 +1261,7 @@ class QuicConnection(
             scid = sourceConnectionId.bytes,
         )
         qlogObserver.onTransportParametersSet("local", localTransportParametersSummary())
-        // RFC 9000 §6: we're not doing version negotiation, so the
-        // chosen version is unconditional.
-        qlogObserver.onVersionInformation("v1", emptyList())
+        qlogObserver.onVersionInformation(QuicVersion.name(initialVersion), offeredVersions.map { QuicVersion.name(it) })
         tls.start()
         // Drain ClientHello bytes into the Initial-level CRYPTO send buffer.
         // Cache the bytes so [applyVersionNegotiation] can re-enqueue them
@@ -1269,12 +1298,13 @@ class QuicConnection(
         // Anti-downgrade: server-claimed support for the version we
         // already offered indicates VN replay / spoof. Drop silently.
         if (supportedVersions.contains(initialVersion)) return
-        // Pick a version we can speak. Today that's only v1.
-        if (!supportedVersions.contains(QuicVersion.V1)) {
+        // Pick the version we prefer among those the server speaks.
+        val chosen = versionPreference().firstOrNull { it in supportedVersions }
+        if (chosen == null) {
             signalHandshakeFailed(
                 QuicVersionNegotiationException(
-                    "VERSION_NEGOTIATION: server offered ${supportedVersions.map { v -> "0x" + v.toUInt().toString(16) }}, " +
-                        "client only supports 0x" + QuicVersion.V1.toUInt().toString(16),
+                    "VERSION_NEGOTIATION: server offered ${supportedVersions.map { v -> QuicVersion.name(v) }}, " +
+                        "client supports ${QuicVersion.SUPPORTED.map { v -> QuicVersion.name(v) }}",
                 ),
             )
             markClosedExternally("VERSION_NEGOTIATION: no mutually supported version")
@@ -1298,20 +1328,63 @@ class QuicConnection(
         // cryptoSend / cryptoReceive, fresh sentPackets retention.
         // Writer + parser only ever reach the level via [conn.initial],
         // so we mutate the fields rather than swap the instance.
-        val proto = InitialSecrets.derive(newDcid.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
-        val newSend =
-            PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp)
-        val newReceive =
-            PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+        initialKeysDcid = newDcid
+        val (newSend, newReceive) = initialProtections(newDcid, chosen)
         initial.resetForVersionNegotiation(sendProtection = newSend, receiveProtection = newReceive)
         // Re-enqueue the ClientHello so the next drainOutbound emits a v1
         // Initial datagram with the same TLS handshake the original carried.
         originalClientHello?.let { initial.cryptoSend.enqueue(it) }
 
-        // Switch the writer's stamp to v1 so the next Initial / Handshake
+        // Switch the writer's stamp so the next Initial / Handshake
         // long-header carries the right version.
-        currentVersion = QuicVersion.V1
+        currentVersion = chosen
+    }
+
+    /** Our version preference for Version Negotiation: the configured compatible versions, then the rest we speak. */
+    private fun versionPreference(): List<Int> = (config.compatibleVersions.filter { QuicVersion.isSupported(it) } + QuicVersion.SUPPORTED).distinct()
+
+    /** Initial packet protection for both directions, derived from [dcid] under [version]'s salt and labels. */
+    private fun initialProtections(
+        dcid: ConnectionId,
+        version: Int,
+    ): Pair<PacketProtection, PacketProtection> {
+        val proto = InitialSecrets.derive(dcid.bytes, version)
+        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
+        // Initial packets always use AES-128-GCM (RFC 9001 §5). Use the
+        // platform's cached-cipher implementation so per-packet seal/open
+        // doesn't pay for `Cipher.getInstance`.
+        return PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp) to
+            PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+    }
+
+    /**
+     * RFC 9368 §2.3 compatible version negotiation, client side. The server
+     * answered our first flight in [version] instead of [currentVersion]:
+     * returns the Initial receive keys for that version so the parser can try
+     * the packet, or null if [version] isn't one we offered (drop it). Nothing
+     * changes until [commitCompatibleVersion], which the parser calls only once
+     * a packet authenticates under these keys, so a forged version field can't
+     * move us.
+     */
+    internal fun compatibleVersionCandidate(version: Int): PacketProtection? {
+        if (compatibleVersionSwitched || vnConsumed) return null
+        if (version == currentVersion || version !in offeredVersions) return null
+        return initialProtections(initialKeysDcid, version).second
+    }
+
+    /** Switch the connection to [version] after a packet in it authenticated with [receive]. */
+    internal fun commitCompatibleVersion(
+        version: Int,
+        receive: PacketProtection,
+    ) {
+        compatibleVersionSwitched = true
+        originalVersionInitialReceive = initial.receiveProtection
+        // RFC 9369 §4.1: once the negotiated version is known, send our
+        // remaining Initials in it. Same packet-number space, same CRYPTO stream.
+        initial.sendProtection = initialProtections(initialKeysDcid, version).first
+        initial.receiveProtection = receive
+        currentVersion = version
+        qlogObserver.onVersionInformation(QuicVersion.name(version), offeredVersions.map { QuicVersion.name(it) })
     }
 
     /**
@@ -1342,19 +1415,17 @@ class QuicConnection(
         }
         val savedClientHello = originalClientHello ?: return false
 
+        // RFC 9369 §4.1: a Retry always uses the original version, and the
+        // Initial that echoes its token must too.
+        if (retryPacket.version != currentVersion || compatibleVersionSwitched) return false
         destinationConnectionId = retryPacket.scid
-        val proto = InitialSecrets.derive(destinationConnectionId.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
+        initialKeysDcid = retryPacket.scid
+        val (send, receive) = initialProtections(retryPacket.scid, currentVersion)
         // Use resetForRetry, NOT resetForVersionNegotiation: RFC 9001 §5.7
         // requires the Initial PN namespace to continue across the Retry
         // boundary. Resetting PN to 0 caused the runner to flag
         // "Client reset the packet number. Check failed for PN 0".
-        initial.resetForRetry(
-            sendProtection =
-                PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp),
-            receiveProtection =
-                PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp),
-        )
+        initial.resetForRetry(sendProtection = send, receiveProtection = receive)
         initial.cryptoSend.enqueue(savedClientHello)
 
         retryToken = retryPacket.retryToken
@@ -1406,6 +1477,7 @@ class QuicConnection(
             activeConnectionIdLimit = config.activeConnectionIdLimit,
             initialSourceConnectionId = sourceConnectionId.bytes,
             maxDatagramFrameSize = config.maxDatagramFrameSize,
+            versionInformation = offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(initialVersion, it) },
         )
 
     /**
@@ -1417,7 +1489,20 @@ class QuicConnection(
      */
     private fun applyPeerTransportParameters() {
         val raw = tls.peerTransportParameters ?: return
-        val tp = TransportParameters.decode(raw)
+        val tp =
+            try {
+                TransportParameters.decode(raw)
+            } catch (e: com.vitorpamplona.quic.QuicCodecException) {
+                markClosedExternally(
+                    "TRANSPORT_PARAMETER_ERROR: ${e.message}",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
+                )
+                return
+            }
+        versionNegotiationError(tp.versionInformation)?.let { reason ->
+            markClosedExternally("VERSION_NEGOTIATION_ERROR: $reason", errorCode = QuicTransportError.VERSION_NEGOTIATION_ERROR)
+            return
+        }
         // Audit-4 #7: RFC 9000 §7.3 MUST checks. The peer's
         //   initial_source_connection_id MUST equal the SCID it put in its
         //     first Initial (which we adopted as `destinationConnectionId`).
@@ -1496,6 +1581,37 @@ class QuicConnection(
                     }
                 }
         }
+    }
+
+    /**
+     * RFC 9368 §4 downgrade checks on the server's Version Information.
+     * Returns why the connection must close, or null when it checks out.
+     */
+    private fun versionNegotiationError(vi: VersionInformation?): String? {
+        if (vi == null) {
+            // Servers MAY omit it, but not once we reacted to a Version
+            // Negotiation packet or the server switched our version.
+            return when {
+                vnConsumed -> "server sent no version_information after Version Negotiation"
+                compatibleVersionSwitched -> "server switched to ${QuicVersion.name(currentVersion)} without version_information"
+                else -> null
+            }
+        }
+        if (vi.chosenVersion != currentVersion) {
+            return "server chose ${QuicVersion.name(vi.chosenVersion)} but the connection runs ${QuicVersion.name(currentVersion)}"
+        }
+        if (offeredVersions.isNotEmpty() && !vnConsumed && vi.chosenVersion !in offeredVersions) {
+            return "server chose ${QuicVersion.name(vi.chosenVersion)}, which we did not offer"
+        }
+        if (vnConsumed) {
+            // We'd have picked the same version had the VN listed what the
+            // server really deploys; otherwise the VN was forged.
+            val wouldPick = versionPreference().firstOrNull { it in vi.availableVersions || it == vi.chosenVersion }
+            if (vi.availableVersions.isEmpty() || wouldPick != currentVersion) {
+                return "server's available versions ${vi.availableVersions.map { QuicVersion.name(it) }} contradict the Version Negotiation packet"
+            }
+        }
+        return null
     }
 
     /**
@@ -2186,13 +2302,14 @@ class QuicConnection(
         // RFC 9001 §6.1 — secret rotation label.
         val nextSecret =
             com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(current, "quic ku", ByteArray(0), current.size)
+                .expandLabel(current, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), current.size)
         // Reuse the existing builder; it derives key + iv + hp from a secret,
         // and the spec just discards the new HP key (we keep the old one).
         val nextProtection =
             com.vitorpamplona.quic.connection.packetProtectionFromSecret(
                 cipherSuite = cs,
                 secret = nextSecret,
+                version = currentVersion,
             )
         // Keep the OLD HP key — RFC 9001 §6.1 forbids rotating it.
         val live = application.receiveProtection ?: return null
@@ -2245,7 +2362,7 @@ class QuicConnection(
         if (curRx != null && cs != 0) {
             appReceiveSecret =
                 com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curRx, "quic ku", ByteArray(0), curRx.size)
+                    .expandLabel(curRx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curRx.size)
         }
         currentReceiveKeyPhase = !currentReceiveKeyPhase
 
@@ -2256,12 +2373,13 @@ class QuicConnection(
         if (curTx != null && cs != 0) {
             val nextSendSecret =
                 com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curTx, "quic ku", ByteArray(0), curTx.size)
+                    .expandLabel(curTx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curTx.size)
             appSendSecret = nextSendSecret
             val freshSend =
                 com.vitorpamplona.quic.connection.packetProtectionFromSecret(
                     cipherSuite = cs,
                     secret = nextSendSecret,
+                    version = currentVersion,
                 )
             val liveSend = application.sendProtection
             if (liveSend != null) {
@@ -2347,12 +2465,12 @@ class QuicConnection(
         // receive keys orphaned in [previousReceiveProtection].
         val nextRxSecret =
             com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curRx, "quic ku", ByteArray(0), curRx.size)
+                .expandLabel(curRx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curRx.size)
         val nextTxSecret =
             com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curTx, "quic ku", ByteArray(0), curTx.size)
-        val freshRx = packetProtectionFromSecret(cs, nextRxSecret)
-        val freshTx = packetProtectionFromSecret(cs, nextTxSecret)
+                .expandLabel(curTx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curTx.size)
+        val freshRx = packetProtectionFromSecret(cs, nextRxSecret, currentVersion)
+        val freshTx = packetProtectionFromSecret(cs, nextTxSecret, currentVersion)
 
         previousReceiveProtection = liveRx
         application.receiveProtection =

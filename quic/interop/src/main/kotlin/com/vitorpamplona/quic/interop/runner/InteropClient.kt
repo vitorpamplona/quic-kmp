@@ -260,6 +260,10 @@ fun main() {
             "transferloss", "transfercorruption", "longrtt", "goodput", "crosstraffic",
             "retry", "ipv6",
             "ecn", "amplificationlimit", "blackhole",
+            // v2 — first Initial in v1, `version_information` offers v2, and
+            // the server upgrades the connection (RFC 9368 compatible
+            // negotiation, RFC 9369). See [compatibleVersionsFor].
+            "v2",
             // NOTE: the runner does NOT have a `versionnegotiation` testcase
             // (its Available list excludes it). The :quic VN-handling code
             // (applyVersionNegotiation, FORCE_VERSION_NEGOTIATION constant)
@@ -381,6 +385,18 @@ fun main() {
     exitProcess(code)
 }
 
+/**
+ * Versions the first flight offers for compatible negotiation. Only the `v2`
+ * testcase lists QUIC v2: elsewhere the runner checks that every packet is v1,
+ * and servers that prefer v2 would upgrade any connection that offered it.
+ */
+internal fun compatibleVersionsFor(testcase: String?): List<Int> =
+    if (testcase?.trim() == "v2") {
+        listOf(com.vitorpamplona.quic.packet.QuicVersion.V2, com.vitorpamplona.quic.packet.QuicVersion.V1)
+    } else {
+        listOf(com.vitorpamplona.quic.packet.QuicVersion.V1)
+    }
+
 internal enum class Alpn(
     val wireBytes: ByteArray,
 ) {
@@ -462,6 +478,7 @@ private fun runTransferTest(
                             initialMaxStreamDataBidiLocal = 32L * 1024 * 1024,
                             initialMaxStreamDataBidiRemote = 32L * 1024 * 1024,
                             initialMaxStreamDataUni = 32L * 1024 * 1024,
+                            compatibleVersions = compatibleVersionsFor(System.getenv("TESTCASE")),
                         ),
                     tlsCertificateValidator = PermissiveCertificateValidator(),
                     alpnList = offeredAlpns.map { it.wireBytes },
@@ -882,6 +899,7 @@ private suspend fun runOneResumptionConnection(
                     initialMaxStreamDataBidiLocal = 32L * 1024 * 1024,
                     initialMaxStreamDataBidiRemote = 32L * 1024 * 1024,
                     initialMaxStreamDataUni = 32L * 1024 * 1024,
+                    compatibleVersions = compatibleVersionsFor(System.getenv("TESTCASE")),
                 ),
             tlsCertificateValidator = PermissiveCertificateValidator(),
             alpnList = offeredAlpns.map { it.wireBytes },
@@ -1112,6 +1130,7 @@ private fun runMulticonnectTest(
                                 initialMaxStreamDataBidiLocal = 32L * 1024 * 1024,
                                 initialMaxStreamDataBidiRemote = 32L * 1024 * 1024,
                                 initialMaxStreamDataUni = 32L * 1024 * 1024,
+                                compatibleVersions = compatibleVersionsFor(System.getenv("TESTCASE")),
                             ),
                         tlsCertificateValidator = PermissiveCertificateValidator(),
                         alpnList = offeredAlpns.map { it.wireBytes },
