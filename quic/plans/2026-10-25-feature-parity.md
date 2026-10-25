@@ -15,7 +15,7 @@ transport features, and it could only be tested from one side of the matrix.
 | Area | What | Where |
 |---|---|---|
 | QUIC v2 | RFC 9369 keys, labels, Retry and packet types; RFC 9368 compatible version negotiation, client and server | `packet/PacketTypes.kt`, `QuicConnection` |
-| Server | TLS 1.3 server (PSK, tickets, 0-RTT), server `QuicConnection`, `QuicServer` endpoint (VN, Retry, stateless reset, CID routing), NAT rebinding, preferred address, NEW_TOKEN, connection limit, interop server | `quic/plans/2026-10-25-server-role.md` |
+| Server | TLS 1.3 server (PSK, tickets, 0-RTT, HelloRetryRequest), server `QuicConnection`, `QuicServer` endpoint (VN, Retry, stateless reset, CID routing), NAT rebinding, preferred address, NEW_TOKEN, connection limit, interop server | `quic/plans/2026-10-25-server-role.md` |
 | Congestion control | NewReno and CUBIC (default), pacing, persistent congestion, ECN-CE | `recovery/CongestionController.kt` |
 | Path MTU | DPLPMTUD (RFC 8899) with black-hole fallback | `PmtuDiscovery.kt` |
 | ACKs | Delayed ACKs (RFC 9000 §13.2), ACK frequency extension as receiver | `recovery/AckTracker.kt` |
@@ -27,6 +27,18 @@ instead of consumption (a fast sender overflowed the app channel and killed the 
 `extraSecretsListener` never received traffic secrets (SSLKEYLOGFILE was empty), 1-RTT CRYPTO
 was never sent, and `original_destination_connection_id` was checked against the DCID from
 before Version Negotiation.
+
+Found by the server sweep, and affecting the client as well:
+
+- Lost STREAM data was never resent on a "closed" stream (our FIN sent, the peer's FIN received),
+  which is every server response once its last byte is out. A stream was also retired once its
+  FIN was acknowledged, even with an earlier range still lost. quic-go's HTTP/3 and handshakeloss
+  clients waited forever for the missing bytes.
+- A lost range was capped by flow-control credit like new data, so a stream that had used its
+  whole window could deadlock waiting for credit the peer withholds until the gap fills.
+- The PTO timer ran with nothing in flight, so an idle connection sent a PING every PTO. That
+  timer had also been flushing stream writes made without `driver.wakeup()`; writes now wake the
+  send loop themselves.
 
 ## Not done
 
