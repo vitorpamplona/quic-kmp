@@ -160,8 +160,9 @@ fun runInteropServer(testcase: String): Int {
 }
 
 /**
- * One handshake and request over loopback before we listen. A cold JVM takes
- * ~350 ms over the first handshake (class loading, JIT, the JCA's first use),
+ * One handshake and request over loopback before we listen, and Jackson for
+ * the qlog. A cold JVM takes ~350 ms over the first handshake (class loading,
+ * JIT, the JCA's first use) and the first qlog writer ~230 ms more,
  * and the rebind tests move the client's NAT mapping at 1 s: a client that
  * starts late gets rebound before our first reply, and the runner then sees
  * no PATH_CHALLENGE on the new path (there can't be one mid-handshake).
@@ -171,6 +172,8 @@ private suspend fun warmUp(
     scope: CoroutineScope,
 ) {
     val started = System.nanoTime()
+    // The runner always sets QLOGDIR, and Jackson's first use costs ~230 ms.
+    QlogWriter.warmUp()
     val result =
         runCatching {
             withTimeout(5_000) {

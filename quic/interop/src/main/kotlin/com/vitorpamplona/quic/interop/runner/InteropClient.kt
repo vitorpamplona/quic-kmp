@@ -158,6 +158,9 @@ fun main() {
         exitProcess(EXIT_UNSUPPORTED)
     }
 
+    // Jackson's first use would otherwise land in the middle of the handshake.
+    if (!System.getenv("QLOGDIR").isNullOrBlank()) QlogWriter.warmUp()
+
     val testcase = System.getenv("TESTCASE")?.trim().orEmpty()
     val requests = System.getenv("REQUESTS")?.trim().orEmpty()
     // The runner mounts $CLIENT_DOWNLOADS to /downloads as a Docker volume

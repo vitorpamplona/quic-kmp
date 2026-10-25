@@ -341,6 +341,23 @@ class QlogWriter(
 
         private val DEFAULT_MAPPER: ObjectMapper = jacksonObjectMapper()
 
+        /**
+         * Initialise Jackson ahead of time: the first writer otherwise spends
+         * ~230 ms in it, in the middle of the first handshake.
+         */
+        fun warmUp() {
+            val tmp = File.createTempFile("qlog-warmup", ".sqlog")
+            try {
+                QlogWriter(tmp, odcidHex = "00").use { w ->
+                    w.onTransportParametersSet("local", mapOf("initial_max_data" to "0"))
+                    w.onPacketSent(EncryptionLevel.INITIAL, 0L, 1200, listOf("crypto", "padding"))
+                    w.onPacketReceived(EncryptionLevel.APPLICATION, 0L, 1200, listOf("stream"))
+                }
+            } finally {
+                tmp.delete()
+            }
+        }
+
         private fun packetTypeFor(level: EncryptionLevel): String =
             when (level) {
                 EncryptionLevel.INITIAL -> "initial"
