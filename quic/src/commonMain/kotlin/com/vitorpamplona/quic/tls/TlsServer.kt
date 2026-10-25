@@ -42,8 +42,9 @@ import kotlin.time.Clock
  * when 0-RTT is accepted, and [TlsSecretsListener.onHandshakeComplete] once
  * the client's Finished verifies.
  *
- * Not supported: HelloRetryRequest (a ClientHello without an X25519 key share
- * fails with handshake_failure) and client certificates.
+ * A ClientHello that lists X25519 without sending a share for it gets a
+ * HelloRetryRequest; one that doesn't list it fails with handshake_failure.
+ * Not supported: client certificates.
  */
 class TlsServer(
     /** Our QUIC transport parameters, sent in EncryptedExtensions. */
@@ -131,6 +132,9 @@ class TlsServer(
     private var ticketNonce: Long = 0L
     private var sentTransportParameters: ByteArray = transportParameters
 
+    /** We sent a HelloRetryRequest; the next ClientHello is the client's second. */
+    private var helloRetried: Boolean = false
+
     override fun pollOutbound(level: TlsClient.Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
     override fun pushHandshakeBytes(
@@ -201,12 +205,18 @@ class TlsServer(
             cipherSuites.firstOrNull { it in ch.cipherSuites }
                 ?: throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "no common cipher suite")
         negotiatedCipherSuite = suite
-        val clientShare =
-            ch.x25519KeyShare
-                ?: throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "no X25519 key share (HelloRetryRequest not supported)")
+        val clientShare = ch.x25519KeyShare
+        if (clientShare == null) {
+            if (helloRetried) throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "second ClientHello still has no X25519 key share")
+            if (TlsConstants.GROUP_X25519 !in ch.supportedGroups) throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "client does not support X25519")
+            sendHelloRetryRequest(ch, msg, suite)
+            return
+        }
 
         // RFC 8446 §4.2.11: try the offered ticket before deciding on a full handshake.
-        val resumed = tryResume(ch, msg, suite, alpn)
+        // After a HelloRetryRequest the binder would cover the retry too; a full
+        // handshake is simpler and always allowed, and 0-RTT is off (§4.2.10).
+        val resumed = if (helloRetried) null else tryResume(ch, msg, suite, alpn)
         if (resumed != null) {
             pskAccepted = true
             keySchedule.deriveEarlyFromPsk(resumed.psk)
@@ -268,6 +278,38 @@ class TlsServer(
         keySchedule.deriveApplicationTraffic()
         secretsListener.onApplicationKeysReady(suite, keySchedule.clientApplicationSecret!!, keySchedule.serverApplicationSecret!!)
         state = State.WAITING_CLIENT_FINISHED
+    }
+
+    /**
+     * RFC 8446 §4.1.4: ask for an X25519 share. The transcript restarts as
+     * message_hash(ClientHello1) followed by the HelloRetryRequest; the
+     * client's second ClientHello comes on the same Initial CRYPTO stream.
+     */
+    private fun sendHelloRetryRequest(
+        ch: ParsedClientHello,
+        msg: ByteArray,
+        suite: Int,
+    ) {
+        helloRetried = true
+        // Both suites we offer hash with SHA-256.
+        val ch1Hash = TlsRunningSha256().also { it.update(msg) }.snapshot()
+        transcript.append(handshakeMessage(TlsConstants.HS_MESSAGE_HASH) { writeBytes(ch1Hash) })
+        val hrr =
+            handshakeMessage(TlsConstants.HS_SERVER_HELLO) {
+                writeUint16(TlsConstants.LEGACY_VERSION_TLS_1_2)
+                writeBytes(HELLO_RETRY_REQUEST_RANDOM)
+                writeTlsOpaque1(ch.sessionId)
+                writeUint16(suite)
+                writeByte(0)
+                withUint16Length {
+                    writeUint16(TlsConstants.EXT_SUPPORTED_VERSIONS)
+                    withUint16Length { writeUint16(TlsConstants.VERSION_TLS_1_3) }
+                    writeUint16(TlsConstants.EXT_KEY_SHARE)
+                    withUint16Length { writeUint16(TlsConstants.GROUP_X25519) }
+                }
+            }
+        transcript.append(hrr)
+        outboundQueues[TlsClient.Level.INITIAL]!!.addLast(hrr)
     }
 
     /** The ticket state when the client's offered PSK opens, binds and is still fresh; null for a full handshake. */
@@ -429,6 +471,7 @@ internal class ParsedClientHello(
     val cipherSuites: List<Int>,
     val supportedVersions: List<Int>,
     val x25519KeyShare: ByteArray?,
+    val supportedGroups: List<Int>,
     val signatureAlgorithms: List<Int>,
     val alpns: List<ByteArray>,
     val serverName: String?,
@@ -459,6 +502,7 @@ internal class ParsedClientHello(
                 val extEnd = r.position + extTotal
                 var versions = emptyList<Int>()
                 var share: ByteArray? = null
+                var groups = emptyList<Int>()
                 var sigAlgs = emptyList<Int>()
                 var alpns = emptyList<ByteArray>()
                 var sni: String? = null
@@ -486,6 +530,11 @@ internal class ParsedClientHello(
                                 val key = e.readTlsOpaque2()
                                 if (group == TlsConstants.GROUP_X25519 && key.size == 32 && share == null) share = key
                             }
+                        }
+
+                        TlsConstants.EXT_SUPPORTED_GROUPS -> {
+                            val n = e.readUint16()
+                            groups = (0 until n / 2).map { e.readUint16() }
                         }
 
                         TlsConstants.EXT_SIGNATURE_ALGORITHMS -> {
@@ -543,6 +592,7 @@ internal class ParsedClientHello(
                     suites,
                     versions,
                     share,
+                    groups,
                     sigAlgs,
                     alpns,
                     sni,

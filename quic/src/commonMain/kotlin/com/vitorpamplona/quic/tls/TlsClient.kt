@@ -908,7 +908,7 @@ internal class ByteArrayBuilder {
 }
 
 /** RFC 8446 §4.1.4 — HelloRetryRequest is a ServerHello whose Random equals SHA-256("HelloRetryRequest"). */
-private val HELLO_RETRY_REQUEST_RANDOM: ByteArray =
+internal val HELLO_RETRY_REQUEST_RANDOM: ByteArray =
     byteArrayOf(
         0xCF.toByte(),
         0x21.toByte(),

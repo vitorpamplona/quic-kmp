@@ -20,6 +20,9 @@
  */
 package com.vitorpamplona.quic.tls
 
+import com.vitorpamplona.crypto.curve25519.X25519
+import com.vitorpamplona.quic.QuicReader
+import com.vitorpamplona.quic.QuicWriter
 import com.vitorpamplona.quic.TlsAlertException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -214,5 +217,110 @@ class TlsServerTest {
         assertContentEquals(alpnH3, opened.alpn)
         val tampered = keys.seal(state).also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
         assertNull(keys.open(tampered))
+    }
+
+    /** A hand-built ClientHello offering P-256 and X25519 in supported_groups, with one key share. */
+    private fun clientHello(
+        random: ByteArray,
+        shareGroup: Int,
+        share: ByteArray,
+        groups: List<Int> = listOf(GROUP_SECP256R1, TlsConstants.GROUP_X25519),
+    ): ByteArray {
+        val w = QuicWriter()
+        w.writeByte(TlsConstants.HS_CLIENT_HELLO)
+        w.withUint24Length {
+            writeUint16(TlsConstants.LEGACY_VERSION_TLS_1_2)
+            writeBytes(random)
+            writeTlsOpaque1(ByteArray(0))
+            withUint16Length { writeUint16(TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256) }
+            writeTlsOpaque1(byteArrayOf(0))
+            withUint16Length {
+                writeUint16(TlsConstants.EXT_SUPPORTED_VERSIONS)
+                withUint16Length { writeTlsOpaque1(byteArrayOf(0x03, 0x04)) }
+                writeUint16(TlsConstants.EXT_SUPPORTED_GROUPS)
+                withUint16Length { withUint16Length { groups.forEach { writeUint16(it) } } }
+                writeUint16(TlsConstants.EXT_KEY_SHARE)
+                withUint16Length {
+                    withUint16Length {
+                        writeUint16(shareGroup)
+                        writeTlsOpaque2(share)
+                    }
+                }
+                writeUint16(TlsConstants.EXT_SIGNATURE_ALGORITHMS)
+                withUint16Length { withUint16Length { writeUint16(TlsConstants.SIG_ECDSA_SECP256R1_SHA256) } }
+                writeUint16(TlsConstants.EXT_ALPN)
+                withUint16Length { withUint16Length { writeTlsOpaque1(alpnH3) } }
+                writeUint16(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS)
+                writeTlsOpaque2(byteArrayOf(9, 8, 7))
+            }
+        }
+        return w.toByteArray()
+    }
+
+    private fun serverHello(msg: ByteArray): TlsServerHello {
+        assertEquals(TlsConstants.HS_SERVER_HELLO, msg[0].toInt() and 0xFF)
+        return TlsServerHello.decodeBody(QuicReader(msg, 4, msg.size))
+    }
+
+    @Test
+    fun a_client_hello_without_an_x25519_share_gets_a_hello_retry_request() {
+        val sl = Recorder()
+        val s = server(sl)
+        val random = ByteArray(32) { it.toByte() }
+        val ch1 = clientHello(random, GROUP_SECP256R1, ByteArray(65) { 4 })
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch1)
+
+        val hrr = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
+        assertNull(s.pollOutbound(TlsClient.Level.HANDSHAKE), "nothing else until the second ClientHello")
+        assertNull(sl.handshake)
+        assertEquals(TlsServer.State.WAITING_CLIENT_HELLO, s.state)
+        val retry = serverHello(hrr)
+        assertContentEquals(HELLO_RETRY_REQUEST_RANDOM, retry.random)
+        val keyShare = retry.extensions.single { it.type == TlsConstants.EXT_KEY_SHARE }
+        assertEquals(TlsConstants.GROUP_X25519, QuicReader(keyShare.data).readUint16(), "selected_group")
+
+        val keyPair = X25519.generateKeyPair()
+        val ch2 = clientHello(random, TlsConstants.GROUP_X25519, keyPair.publicKey)
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch2)
+        val shBytes = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
+        val sh = serverHello(shBytes)
+        assertFalse(sh.random.contentEquals(HELLO_RETRY_REQUEST_RANDOM))
+        assertEquals(TlsServer.State.WAITING_CLIENT_FINISHED, s.state)
+
+        // RFC 8446 §4.4.1: the transcript replaces ClientHello1 with message_hash.
+        val transcript = TlsTranscriptHash()
+        val ch1Hash = TlsRunningSha256().also { it.update(ch1) }.snapshot()
+        transcript.append(byteArrayOf(TlsConstants.HS_MESSAGE_HASH.toByte(), 0, 0, 32) + ch1Hash)
+        transcript.append(hrr)
+        transcript.append(ch2)
+        transcript.append(shBytes)
+        val expected = TlsKeySchedule(transcript)
+        expected.deriveEarly()
+        expected.deriveHandshake(X25519.dh(keyPair.privateKey, sh.serverKeyShareX25519))
+        expected.deriveHandshakeTraffic()
+        assertContentEquals(expected.clientHandshakeSecret, sl.handshake!!.first)
+        assertContentEquals(expected.serverHandshakeSecret, sl.handshake!!.second)
+    }
+
+    @Test
+    fun a_second_client_hello_still_without_an_x25519_share_is_refused() {
+        val s = server(Recorder())
+        val ch = clientHello(ByteArray(32), GROUP_SECP256R1, ByteArray(65) { 4 })
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch)
+        assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
+        val e = assertFailsWith<TlsAlertException> { s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch) }
+        assertEquals(TlsConstants.ALERT_ILLEGAL_PARAMETER, e.alertCode)
+    }
+
+    @Test
+    fun a_client_without_x25519_in_its_groups_is_refused() {
+        val s = server(Recorder())
+        val ch = clientHello(ByteArray(32), GROUP_SECP256R1, ByteArray(65) { 4 }, groups = listOf(GROUP_SECP256R1))
+        val e = assertFailsWith<TlsAlertException> { s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch) }
+        assertEquals(TlsConstants.ALERT_HANDSHAKE_FAILURE, e.alertCode)
+    }
+
+    private companion object {
+        const val GROUP_SECP256R1 = 23
     }
 }
