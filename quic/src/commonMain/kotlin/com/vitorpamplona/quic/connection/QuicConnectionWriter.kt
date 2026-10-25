@@ -688,6 +688,11 @@ private fun collectHandshakeLevelFrames(
     if (state.sendProtection == null) return null
     val frames = mutableListOf<Frame>()
     val tokens = mutableListOf<RecoveryToken>()
+    val probeHere =
+        conn.pendingPing &&
+            allowance == SendAllowance.FULL &&
+            conn.application.sendProtection == null &&
+            level == highestPreApplicationLevel(conn)
     state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt())?.let {
         frames += it
         tokens += RecoveryToken.Ack(level = level, largestAcked = it.largestAcknowledged)
@@ -729,11 +734,7 @@ private fun collectHandshakeLevelFrames(
     // previous PTO and got drained, or the original Initial was
     // never sent at all). This preserves the "send something
     // ack-eliciting on every PTO" contract without wasting a frame.
-    if (conn.pendingPing &&
-        allowance == SendAllowance.FULL &&
-        conn.application.sendProtection == null &&
-        level == highestPreApplicationLevel(conn)
-    ) {
+    if (probeHere) {
         if (frames.none { it is CryptoFrame }) {
             frames += PingFrame
         }
@@ -741,6 +742,19 @@ private fun collectHandshakeLevelFrames(
         // requirement at this level, or we just appended a PING.
         // Clear the flag so the next drain doesn't double-fire.
         conn.pendingPing = false
+    }
+    // During the handshake an ack-eliciting packet repeats the latest ACK if
+    // it has none: when the only ACK is lost and the peer's own probes are
+    // ACK-only, it never learns what arrived (picoquic, handshakeloss: its
+    // certificate and our ACK of its PING were lost, and it never resent the
+    // certificate).
+    if (frames.isNotEmpty() && frames[0] !is AckFrame) {
+        state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt(), force = true)?.let { ack ->
+            if (headerAndTag + encodeFrames(frames).size + encodeFrames(listOf(ack)).size <= room) {
+                frames.add(0, ack)
+                tokens += RecoveryToken.Ack(level = level, largestAcked = ack.largestAcknowledged)
+            }
+        }
     }
     if (frames.isEmpty()) return null
     return HandshakeLevelContents(frames = frames, tokens = tokens)

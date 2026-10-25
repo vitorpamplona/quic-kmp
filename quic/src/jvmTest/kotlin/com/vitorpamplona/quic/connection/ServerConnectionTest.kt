@@ -31,6 +31,7 @@ import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /** A client [QuicConnection] against a server-side one, datagrams shuttled in memory. */
@@ -39,7 +40,7 @@ class ServerConnectionTest {
 
     private var now = 1_000L
 
-    private fun client() =
+    private fun client(signer: JcaCertificateSigner = this.signer) =
         QuicConnection(
             serverName = "quic.test",
             config = QuicConnectionConfig(),
@@ -47,7 +48,10 @@ class ServerConnectionTest {
             nowMillis = { now },
         )
 
-    private fun serverFor(client: QuicConnection): QuicConnection =
+    private fun serverFor(
+        client: QuicConnection,
+        signer: JcaCertificateSigner = this.signer,
+    ): QuicConnection =
         QuicConnection(
             serverName = "",
             config = QuicConnectionConfig(),
@@ -254,5 +258,30 @@ class ServerConnectionTest {
         }
         assertTrue(sent > 0)
         assertTrue(sent <= 3 * received, "server sent $sent bytes for $received received")
+    }
+
+    @Test
+    fun `a handshake probe repeats an ACK that was lost`() {
+        // picoquic in handshakeloss: most of its flight and our only Handshake ACK
+        // were lost, and its own packets after that were ACK-only, so it learned
+        // what arrived only if our probes carried the ACK again.
+        val rsa = JcaCertificateSigner.fromPem(TestCertificates.RSA_CERT_PEM, TestCertificates.RSA_KEY_PEM)
+        val client = client(rsa)
+        client.start()
+        val server = serverFor(client, rsa)
+        while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+        // The RSA certificate makes the server's flight two datagrams; only the first arrives.
+        feedDatagram(client, assertNotNull(drainOutbound(server, now)), now)
+        assertNotNull(drainOutbound(server, now), "the flight spans more than one datagram")
+        while (true) drainOutbound(server, now) ?: break
+        assertTrue(client.application.sendProtection == null, "the client is still waiting for the rest")
+        // The client's ACKs for what arrived are lost.
+        while (true) drainOutbound(client, now) ?: break
+        assertNull(server.handshake.largestAckedPn)
+
+        now += 1_000
+        client.pendingPing = true
+        while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+        assertNotNull(server.handshake.largestAckedPn, "the client's probe acknowledged the server's Handshake packet")
     }
 }

@@ -226,9 +226,11 @@ class AckTracker {
     fun buildAckFrame(
         nowMillis: Long,
         ackDelayExponent: Int = 3,
+        /** Repeat the latest ACK even with nothing new to acknowledge. */
+        force: Boolean = false,
     ): AckFrame? {
         if (ranges.isEmpty()) return null
-        if (!ackElicitingPending) return null
+        if (!ackElicitingPending && !force) return null
         val largest = ranges[0].endInclusive
         val firstRangeLength = largest - ranges[0].start
         val rest = mutableListOf<AckRange>()
