@@ -78,8 +78,13 @@ class ServerConnectionTest {
                     clientSourceConnectionId = client.sourceConnectionId,
                     localConnectionId = ConnectionId.random(8),
                     statelessResetTokenFor = { ByteArray(16) { i -> (it.bytes[0] + i).toByte() } },
+                    peerAddress = clientAddress,
                 ),
         )
+
+    private val clientAddress =
+        com.vitorpamplona.quic.transport
+            .UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 5000)
 
     private class Counts {
         var toServer = 0L
@@ -200,6 +205,30 @@ class ServerConnectionTest {
         }
         assertEquals(listOf(false, true, false, true), seen)
     }
+
+    @Test
+    fun `a replayed packet from another address does not move the server`() =
+        runBlocking {
+            val client = client()
+            client.start()
+            val server = serverFor(client)
+            pump(client, server)
+            val stream = client.openBidiStream()
+            stream.send.enqueue("x".encodeToByteArray())
+            val datagram = assertNotNull(drainOutbound(client, now))
+            server.datagramPath = ServerPath(0, clientAddress)
+            feedDatagram(server, datagram, now)
+            // An attacker replays it from elsewhere: not a higher packet number, so no move.
+            server.datagramPath =
+                ServerPath(
+                    0,
+                    com.vitorpamplona.quic.transport
+                        .UdpPeerAddress(byteArrayOf(10, 6, 6, 6), 666),
+                )
+            feedDatagram(server, datagram, now)
+            assertEquals(null, server.peerMigration)
+            assertEquals(clientAddress, server.sendAddress)
+        }
 
     @Test
     fun `an unvalidated server sends at most three times what it received`() {

@@ -58,7 +58,7 @@ internal class AddressTokens(
         w.writeByte(retrySourceConnectionId.length)
         w.writeBytes(retrySourceConnectionId.bytes)
         val nonce = RandomInstance.bytes(12)
-        return nonce + Aes128Gcm.seal(key, nonce, aad(peer), w.toByteArray())
+        return byteArrayOf(KIND_RETRY.toByte()) + nonce + Aes128Gcm.seal(key, nonce, aad(peer), w.toByteArray())
     }
 
     /** The Retry token's contents when it opens, came from [peer], and is fresh; else null. */
@@ -67,8 +67,8 @@ internal class AddressTokens(
         peer: UdpPeerAddress,
         nowMillis: Long,
     ): Retry? {
-        if (token.size < 12 + 16 + 11) return null
-        val plain = Aes128Gcm.open(key, token.copyOfRange(0, 12), aad(peer), token.copyOfRange(12, token.size)) ?: return null
+        if (!isRetryToken(token) || token.size < 1 + 12 + 16 + 11) return null
+        val plain = Aes128Gcm.open(key, token.copyOfRange(1, 13), aad(peer), token.copyOfRange(13, token.size)) ?: return null
         return try {
             val r = QuicReader(plain)
             if (r.readByte() != KIND_RETRY) return null
@@ -95,7 +95,7 @@ internal class AddressTokens(
         w.writeUint32((nowMillis ushr 32).toInt())
         w.writeUint32(nowMillis.toInt())
         val nonce = RandomInstance.bytes(12)
-        return nonce + Aes128Gcm.seal(key, nonce, peer.ip, w.toByteArray())
+        return byteArrayOf(KIND_NEW_TOKEN.toByte()) + nonce + Aes128Gcm.seal(key, nonce, peer.ip, w.toByteArray())
     }
 
     /** True when [token] is one of our NEW_TOKEN tokens for [peer]'s IP, and still fresh. */
@@ -104,8 +104,8 @@ internal class AddressTokens(
         peer: UdpPeerAddress,
         nowMillis: Long,
     ): Boolean {
-        if (token.size < 12 + 16 + 9) return false
-        val plain = Aes128Gcm.open(key, token.copyOfRange(0, 12), peer.ip, token.copyOfRange(12, token.size)) ?: return false
+        if (token.isEmpty() || token[0] != KIND_NEW_TOKEN.toByte() || token.size < 1 + 12 + 16 + 9) return false
+        val plain = Aes128Gcm.open(key, token.copyOfRange(1, 13), peer.ip, token.copyOfRange(13, token.size)) ?: return false
         return try {
             val r = QuicReader(plain)
             if (r.readByte() != KIND_NEW_TOKEN) return false
@@ -115,6 +115,14 @@ internal class AddressTokens(
             false
         }
     }
+
+    /**
+     * True when [token] says it's one of our Retry tokens. Its first byte is
+     * the kind in the clear, so a Retry token that no longer opens can be
+     * told from a NEW_TOKEN one (RFC 9000 §8.1.2: the client won't take a
+     * second Retry, so a bad Retry token ends the attempt instead).
+     */
+    fun isRetryToken(token: ByteArray): Boolean = token.isNotEmpty() && token[0] == KIND_RETRY.toByte()
 
     private fun aad(peer: UdpPeerAddress): ByteArray = peer.ip + byteArrayOf((peer.port ushr 8).toByte(), peer.port.toByte())
 

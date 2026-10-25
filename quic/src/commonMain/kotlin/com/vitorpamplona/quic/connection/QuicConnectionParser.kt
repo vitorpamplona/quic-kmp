@@ -399,7 +399,7 @@ private fun feedLongHeaderPacket(
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
     // resets the idle timer.
-    conn.lastActivityMs = nowMillis
+    conn.noteReceived(nowMillis)
 
     // RFC 9000 §8.1: a Handshake packet proves the client got our Initial,
     // which validates its address; and RFC 9001 §4.9.1: a server discards
@@ -663,9 +663,12 @@ private fun feedShortHeaderPacket(
     if (rotateOnSuccess != null && parsed.packet.packetNumber > state.pnSpace.largestReceived) {
         conn.commitKeyUpdate(rotateOnSuccess)
     }
+    // Whether this packet raises the highest packet number seen — judged
+    // before recording it, so a replayed duplicate of the latest doesn't count.
+    val raisesLargest = parsed.packet.packetNumber > state.pnSpace.largestReceived
     // RFC 9000 §17.4: the spin bit isn't header-protected; it follows the
     // packet that raises the highest packet number.
-    if (parsed.packet.packetNumber > state.pnSpace.largestReceived) {
+    if (raisesLargest) {
         conn.onSpinBitReceived((datagram[offset].toInt() and 0x20) != 0)
     }
     // RFC 9001 §6.4: clear the in-flight-rotation gate once an inbound
@@ -681,7 +684,7 @@ private fun feedShortHeaderPacket(
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
     // resets the idle timer.
-    conn.lastActivityMs = nowMillis
+    conn.noteReceived(nowMillis)
     // Round-5 #P3: single decode of the application-level payload feeds
     // both qlog and dispatch.
     val decodedFrames = decodeFramesOrClose(conn, parsed.packet.payload) ?: return
@@ -694,7 +697,7 @@ private fun feedShortHeaderPacket(
         )
     }
     dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
-    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, parsed.packet.packetNumber == state.pnSpace.largestReceived, nowMillis, datagram.size)
+    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, raisesLargest, nowMillis, datagram.size)
 }
 
 /**
@@ -950,6 +953,18 @@ private fun dispatchFrames(
                     conn.streamByIdLocked(frame.streamId) == null
                 ) {
                     continue
+                }
+                // RFC 9000 §4.6: a peer opening past the stream limit we
+                // advertised is a STREAM_LIMIT_ERROR.
+                if (!conn.isLocalStream(frame.streamId) && conn.streamByIdLocked(frame.streamId) == null) {
+                    val limit = if (StreamId.isBidirectional(frame.streamId)) conn.advertisedMaxStreamsBidi else conn.advertisedMaxStreamsUni
+                    if ((frame.streamId ushr 2) >= limit) {
+                        conn.markClosedExternally(
+                            "STREAM_LIMIT_ERROR: peer opened stream ${frame.streamId} past our limit of $limit",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_LIMIT_ERROR,
+                        )
+                        return
+                    }
                 }
                 val stream = conn.getOrCreatePeerStreamLocked(frame.streamId)
                 // RFC 9000 §3.2: once the peer has sent RESET_STREAM the
@@ -1375,6 +1390,14 @@ private fun dispatchFrames(
 
             is com.vitorpamplona.quic.frame.ImmediateAckFrame -> {
                 ackEliciting = true
+                // Only a peer that saw our min_ack_delay may send it.
+                if (!conn.config.ackFrequency) {
+                    conn.markClosedExternally(
+                        "PROTOCOL_VIOLATION: IMMEDIATE_ACK without min_ack_delay",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+                    )
+                    return
+                }
                 state.ackTracker.requestImmediateAck()
             }
 

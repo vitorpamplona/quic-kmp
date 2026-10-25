@@ -90,6 +90,8 @@ class QuicServerUdpTest {
             assertContentEquals(body, got)
             assertNotNull(conn.peerTransportParameters)
             driver.close()
+            // Teardown is asynchronous; let it close the socket before the scope goes.
+            driver.closeTeardownJob?.join()
             server.close()
         }
 }

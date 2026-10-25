@@ -155,6 +155,18 @@ class QuicServer(
             }
             return
         }
+        // RFC 8999 / RFC 9000 §6: a version we don't speak, in a datagram a
+        // client Initial could be, gets Version Negotiation; its connection
+        // IDs may be up to 255 bytes, which no version we speak allows.
+        if (bytes.size >= 7) {
+            val version =
+                ((bytes[1].toInt() and 0xFF) shl 24) or ((bytes[2].toInt() and 0xFF) shl 16) or
+                    ((bytes[3].toInt() and 0xFF) shl 8) or (bytes[4].toInt() and 0xFF)
+            if (version != QuicVersion.VERSION_NEGOTIATION && version !in config.supportedVersions) {
+                if (local == 0 && bytes.size >= MIN_INITIAL_DATAGRAM) sendVersionNegotiation(bytes, d.from)
+                return
+            }
+        }
         val header = parseLongHeader(bytes) ?: return
         synchronized(lock) { routes[header.dcid] }?.let {
             it.deliver(d, local)
@@ -165,11 +177,6 @@ class QuicServer(
         // packets of one already gone) is dropped.
         // Connections start at the address clients were given, not the preferred one.
         if (header.version == QuicVersion.VERSION_NEGOTIATION || local != 0) return
-        if (header.version !in config.supportedVersions) {
-            // RFC 9000 §6.1 / §14.1: only for datagrams a client Initial could be.
-            if (bytes.size >= MIN_INITIAL_DATAGRAM) sendVersionNegotiation(header, d.from)
-            return
-        }
         if (LongHeaderType.fromWireBits((first ushr 4) and 0x03, header.version) != LongHeaderType.INITIAL) return
         // RFC 9000 §14.1: a server discards an Initial in a datagram under
         // 1200 bytes; §7.2: the client's first DCID has at least 8 bytes.
@@ -180,12 +187,17 @@ class QuicServer(
         if (header.token.isNotEmpty()) {
             retry = tokens.openRetry(header.token, d.from, now)
             if (retry != null && retry.retrySourceConnectionId != header.dcid) retry = null
-            // A token we can't open (stale, another address, someone else's)
-            // gets the same treatment as none.
+            if (retry == null && tokens.isRetryToken(header.token)) {
+                // RFC 9000 §8.1.2: the client won't take a second Retry.
+                refuse(header, d, com.vitorpamplona.quic.frame.QuicTransportError.INVALID_TOKEN, "invalid Retry token")
+                return
+            }
+            // Any other token we can't open (stale, another address, someone
+            // else's) gets the same treatment as none.
             if (retry == null) returning = tokens.openNewToken(header.token, d.from, now)
         }
         if (synchronized(lock) { liveConnections } >= config.maxConnections) {
-            refuse(header, d)
+            refuse(header, d, com.vitorpamplona.quic.frame.QuicTransportError.CONNECTION_REFUSED, "server at its connection limit")
             return
         }
         if (retry == null && !returning && config.requireRetry) {
@@ -196,17 +208,19 @@ class QuicServer(
     }
 
     /**
-     * RFC 9000 §10.2: an Initial CONNECTION_CLOSE with CONNECTION_REFUSED, from
-     * a throwaway connection that only holds the Initial keys.
+     * RFC 9000 §10.2: an Initial CONNECTION_CLOSE with [errorCode], from a
+     * throwaway connection that only holds the Initial keys.
      */
     private suspend fun refuse(
         header: LongHeader,
         d: ReceivedDatagram,
+        errorCode: Long,
+        reason: String,
     ) {
         val conn = newConnection(header, d, ServerPeerSocket(transports, d.from), retry = null, returning = false, register = false)
-        conn.markClosedExternally("server at its connection limit", com.vitorpamplona.quic.frame.QuicTransportError.CONNECTION_REFUSED)
+        conn.markClosedExternally(reason, errorCode)
         conn.takeFinalCloseDatagram()?.let { transport.send(it, d.from) }
-        QuicLog.d(TAG) { "refused ${d.from}: ${config.maxConnections} connections" }
+        QuicLog.d(TAG) { "refused ${d.from}: $reason" }
     }
 
     private fun startConnection(
@@ -298,21 +312,29 @@ class QuicServer(
                 serverSetup = setup,
             )
         connRef = conn
+        conn.sendOnServerPath = { path, datagram -> transports[path.local].send(datagram, path.peer) }
         return conn
     }
 
     /** RFC 9000 §17.2.1. */
     private suspend fun sendVersionNegotiation(
-        header: LongHeader,
+        packet: ByteArray,
         to: UdpPeerAddress,
     ) {
+        // The client's connection IDs, echoed swapped (RFC 8999 §6).
+        val dcidLen = packet[5].toInt() and 0xFF
+        if (7 + dcidLen > packet.size) return
+        val dcid = packet.copyOfRange(6, 6 + dcidLen)
+        val scidLen = packet[6 + dcidLen].toInt() and 0xFF
+        if (7 + dcidLen + scidLen > packet.size) return
+        val scid = packet.copyOfRange(7 + dcidLen, 7 + dcidLen + scidLen)
         val w = QuicWriter()
         w.writeByte(0x80 or 0x40 or (RandomInstance.bytes(1)[0].toInt() and 0x3F))
         w.writeUint32(0)
-        w.writeByte(header.scid.length)
-        w.writeBytes(header.scid.bytes)
-        w.writeByte(header.dcid.length)
-        w.writeBytes(header.dcid.bytes)
+        w.writeByte(scid.size)
+        w.writeBytes(scid)
+        w.writeByte(dcid.size)
+        w.writeBytes(dcid)
         for (v in config.supportedVersions) w.writeUint32(v)
         // A reserved version (0x?a?a?a?a), so clients don't come to rely on the list's shape.
         w.writeUint32(((RandomInstance.bytes(4).fold(0) { a, b -> (a shl 8) or (b.toInt() and 0xFF) }) and 0xF0F0F0F0.toInt()) or 0x0A0A0A0A)

@@ -261,12 +261,22 @@ class QuicStream(
                 when (direction) {
                     Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE -> true
 
+                    // Done once the application consumed it all (or the peer
+                    // reset it): until then its bytes still hold receive credit.
                     Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL,
                     Direction.BIDIRECTIONAL,
-                    -> receive.finReceived && receive.isFullyRead()
+                    -> peerResetReceived || receive.finReceived && receive.isFullyRead() && consumedBytes >= receive.contiguousEnd()
                 }
             return recvSettled
         }
+
+    /**
+     * The receive bytes this stream gives back as credit: what the
+     * application consumed, or the whole final size once the peer reset it
+     * (RFC 9000 §4.5 — those bytes will never be read).
+     */
+    internal val creditedReceiveBytes: Long
+        get() = if (peerResetReceived) maxOf(receiveHighestOffset, consumedBytes) else consumedBytes
 
     /**
      * Pushes [data] toward the consumer. Returns false if the bounded channel

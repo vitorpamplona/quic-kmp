@@ -267,6 +267,13 @@ class QuicConnection internal constructor(
 
     internal var peerMigration: PeerMigration? = null
 
+    /** Server: PATH_RESPONSEs owed on paths other than [sendPath], with the path to send each on. */
+    internal val serverProbeResponses = ArrayDeque<Pair<ServerPath, ByteArray>>()
+
+    /** Server: sends a datagram on a given path; the endpoint sets it. */
+    @kotlin.concurrent.Volatile
+    internal var sendOnServerPath: (suspend (ServerPath, ByteArray) -> Unit)? = null
+
     /**
      * Server: after a short-header packet on [datagramPath] was processed.
      * RFC 9000 §9.3: a non-probing packet with the highest packet number on a
@@ -333,6 +340,7 @@ class QuicConnection internal constructor(
 
     /** Called once when the connection terminates; a server endpoint drops its routes. */
     internal var onTerminated: (() -> Unit)? = null
+    private val terminationLock = com.vitorpamplona.quic.SynchronizedObject()
 
     /** True when [id] is in our stream id space (RFC 9000 §2.1: bit 0 names the initiator). */
     internal fun isLocalStream(id: Long): Boolean = StreamId.isServerInitiated(id) == isServer
@@ -636,6 +644,26 @@ class QuicConnection internal constructor(
     @Volatile
     internal var lastActivityMs: Long = nowMillis()
 
+    /** An ack-eliciting packet went out since we last processed one (RFC 9000 §10.1). */
+    private var ackElicitingSentSinceReceive: Boolean = false
+
+    /** A packet from the peer was processed: the idle timer restarts. */
+    internal fun noteReceived(nowMillis: Long) {
+        lastActivityMs = nowMillis
+        ackElicitingSentSinceReceive = false
+    }
+
+    /**
+     * RFC 9000 §10.1: sending restarts the idle timer only for the first
+     * ack-eliciting packet since the last receive, so PTO probes into a peer
+     * that went silent can't keep the connection alive forever.
+     */
+    internal fun noteAckElicitingSent(nowMillis: Long) {
+        if (ackElicitingSentSinceReceive) return
+        ackElicitingSentSinceReceive = true
+        lastActivityMs = nowMillis
+    }
+
     /**
      * RFC 9000 §10.2.2 draining-period deadline. Set by
      * [enterDraining] to `now + 3 * PTO`; the driver's send loop
@@ -881,6 +909,12 @@ class QuicConnection internal constructor(
 
     /** Bidi counterpart of [peerInitiatedUniCount]. */
     internal var peerInitiatedBidiCount: Long = 0L
+
+    /** Peer-opened uni streams retired so far; MAX_STREAMS_UNI stays within reach of it. */
+    internal var retiredPeerUniCount: Long = 0L
+
+    /** Bidi counterpart of [retiredPeerUniCount]. */
+    internal var retiredPeerBidiCount: Long = 0L
 
     /**
      * The peer-initiated uni stream cap we've currently advertised to
@@ -1701,17 +1735,22 @@ class QuicConnection internal constructor(
         }
 
     /** The TLS side this connection plays: a [TlsClient], or a [TlsServer] on a server. */
-    internal val handshakeTls: com.vitorpamplona.quic.tls.TlsHandshake =
+    internal var handshakeTls: com.vitorpamplona.quic.tls.TlsHandshake =
         serverSetup?.tlsServerFactory?.invoke(buildLocalTransportParameters().encode(), tlsListener)
-            ?: TlsClient(
-                serverName = serverName,
-                transportParameters = buildLocalTransportParameters().encode(),
-                secretsListener = tlsListener,
-                certificateValidator = tlsCertificateValidator,
-                offeredAlpns = alpnList,
-                cipherSuites = cipherSuites,
-                resumption = effectiveResumption,
-            )
+            ?: newTlsClient()
+        private set
+
+    /** A TLS client carrying our transport parameters as they stand now. */
+    private fun newTlsClient(): TlsClient =
+        TlsClient(
+            serverName = serverName,
+            transportParameters = buildLocalTransportParameters().encode(),
+            secretsListener = tlsListener,
+            certificateValidator = tlsCertificateValidator,
+            offeredAlpns = alpnList,
+            cipherSuites = cipherSuites,
+            resumption = effectiveResumption,
+        )
 
     /** The TLS client of a client connection. A server connection has [tlsServer] instead. */
     val tls: TlsClient
@@ -1844,13 +1883,27 @@ class QuicConnection internal constructor(
         serverInitialScid = null
         val (newSend, newReceive) = initialProtections(newDcid, chosen)
         initial.resetForVersionNegotiation(sendProtection = newSend, receiveProtection = newReceive)
-        // Re-enqueue the ClientHello so the next drainOutbound emits a v1
-        // Initial datagram with the same TLS handshake the original carried.
-        originalClientHello?.let { initial.cryptoSend.enqueue(it) }
 
         // Switch the writer's stamp so the next Initial / Handshake
         // long-header carries the right version.
         currentVersion = chosen
+
+        // A new attempt needs a new ClientHello: its version_information must
+        // name the version we now use (RFC 9368 §4). Early data sent under
+        // the old one never reached a server that processed it; send it again
+        // under the new attempt's 0-RTT keys, or 1-RTT.
+        if (zeroRttSendProtection != null) {
+            zeroRttSendProtection = null
+            requeueAllInflightStreamData()
+            application.clearSentPackets()
+        }
+        val tlsClient = newTlsClient()
+        handshakeTls = tlsClient
+        tlsClient.start()
+        tlsClient.pollOutbound(TlsClient.Level.INITIAL)?.let {
+            originalClientHello = it
+            initial.cryptoSend.enqueue(it)
+        }
     }
 
     /**
@@ -2029,7 +2082,9 @@ class QuicConnection internal constructor(
                 if (serverSetup != null) {
                     VersionInformation(currentVersion, serverSetup.supportedVersions)
                 } else {
-                    offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(initialVersion, it) }
+                    // The version this attempt's Initials use: after Version
+                    // Negotiation, the one we restarted in (RFC 9368 §4).
+                    offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(currentVersion, it) }
                 },
             originalDestinationConnectionId = serverSetup?.originalDestinationConnectionId?.bytes,
             retrySourceConnectionId = serverSetup?.retrySourceConnectionId?.bytes,
@@ -2097,6 +2152,16 @@ class QuicConnection internal constructor(
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: client sent $serverOnly",
                     errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
+                )
+                return
+            }
+            // RFC 9368 §4: the client's Chosen Version must be the version of
+            // its Initial, or someone rewrote the packet to downgrade it.
+            val chosen = tp.versionInformation?.chosenVersion
+            if (chosen != null && chosen != initialVersion) {
+                markClosedExternally(
+                    "VERSION_NEGOTIATION_ERROR: client chose ${QuicVersion.name(chosen)} but its Initial was ${QuicVersion.name(initialVersion)}",
+                    errorCode = QuicTransportError.VERSION_NEGOTIATION_ERROR,
                 )
                 return
             }
@@ -2714,10 +2779,10 @@ class QuicConnection internal constructor(
      * delivered are surfaced to the collector before the Flow completes.
      */
     private fun closeAllSignals() {
-        onTerminated?.let {
-            onTerminated = null
-            it()
-        }
+        // close() and markClosedExternally can race here from two threads;
+        // the endpoint's bookkeeping must run once.
+        val terminated = com.vitorpamplona.quic.synchronized(terminationLock) { onTerminated.also { onTerminated = null } }
+        terminated?.invoke()
         closedSignal.close()
         peerStreamSignal.close()
         incomingDatagramSignal.close()
@@ -3193,7 +3258,10 @@ class QuicConnection internal constructor(
             // Fold the per-stream receive high-water into the cumulative
             // counter BEFORE we drop it — once we lose the reference the
             // writer can no longer reconstruct the contribution.
-            retiredStreamsRecvBytes += stream.receive.contiguousEnd()
+            retiredStreamsRecvBytes += stream.creditedReceiveBytes
+            if (!isLocalStream(stream.streamId)) {
+                if (StreamId.isUnidirectional(stream.streamId)) retiredPeerUniCount++ else retiredPeerBidiCount++
+            }
             // Defence-in-depth: ensure the application-side incoming
             // channel is closed even if the parser somehow missed the
             // closeIncoming call (e.g. a stream that finished via
@@ -3905,6 +3973,15 @@ class QuicConnection internal constructor(
     ) {
         // RFC 9000 §8.2.2: answer on the path the challenge arrived on. A
         // challenge on the path we just left has no socket to answer on.
+        // A server tells paths apart by [datagramPath]: one other than the
+        // path we send on gets its answer there, in a datagram of its own.
+        if (isServer) {
+            val arrived = datagramPath
+            if (arrived != null && arrived != sendPath) {
+                if (serverProbeResponses.size < MAX_PENDING_PATH_RESPONSES) serverProbeResponses.addLast(arrived to challengeData)
+                return
+            }
+        }
         when (path) {
             NetworkPath.ACTIVE -> {}
 

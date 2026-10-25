@@ -124,7 +124,9 @@ fun drainOutbound(
     // so hold off unless a whole one fits.
     if (conn.amplificationAllowance() < conn.pmtud.currentSize) return null
     // The same for a path a client moved to, until it answers our challenge
-    // (§9.3); small datagrams still go, so the challenge itself can.
+    // (§9.3); small datagrams still go, so the challenge itself can. A
+    // challenge that went unanswered moves us back first, budget or not.
+    if (conn.isServer) conn.checkPeerMigrationTimeoutLocked(nowMillis)
     if (conn.migrationSendAllowance() < MIN_MIGRATION_DATAGRAM) return null
 
     // Bug-A fix: drive the §8.2.4 3*PTO validation budget on every
@@ -137,7 +139,6 @@ fun drainOutbound(
     // budget-elapsed condition reliably. Cheap (one type-cast +
     // time comparison) when the validator is in [PathValidationState.Idle].
     conn.checkPathValidationTimeoutLocked(nowMillis)
-    if (conn.isServer) conn.checkPeerMigrationTimeoutLocked(nowMillis)
 
     // RFC 9000 §5.1.1 + §19.15: once the handshake is confirmed,
     // issue spare source CIDs to the peer so it has DCIDs available
@@ -334,7 +335,7 @@ private fun buildPmtuProbe(
     state.recordSent(SentPacket(pn, nowMillis, ackEliciting = true, sizeBytes = built.size, tokens = emptyList(), mtuProbeSize = size))
     conn.pmtud.onProbeSent(size)
     conn.aeadEncryptCount += 1L
-    conn.lastActivityMs = nowMillis
+    conn.noteAckElicitingSent(nowMillis)
     emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, listOf(PingFrame))
     return built
 }
@@ -387,6 +388,42 @@ fun drainProbe(
     conn.aeadEncryptCount += 1L
     emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, frames)
     return built
+}
+
+/**
+ * Server: the next PATH_RESPONSE owed on a path other than the one we send on
+ * (RFC 9000 §8.2.2), as a 1-RTT packet expanded to 1200 bytes (§8.2.1) and
+ * the path to send it on; null when none is owed.
+ */
+internal fun drainServerProbeResponse(
+    conn: QuicConnection,
+    nowMillis: Long,
+): Pair<ServerPath, ByteArray>? {
+    if (conn.status != QuicConnection.Status.CONNECTED) return null
+    val (path, data) = conn.serverProbeResponses.removeFirstOrNull() ?: return null
+    val proto = conn.application.sendProtection ?: return null
+    val pn = conn.application.pnSpace.allocateOutbound()
+    val frames = listOf<Frame>(PathResponseFrame(data))
+    val body = encodeFrames(frames)
+    val pnLen = PacketNumberSpaceState.encodeLength(pn, -1L)
+    val unpadded = 1 + conn.destinationConnectionId.length + pnLen + body.size + proto.aead.tagLength
+    val payload = if (unpadded < PROBE_DATAGRAM_SIZE) body.copyOf(body.size + PROBE_DATAGRAM_SIZE - unpadded) else body
+    val built =
+        ShortHeaderPacket.build(
+            ShortHeaderPlaintextPacket(conn.destinationConnectionId, pn, payload, keyPhase = conn.currentSendKeyPhase, spin = conn.spinValue),
+            proto.aead,
+            proto.key,
+            proto.iv,
+            proto.hp,
+            proto.hpKey,
+            largestAckedInSpace = -1L,
+            nonceScratch = proto.nonceScratch,
+            hpScratch = proto.hpScratch,
+            hpMask = proto.hpMask,
+        )
+    conn.aeadEncryptCount += 1L
+    emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, frames)
+    return path to built
 }
 
 /** How long after confirmation a due PMTU probe goes ahead of queued data. */
@@ -782,7 +819,7 @@ private fun buildLongHeaderFromFrames(
     // RFC 9000 §10.1.1: an ack-eliciting outbound packet resets the
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)
-    if (ackEliciting) conn.lastActivityMs = nowMillis
+    if (ackEliciting) conn.noteAckElicitingSent(nowMillis)
     emitQlogSent(conn, level, pn, packet.size, frames)
     return packet
 }
@@ -1172,7 +1209,7 @@ private fun buildApplicationPacket(
     // RFC 9000 §10.1.1: an ack-eliciting outbound packet resets the
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)
-    if (ackEliciting) conn.lastActivityMs = nowMillis
+    if (ackEliciting) conn.noteAckElicitingSent(nowMillis)
     // RFC 9001 §6.6 / §B.1 confidentiality limit. Track per-key
     // encryption count for the active 1-RTT send key. At half the
     // AEAD's confidentiality limit we soft-trigger a key update; at
@@ -1473,11 +1510,16 @@ private fun appendFlowControlUpdates(
     // new MAX_STREAM_DATA frame.
     for (stream in conn.streamsListLocked()) {
         val id = stream.streamId
+        // Take the dirty mark before reading the count: the application sets
+        // it without our lock, and a consumption landing after the read must
+        // leave it set for the next drain.
+        val dirty = stream.receiveDirtyForFlowControl
+        if (dirty) stream.receiveDirtyForFlowControl = false
         // Credit follows what the application consumed, not what arrived:
         // a slow reader holds the peer to one window ahead of it.
-        val rcv = stream.consumedBytes
+        val rcv = stream.creditedReceiveBytes
         if (rcv == 0L) continue
-        if (!stream.receiveDirtyForFlowControl) {
+        if (!dirty) {
             // Stream has data but nothing changed since last drain — skip the
             // per-direction window lookup and the comparison.
             totalRecvAdvanced += rcv
@@ -1504,10 +1546,6 @@ private fun appendFlowControlUpdates(
                 tokens += RecoveryToken.MaxStreamData(streamId = id, maxData = newLimit)
             }
         }
-        // Clear the dirty flag once we've considered this stream — even if we
-        // didn't emit a new MAX_STREAM_DATA, the threshold-check work doesn't
-        // need to repeat until more bytes arrive.
-        stream.receiveDirtyForFlowControl = false
         totalRecvAdvanced += rcv
     }
     // Connection-level: only re-grant when the new total would exceed our
@@ -1532,7 +1570,10 @@ private fun appendFlowControlUpdates(
     // ~99". See
     // `nestsClient/plans/2026-05-01-quic-stream-cliff-investigation.md`.
     if (conn.peerInitiatedUniCount + cfg.initialMaxStreamsUni / 2 >= conn.advertisedMaxStreamsUni) {
-        val newCap = conn.peerInitiatedUniCount + cfg.initialMaxStreamsUni
+        // Ahead of the peer as it opens streams, but no more than two windows
+        // past those retired: streams the application never reads (so never
+        // retire) can't pile up without bound.
+        val newCap = minOf(conn.peerInitiatedUniCount + cfg.initialMaxStreamsUni, conn.retiredPeerUniCount + 2 * cfg.initialMaxStreamsUni)
         if (newCap > conn.advertisedMaxStreamsUni) {
             val oldCap = conn.advertisedMaxStreamsUni
             conn.advertisedMaxStreamsUni = newCap
@@ -1545,7 +1586,7 @@ private fun appendFlowControlUpdates(
         }
     }
     if (conn.peerInitiatedBidiCount + cfg.initialMaxStreamsBidi / 2 >= conn.advertisedMaxStreamsBidi) {
-        val newCap = conn.peerInitiatedBidiCount + cfg.initialMaxStreamsBidi
+        val newCap = minOf(conn.peerInitiatedBidiCount + cfg.initialMaxStreamsBidi, conn.retiredPeerBidiCount + 2 * cfg.initialMaxStreamsBidi)
         if (newCap > conn.advertisedMaxStreamsBidi) {
             val oldCap = conn.advertisedMaxStreamsBidi
             conn.advertisedMaxStreamsBidi = newCap

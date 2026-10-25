@@ -205,6 +205,14 @@ class QuicConnectionDriver(
      * path validated, drop it if validation failed, and flush its datagrams.
      */
     private suspend fun servicePathProbe() {
+        if (connection.isServer) {
+            val send = connection.sendOnServerPath ?: return
+            while (true) {
+                val (path, datagram) = connection.streamsLock.withLock { drainServerProbeResponse(connection, nowMillis()) } ?: break
+                runCatching { send(path, datagram) }
+            }
+            return
+        }
         val probe = connection.pathProbe ?: return
         when (probe.state) {
             PathProbe.State.AWAITING_SOCKET -> {
