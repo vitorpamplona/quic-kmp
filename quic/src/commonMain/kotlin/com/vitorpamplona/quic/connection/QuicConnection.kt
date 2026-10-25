@@ -389,6 +389,10 @@ class QuicConnection(
 
     private val handshakeConfirmedSignal = CompletableDeferred<Unit>()
 
+    /** When [handshakeConfirmed] flipped, on [nowMillis]'s clock; MIN_VALUE before. */
+    @Volatile
+    internal var handshakeConfirmedAtMillis: Long = Long.MIN_VALUE
+
     /**
      * Lock-split refactor (2026-05-08): @Volatile because the writer/parser
      * read this without acquiring [lifecycleLock] (the field is written
@@ -924,6 +928,9 @@ class QuicConnection(
         com.vitorpamplona.quic.connection.recovery
             .Pacer()
 
+    /** RFC 9000 §14.3 / RFC 8899 path MTU discovery; [PmtuDiscovery.currentSize] bounds every packet. */
+    val pmtud: PmtuDiscovery = PmtuDiscovery()
+
     /** Largest ECN-CE count the peer has reported in a 1-RTT ACK (RFC 9000 §13.4.2). */
     internal var peerReportedEcnCe: Long = 0L
 
@@ -971,6 +978,7 @@ class QuicConnection(
         if (acked.isEmpty()) return
         val before = bytesInFlight()
         state.onLeftFlight(acked)
+        for (p in acked) if (p.mtuProbeSize > 0) pmtud.onProbeAcked(p.mtuProbeSize)
         congestion.onPacketsAcked(acked, before)
     }
 
@@ -982,7 +990,21 @@ class QuicConnection(
     ) {
         if (lost.isEmpty()) return
         state.onLeftFlight(lost)
-        congestion.onPacketsLost(lost, nowMillis, persistentCongestionDurationMs())
+        // A lost PMTU probe says the path doesn't carry that size, not that
+        // it's congested (RFC 8899 §4.4).
+        var probes = false
+        for (p in lost) {
+            if (p.mtuProbeSize > 0) {
+                pmtud.onProbeLost(p.mtuProbeSize)
+                probes = true
+            }
+        }
+        val congestionLosses = if (probes) lost.filter { it.mtuProbeSize == 0 } else lost
+        val persistentBefore = congestion.persistentCongestionEvents
+        congestion.onPacketsLost(congestionLosses, nowMillis, persistentCongestionDurationMs())
+        // Persistent congestion right after growing the packet size looks like
+        // a PMTU black hole: fall back to the base size (RFC 8899 §4.3).
+        if (congestion.persistentCongestionEvents > persistentBefore) pmtud.onBlackHoleSuspected(nowMillis)
     }
 
     /**
@@ -1309,6 +1331,7 @@ class QuicConnection(
      */
     internal fun markHandshakeConfirmed() {
         if (!handshakeConfirmed) {
+            handshakeConfirmedAtMillis = nowMillis()
             handshakeConfirmed = true
             handshakeConfirmedSignal.complete(Unit)
         }
@@ -1750,6 +1773,13 @@ class QuicConnection(
             }
         }
         peerTransportParameters = tp
+        pmtud.setCeiling(
+            minOf(
+                config.maxUdpPayloadSize,
+                tp.maxUdpPayloadSize ?: MAX_UDP_PAYLOAD_DEFAULT,
+                PmtuDiscovery.MAX_PROBE_SIZE.toLong(),
+            ).toInt(),
+        )
         qlogObserver.onTransportParametersSet("remote", peerTransportParametersSummary(tp))
         sendConnectionFlowCredit = tp.initialMaxData ?: 0L
         peerMaxStreamsBidi = tp.initialMaxStreamsBidi ?: 0L
@@ -3710,6 +3740,9 @@ class QuicConnection(
         internal const val PREFERRED_ADDRESS_CID_SEQUENCE: Long = 1L
 
         private const val MIN_PROBE_RETRANSMIT_MS: Long = 100L
+
+        /** RFC 9000 §18.2 default `max_udp_payload_size`. */
+        private const val MAX_UDP_PAYLOAD_DEFAULT: Long = 65_527L
 
         /**
          * RFC 9000 §10.2.2 floor on the draining-period grace. The

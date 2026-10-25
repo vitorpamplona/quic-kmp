@@ -158,6 +158,16 @@ fun drainOutbound(
     val allowance = conn.sendAllowance(nowMillis)
     val inFlightBefore = conn.bytesInFlight()
 
+    // RFC 8899 / RFC 9000 §14.3: a PMTU probe goes out on its own — in a
+    // lull, or ahead of other data once the connection has been confirmed
+    // for a while, so a sender that's never idle still finds the size.
+    if (allowance == SendAllowance.FULL &&
+        conn.handshakeConfirmedAtMillis != Long.MIN_VALUE &&
+        nowMillis - conn.handshakeConfirmedAtMillis >= PMTU_PROBE_PRIORITY_DELAY_MS
+    ) {
+        buildPmtuProbe(conn, nowMillis)?.let { return it }
+    }
+
     // Drain destructive frame sources into local lists, ONCE.
     val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis, allowance)
     val handshakeContents = collectHandshakeLevelFrames(conn, EncryptionLevel.HANDSHAKE, nowMillis, allowance)
@@ -197,7 +207,7 @@ fun drainOutbound(
         }
 
     val firstPass = listOfNotNull(initialNatural, handshakeNatural, applicationPkt)
-    if (firstPass.isEmpty()) return null
+    if (firstPass.isEmpty()) return if (allowance == SendAllowance.FULL) buildPmtuProbe(conn, nowMillis) else null
 
     // RFC 9000 §14.1: client datagrams containing Initial MUST pad to ≥ 1200,
     // via PADDING frames inside the Initial's encryption envelope.
@@ -268,6 +278,46 @@ fun drainOutbound(
 }
 
 /**
+ * A PMTU probe (RFC 8899 §4.1): a 1-RTT PING padded to exactly the size being
+ * tested, when one is due. Only once the handshake is confirmed, and never
+ * past the congestion window. Its loss doesn't count as congestion.
+ */
+private fun buildPmtuProbe(
+    conn: QuicConnection,
+    nowMillis: Long,
+): ByteArray? {
+    if (!conn.handshakeConfirmed || conn.status != QuicConnection.Status.CONNECTED) return null
+    val proto = conn.application.sendProtection ?: return null
+    val size = conn.pmtud.probeDue(nowMillis)
+    if (size == 0 || conn.congestion.availableWindow(conn.bytesInFlight()) < size) return null
+    val state = conn.application
+    val pn = state.pnSpace.allocateOutbound()
+    val ping = encodeFrames(listOf(PingFrame))
+    val pnLen = PacketNumberSpaceState.encodeLength(pn, -1L)
+    val overhead = 1 + conn.destinationConnectionId.length + pnLen + proto.aead.tagLength
+    val payload = ping.copyOf((size - overhead).coerceAtLeast(ping.size))
+    val built =
+        ShortHeaderPacket.build(
+            ShortHeaderPlaintextPacket(conn.destinationConnectionId, pn, payload, keyPhase = conn.currentSendKeyPhase),
+            proto.aead,
+            proto.key,
+            proto.iv,
+            proto.hp,
+            proto.hpKey,
+            largestAckedInSpace = -1L,
+            nonceScratch = proto.nonceScratch,
+            hpScratch = proto.hpScratch,
+            hpMask = proto.hpMask,
+        )
+    state.recordSent(SentPacket(pn, nowMillis, ackEliciting = true, sizeBytes = built.size, tokens = emptyList(), mtuProbeSize = size))
+    conn.pmtud.onProbeSent(size)
+    conn.aeadEncryptCount += 1L
+    conn.lastActivityMs = nowMillis
+    emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, listOf(PingFrame))
+    return built
+}
+
+/**
  * Build the next datagram for the preferred-address probe path, or null when it
  * owes nothing right now: a PATH_CHALLENGE when one is due, plus PATH_RESPONSEs
  * to the server's challenges received on that path, in a 1-RTT packet carrying
@@ -316,6 +366,9 @@ fun drainProbe(
     emitQlogSent(conn, EncryptionLevel.APPLICATION, pn, built.size, frames)
     return built
 }
+
+/** How long after confirmation a due PMTU probe goes ahead of queued data. */
+private const val PMTU_PROBE_PRIORITY_DELAY_MS = 1_000L
 
 /** RFC 9000 §8.2.1: datagrams carrying PATH_CHALLENGE are expanded to at least this size. */
 private const val PROBE_DATAGRAM_SIZE = 1200
@@ -877,7 +930,12 @@ private fun buildApplicationPacket(
     // entirely; the peer's initial_max_data was decoded then forgotten,
     // causing the connection to be torn down with FLOW_CONTROL_ERROR once
     // we cumulatively sent past the cap).
-    var packetBudget = 1100
+    //
+    // Stream room: the validated datagram size (PMTU discovery; 1200 until a
+    // larger size is proven) less ~100 bytes for headers, the AEAD tag and
+    // a coalesced packet, less the frames this packet already carries.
+    val controlBytes = if (frames.isEmpty()) 0 else encodeFrames(frames).size
+    var packetBudget = conn.pmtud.currentSize - 100 - controlBytes
     val connRemaining =
         (conn.sendConnectionFlowCredit - conn.sendConnectionFlowConsumed).coerceAtLeast(0L)
     var connBudget = connRemaining

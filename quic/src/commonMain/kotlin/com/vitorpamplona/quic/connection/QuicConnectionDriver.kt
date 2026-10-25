@@ -692,6 +692,8 @@ internal suspend fun handlePtoFired(conn: QuicConnection) {
     // constant's natural reading: "after N consecutive PTOs with no
     // progress, trigger migration on the Nth PTO firing".
     conn.consecutivePtoCount = (conn.consecutivePtoCount + 1).coerceAtMost(6)
+    // Repeated PTOs after growing the packet size: suspect a PMTU black hole.
+    if (conn.consecutivePtoCount >= PMTU_BLACK_HOLE_PTO_COUNT) conn.pmtud.onBlackHoleSuspected(conn.nowMillis())
     conn.pendingPing = true
     requeueInflightForProbe(conn)
     // RFC 9002 §6.2.4: the spec allows up to 2 ack-eliciting packets
@@ -803,3 +805,6 @@ internal suspend fun requeueInflightForProbe(conn: QuicConnection) {
  * flight is a no-op.
  */
 internal const val PATH_PROBE_PTO_THRESHOLD: Int = 2
+
+/** Consecutive PTOs after which full-size packets are presumed to vanish (RFC 8899 §4.3). */
+internal const val PMTU_BLACK_HOLE_PTO_COUNT: Int = 3

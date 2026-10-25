@@ -114,7 +114,14 @@ actual class UdpSocket private constructor(
         return withContext(sendDispatcher) {
             if (closed.get()) throw ClosedChannelException()
             val buf = ByteBuffer.wrap(payload)
-            channel.send(buf, remote)
+            try {
+                channel.send(buf, remote)
+            } catch (e: java.io.IOException) {
+                // EMSGSIZE: the datagram is larger than the path MTU the kernel
+                // knows (a PMTU probe, or the path shrank). Drop it like the
+                // network would; loss recovery and PMTU discovery react.
+                if (e !is ClosedChannelException && e.message?.contains("too long", ignoreCase = true) == true) 0 else throw e
+            }
         }
     }
 
@@ -209,6 +216,18 @@ actual class UdpSocket private constructor(
                 // packets and ACK_ECN frames in both directions.
                 runCatching {
                     channel.setOption(StandardSocketOptions.IP_TOS, ECT0_TOS_BITS)
+                }
+                // RFC 9000 §14: don't let IP fragment datagrams, so PMTU probes
+                // tell the truth. jdk.net.ExtendedSocketOptions.IP_DONTFRAGMENT
+                // exists from JDK 19, not on Android: looked up reflectively.
+                runCatching {
+                    val option =
+                        Class
+                            .forName("jdk.net.ExtendedSocketOptions")
+                            .getField("IP_DONTFRAGMENT")
+                            .get(null)
+                    @Suppress("UNCHECKED_CAST")
+                    channel.setOption(option as java.net.SocketOption<Boolean>, true)
                 }
                 channel.bind(InetSocketAddress(0)) // ephemeral
                 // RFC 9000 §9 / defence-in-depth: connect() asks the kernel
