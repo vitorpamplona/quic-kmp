@@ -13,12 +13,12 @@ audio rooms and Marmot agent streams in production.
 
 | Area | What you get |
 |---|---|
-| QUIC v1 (RFC 9000) | Client and server. Bidirectional and unidirectional streams with flow control, version negotiation, Retry, connection IDs (`NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID`), path validation, NAT rebinding and migration to a server's preferred address, stateless reset, `NEW_TOKEN`, ECN on 1-RTT, path MTU discovery (RFC 8899), keep-alive |
+| QUIC v1 (RFC 9000) | Client and server. Bidirectional and unidirectional streams with flow control, version negotiation, Retry, connection IDs (`NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID`), path validation, NAT rebinding, preferred addresses (the client moves to one; the server offers one), stateless reset, `NEW_TOKEN`, ECN on 1-RTT, path MTU discovery (RFC 8899), latency spin bit, keep-alive |
 | QUIC v2 (RFC 9369, RFC 9368) | Both versions, and compatible version negotiation from v1 to v2 on either side |
 | TLS 1.3 for QUIC (RFC 8446, RFC 9001) | X25519 key exchange; `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`; RSA-PSS, ECDSA and Ed25519 certificates (Ed25519 needs Android 13+); 1-RTT key update (both directions); session resumption and 0-RTT, as client and as server (session tickets, PSK binders, single-use 0-RTT tickets) |
-| Recovery (RFC 9002) | RTT estimation, packet- and time-threshold loss detection, PTO, per-frame retransmission, NewReno congestion control with pacing, persistent congestion and ECN-CE response, delayed ACKs |
+| Recovery (RFC 9002) | RTT estimation, packet- and time-threshold loss detection, PTO, per-frame retransmission, CUBIC (RFC 9438) or NewReno congestion control with pacing, persistent congestion and ECN-CE response, delayed ACKs, the ACK frequency extension (draft-ietf-quic-ack-frequency) as receiver |
 | Datagrams (RFC 9221) | Send and receive unreliable `DATAGRAM` frames |
-| HTTP/3 (RFC 9114) | Frame reader and writer, `SETTINGS`, control and request streams, `GOAWAY` |
+| HTTP/3 (RFC 9114) | Frame reader (optionally streaming DATA bodies) and writer, `SETTINGS`, control and request streams, `GOAWAY` |
 | QPACK (RFC 9204) | Static table and Huffman. The encoder sends literals; the decoder also reads dynamic-table references |
 | WebTransport over HTTP/3 | Extended CONNECT, session streams, capsules (`WT_CLOSE_SESSION`), HTTP datagrams |
 | Debugging | qlog events (`QlogObserver`, viewable in [qvis](https://qvis.quictools.info/)) and TLS secrets for Wireshark (`TlsSecretsListener`) |
@@ -32,8 +32,8 @@ server (see [Interop matrix](#interop-matrix)).
 - `TLS_AES_256_GCM_SHA384` and key shares other than X25519 (so no HelloRetryRequest): both
   wait on SHA-384 and P-256 in [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp).
 - HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
-- On the server: client certificates, a preferred address of its own, and amplification limits
-  on a path a client migrated to (the handshake's 3x limit is enforced).
+- On the server: client certificates, and amplification limits on a path a client migrated to
+  (the handshake's 3x limit is enforced).
 - **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
   (CI compiles it as common code), but the UDP socket, packet ciphers, TLS transcript hash, lock
   and certificate validation exist only for the JVM so far.
@@ -279,6 +279,10 @@ long-lived connection with many streams:
 | `initialMaxStreamsBidi` / `initialMaxStreamsUni` | 100 / 10,000 (both extend as streams close) |
 | `maxIdleTimeoutMillis` | 30 s |
 | `maxDatagramFrameSize` | 1200 bytes, the largest datagram the peer may send (0: none) |
+| `congestionControl` | `CUBIC` (`NEW_RENO` also available) |
+| `compatibleVersions` | `[V1]`; add `V2` to offer QUIC v2 (RFC 9368) |
+| `spinBit`, `ackFrequency`, `greaseTransportParameters`, `migrateToPreferredAddress` | on |
+| `keepAliveIntervalMillis` | 0 (off) |
 
 ## Debugging
 
