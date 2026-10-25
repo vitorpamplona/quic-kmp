@@ -888,7 +888,7 @@ private fun buildApplicationPacket(
             tokens += RecoveryToken.Ack(level = EncryptionLevel.APPLICATION, largestAcked = ackWithCounts.largestAcknowledged)
         }
     }
-    if (use1Rtt && state.ackTracker.ackDue(nowMillis, conn.config.maxAckDelay)) appendAck()
+    if (use1Rtt && state.ackTracker.ackDue(nowMillis, conn.localMaxAckDelayMillis)) appendAck()
 
     // Step 7: PTO probe. The driver sets `pendingPing` when its
     // PTO timer fires without intervening ACKs. A PING is the

@@ -44,6 +44,22 @@ class AckTracker {
     /** An arrival out of order (a gap or a fill) since the last ACK: acknowledge at once (§13.2.1). */
     private var reorderedSinceAck: Boolean = false
 
+    /**
+     * Ack-eliciting packets that make an ACK due; RFC 9000's two unless the
+     * peer asked otherwise with ACK_FREQUENCY (draft-ietf-quic-ack-frequency).
+     */
+    var ackElicitingThreshold: Int = ACK_ELICITING_THRESHOLD
+
+    /** Whether reordering makes an ACK due at once; an ACK_FREQUENCY can turn it off. */
+    var ackOnReorder: Boolean = true
+
+    /** An IMMEDIATE_ACK arrived: the next drain acknowledges. */
+    private var immediateAckRequested: Boolean = false
+
+    fun requestImmediateAck() {
+        immediateAckRequested = true
+    }
+
     fun receivedPacket(
         packetNumber: Long,
         ackEliciting: Boolean,
@@ -130,7 +146,7 @@ class AckTracker {
         maxAckDelayMillis: Long,
     ): Boolean {
         if (!ackElicitingPending) return false
-        if (ackElicitingSinceAck >= ACK_ELICITING_THRESHOLD || reorderedSinceAck) return true
+        if (immediateAckRequested || ackElicitingSinceAck >= ackElicitingThreshold || reorderedSinceAck && ackOnReorder) return true
         return nowMillis - firstUnackedAtMillis >= maxAckDelayMillis
     }
 
@@ -208,6 +224,7 @@ class AckTracker {
         ackElicitingPending = false
         ackElicitingSinceAck = 0
         reorderedSinceAck = false
+        immediateAckRequested = false
         return AckFrame(
             largestAcknowledged = largest,
             ackDelay = ackDelay,

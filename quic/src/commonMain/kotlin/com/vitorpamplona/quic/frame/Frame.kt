@@ -63,6 +63,12 @@ object FrameType {
     /** RFC 9221 — DATAGRAM frame. 0x30 = no length, 0x31 = length-prefixed. */
     const val DATAGRAM: Long = 0x30
     const val DATAGRAM_LEN: Long = 0x31
+
+    /** draft-ietf-quic-ack-frequency §4 — ACK_FREQUENCY. */
+    const val ACK_FREQUENCY: Long = 0xaf
+
+    /** draft-ietf-quic-ack-frequency §5 — IMMEDIATE_ACK. */
+    const val IMMEDIATE_ACK: Long = 0x1f
 }
 
 /**
@@ -379,6 +385,34 @@ class DatagramFrame(
     }
 }
 
+/**
+ * draft-ietf-quic-ack-frequency §4: the peer asks us to acknowledge after
+ * [ackElicitingThreshold] + 1 ack-eliciting packets, within
+ * [requestedMaxAckDelayMicros], and on reordering of [reorderingThreshold]
+ * packets or more (0: don't hurry on reordering).
+ */
+class AckFrequencyFrame(
+    val sequenceNumber: Long,
+    val ackElicitingThreshold: Long,
+    val requestedMaxAckDelayMicros: Long,
+    val reorderingThreshold: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeVarint(FrameType.ACK_FREQUENCY)
+        out.writeVarint(sequenceNumber)
+        out.writeVarint(ackElicitingThreshold)
+        out.writeVarint(requestedMaxAckDelayMicros)
+        out.writeVarint(reorderingThreshold)
+    }
+}
+
+/** draft-ietf-quic-ack-frequency §5: acknowledge this packet right away. */
+class ImmediateAckFrame : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeVarint(FrameType.IMMEDIATE_ACK)
+    }
+}
+
 class HandshakeDoneFrame : Frame() {
     override fun encode(out: QuicWriter) {
         out.writeByte(FrameType.HANDSHAKE_DONE.toInt())
@@ -623,6 +657,14 @@ fun decodeFrames(data: ByteArray): List<Frame> {
 
             type == FrameType.HANDSHAKE_DONE -> {
                 out += HandshakeDoneFrame()
+            }
+
+            type == FrameType.ACK_FREQUENCY -> {
+                out += AckFrequencyFrame(r.readVarint(), r.readVarint(), r.readVarint(), r.readVarint())
+            }
+
+            type == FrameType.IMMEDIATE_ACK -> {
+                out += ImmediateAckFrame()
             }
 
             type == FrameType.DATAGRAM -> {

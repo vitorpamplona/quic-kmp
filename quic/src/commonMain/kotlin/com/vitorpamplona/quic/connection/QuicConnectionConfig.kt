@@ -100,6 +100,12 @@ data class QuicConnectionConfig(
      * RFC requires; off, it carries a random value per connection.
      */
     val spinBit: Boolean = true,
+    /**
+     * draft-ietf-quic-ack-frequency: advertise `min_ack_delay`, so the peer may
+     * tune how often we acknowledge (ACK_FREQUENCY) or ask for an ACK now
+     * (IMMEDIATE_ACK).
+     */
+    val ackFrequency: Boolean = true,
     /** RFC 9002 / RFC 9438: how the congestion window grows and shrinks. */
     val congestionControl: com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm =
         com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm.CUBIC,

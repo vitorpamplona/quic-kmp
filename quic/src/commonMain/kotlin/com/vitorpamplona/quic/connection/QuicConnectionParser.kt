@@ -1368,6 +1368,16 @@ private fun dispatchFrames(
                 ackEliciting = true
             }
 
+            is com.vitorpamplona.quic.frame.AckFrequencyFrame -> {
+                ackEliciting = true
+                conn.applyAckFrequencyLocked(frame)
+            }
+
+            is com.vitorpamplona.quic.frame.ImmediateAckFrame -> {
+                ackEliciting = true
+                state.ackTracker.requestImmediateAck()
+            }
+
             is com.vitorpamplona.quic.frame.DataBlockedFrame,
             is com.vitorpamplona.quic.frame.StreamDataBlockedFrame,
             is com.vitorpamplona.quic.frame.StreamsBlockedFrame,

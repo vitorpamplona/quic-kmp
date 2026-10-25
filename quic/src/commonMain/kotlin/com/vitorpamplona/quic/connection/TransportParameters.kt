@@ -54,6 +54,9 @@ object TransportParameterId {
 
     /** RFC 9368 §3 — `version_information`. */
     const val VERSION_INFORMATION: Long = 0x11
+
+    /** draft-ietf-quic-ack-frequency §3: the smallest ACK delay we can do, in microseconds. */
+    const val MIN_ACK_DELAY: Long = 0xff04de1bL
 }
 
 /**
@@ -202,6 +205,8 @@ data class TransportParameters(
     val unknown: Map<Long, ByteArray> = emptyMap(),
     val versionInformation: VersionInformation? = null,
     val preferredAddress: PreferredAddress? = null,
+    /** draft-ietf-quic-ack-frequency `min_ack_delay`, microseconds; non-null means ACK_FREQUENCY is welcome. */
+    val minAckDelayMicros: Long? = null,
 ) {
     fun encode(): ByteArray {
         val w = QuicWriter()
@@ -248,6 +253,7 @@ data class TransportParameters(
         maxDatagramFrameSize?.let { writeVarintParam(TransportParameterId.MAX_DATAGRAM_FRAME_SIZE, it) }
         versionInformation?.let { writeBytesParam(TransportParameterId.VERSION_INFORMATION, it.encode()) }
         preferredAddress?.let { writeBytesParam(TransportParameterId.PREFERRED_ADDRESS, it.encode()) }
+        minAckDelayMicros?.let { writeVarintParam(TransportParameterId.MIN_ACK_DELAY, it) }
         for ((id, bytes) in unknown) writeBytesParam(id, bytes)
 
         return w.toByteArray()
@@ -266,6 +272,7 @@ data class TransportParameters(
             var maxUdpPayloadSize: Long? = null
             var ackDelayExponent: Long? = null
             var maxAckDelay: Long? = null
+            var minAckDelayMicros: Long? = null
             var activeConnectionIdLimit: Long? = null
             var disableActiveMigration = false
             var initialSourceConnectionId: ByteArray? = null
@@ -301,6 +308,7 @@ data class TransportParameters(
                     TransportParameterId.MAX_DATAGRAM_FRAME_SIZE -> maxDatagramFrameSize = sub.readVarint()
                     TransportParameterId.VERSION_INFORMATION -> versionInformation = VersionInformation.decode(sub.src.copyOfRange(0, len))
                     TransportParameterId.PREFERRED_ADDRESS -> preferredAddress = PreferredAddress.decode(sub.src.copyOfRange(0, len))
+                    TransportParameterId.MIN_ACK_DELAY -> minAckDelayMicros = sub.readVarint()
                     else -> unknown[id] = sub.src.copyOfRange(0, len)
                 }
             }
@@ -315,6 +323,7 @@ data class TransportParameters(
                 maxUdpPayloadSize = maxUdpPayloadSize,
                 ackDelayExponent = ackDelayExponent,
                 maxAckDelay = maxAckDelay,
+                minAckDelayMicros = minAckDelayMicros,
                 activeConnectionIdLimit = activeConnectionIdLimit,
                 disableActiveMigration = disableActiveMigration,
                 initialSourceConnectionId = initialSourceConnectionId,

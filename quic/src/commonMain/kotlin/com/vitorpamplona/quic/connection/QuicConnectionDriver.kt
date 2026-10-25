@@ -451,7 +451,7 @@ class QuicConnectionDriver(
             // RFC 9000 §13.2.1: a delayed application ACK falls due at max_ack_delay.
             val ackDelta =
                 connection.application.ackTracker
-                    .ackDeadlineMillis(connection.config.maxAckDelay)
+                    .ackDeadlineMillis(connection.localMaxAckDelayMillis)
                     ?.let { (it - nowForLossTimer).coerceAtLeast(0L) }
                     ?.takeIf { connection.application.sendProtection != null }
             val sleepMillis =

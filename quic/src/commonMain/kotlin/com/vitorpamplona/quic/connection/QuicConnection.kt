@@ -1263,6 +1263,39 @@ class QuicConnection internal constructor(
         if (spinEnabled) spinValue = if (isServer) spin else !spin
     }
 
+    /**
+     * The longest we hold back an ACK: our advertised max_ack_delay, or what
+     * the peer's latest ACK_FREQUENCY asked for.
+     */
+    internal var localMaxAckDelayMillis: Long = config.maxAckDelay
+
+    /** The sequence number the next ACK_FREQUENCY must reach to count (draft §4). */
+    private var nextAckFrequencySequence: Long = 0L
+
+    /**
+     * draft-ietf-quic-ack-frequency §4: apply the peer's latest ACK_FREQUENCY
+     * to how the application space acknowledges. Caller holds [streamsLock].
+     */
+    internal fun applyAckFrequencyLocked(frame: com.vitorpamplona.quic.frame.AckFrequencyFrame) {
+        if (!config.ackFrequency) {
+            markClosedExternally("PROTOCOL_VIOLATION: ACK_FREQUENCY without min_ack_delay", errorCode = QuicTransportError.PROTOCOL_VIOLATION)
+            return
+        }
+        if (frame.requestedMaxAckDelayMicros < MIN_ACK_DELAY_MICROS) {
+            markClosedExternally(
+                "PROTOCOL_VIOLATION: ACK_FREQUENCY delay ${frame.requestedMaxAckDelayMicros} us below our min_ack_delay",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+        if (frame.sequenceNumber < nextAckFrequencySequence) return
+        nextAckFrequencySequence = frame.sequenceNumber + 1
+        val tracker = application.ackTracker
+        tracker.ackElicitingThreshold = (frame.ackElicitingThreshold + 1).coerceIn(1L, MAX_ACK_ELICITING_THRESHOLD).toInt()
+        tracker.ackOnReorder = frame.reorderingThreshold != 0L
+        localMaxAckDelayMillis = (frame.requestedMaxAckDelayMicros / 1000L).coerceAtLeast(1L)
+    }
+
     /** A server owes the client this NEW_TOKEN token (RFC 9000 §8.1.3), first send or after a loss. */
     internal var pendingNewToken: ByteArray? = null
 
@@ -1973,6 +2006,7 @@ class QuicConnection internal constructor(
             activeConnectionIdLimit = config.activeConnectionIdLimit,
             initialSourceConnectionId = sourceConnectionId.bytes,
             maxDatagramFrameSize = config.maxDatagramFrameSize,
+            minAckDelayMicros = if (config.ackFrequency) MIN_ACK_DELAY_MICROS else null,
             versionInformation =
                 if (serverSetup != null) {
                     VersionInformation(currentVersion, serverSetup.supportedVersions)
@@ -4107,6 +4141,12 @@ class QuicConnection internal constructor(
 
     companion object {
         private const val TAG = "QuicConnection"
+
+        /** Our `min_ack_delay`: the millisecond clock can't do better. */
+        internal const val MIN_ACK_DELAY_MICROS: Long = 1_000L
+
+        /** Bounds what an ACK_FREQUENCY can make us hold back. */
+        private const val MAX_ACK_ELICITING_THRESHOLD: Long = 1_000L
 
         /** Floor on the wait for a migrated client's PATH_RESPONSE before going back. */
         private const val PEER_MIGRATION_MIN_TIMEOUT_MS = 1_000L
