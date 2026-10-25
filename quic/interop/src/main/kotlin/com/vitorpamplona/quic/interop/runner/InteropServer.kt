@@ -132,7 +132,10 @@ fun runInteropServer(testcase: String): Int {
             supportedVersions = if (testcase == "v2") listOf(QuicVersion.V2, QuicVersion.V1) else listOf(QuicVersion.V1, QuicVersion.V2),
             requireRetry = testcase == "retry",
             ticketKeys = TlsSessionTicketKeys(),
-            maxEarlyDataSize = if (testcase == "zerortt") 0xffffffffL else 0L,
+            // xquic only keeps a session whose ticket allows early data
+            // ("xqc_ssl_new_session_cb|early data is not enabled"), so the
+            // resumption test's tickets allow it too.
+            maxEarlyDataSize = if (testcase == "zerortt" || testcase == "resumption") 0xffffffffL else 0L,
             cipherSuites =
                 intArrayOf(
                     TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
