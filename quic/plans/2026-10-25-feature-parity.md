@@ -39,11 +39,29 @@ Found by the server sweep, and affecting the client as well:
 - The PTO timer ran with nothing in flight, so an idle connection sent a PING every PTO. That
   timer had also been flushing stream writes made without `driver.wakeup()`; writes now wake the
   send loop themselves.
+- The reserved header bits were checked before the AEAD, so about three in four undecryptable
+  packets (corrupted, forged, or left over from before a version switch) closed the connection
+  instead of being dropped.
+- An ICMP port unreachable made the client socket's `receive()` throw, which killed the read loop
+  with an uncaught exception (an app crash on Android) whenever the server's port closed.
+- Every 1-RTT ACK was an ACK_ECN with zero counts. nginx closes the connection with
+  INTERNAL_ERROR on the first ACK_ECN it gets, so our client never finished a transfer from nginx.
+  ACKs now carry counts only once the peer's ACKs do. ACK_ECN counts were also decoded and
+  dropped, so the ECN-CE congestion response never saw a real count.
+- A PATH_CHALLENGE that arrived with the PATH_RESPONSE validating our preferred-address probe
+  was never answered.
+
+Server-only: a client whose NAT rebound before the handshake finished was never answered again;
+with a HelloRetryRequest the server switched versions before the retry (picoquic then restarted its
+handshake) and skipped PSK resumption on ClientHello2 (s2n-quic, xquic, kwik lead with P-256
+shares); and a path the client probed (our preferred address) is now challenged and validated
+before the client moves there.
 
 ## Not done
 
-- `TLS_AES_256_GCM_SHA384` and P-256 key shares (so HelloRetryRequest): crypto-kmp has neither
-  SHA-384 nor P-256 yet.
+- `TLS_AES_256_GCM_SHA384` and P-256 key shares: crypto-kmp has neither SHA-384 nor P-256 yet.
+  A client that lists X25519 gets a HelloRetryRequest (which rules out its 0-RTT: xquic, kwik);
+  one that offers only P-256 can't connect (kwik's HTTP/3 client).
 - Client certificates; HTTP/3 server push; QPACK dynamic-table inserts; multipath.
 - The sending side of the ACK frequency extension.
 - Reading ECN marks on receive: the JVM can't see the TOS byte, so ACK_ECN counts are zero and
@@ -63,3 +81,49 @@ runner. Consequences:
   rebound are lost, our ACKs (sent on the new path) report the gap, but quiche's log never
   declares those packets lost, so the data is never resent and the transfer waits forever. Per-path
   loss detection is the likely cause; unconfirmed.
+
+## Interop results: our server against the runner's clients
+
+2026-10-25, final image (`server-*.json` plus reruns of tests fixed during the sweep). `ok` passed,
+`FAIL` failed, `-` unsupported by the client.
+
+| client | handshake | transfer | longrtt | chacha20 | multiplexing | retry | resumption | zerortt | http3 | blackhole | keyupdate | ecn | amplificationlimit | handshakeloss | transferloss | handshakecorruption | transfercorruption | ipv6 | v2 | rebind-port | rebind-addr | connectionmigration |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| aioquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | ok |
+| go-x-net | ok | ok | ok | - | ok | - | - | - | - | ok | ok | - | ok | - | ok | - | ok | FAIL | - | ok | ok | FAIL |
+| kwik | ok | ok | ok | ok | ok | ok | ok | FAIL | FAIL | ok | ok | - | FAIL | ok | ok | ok | ok | FAIL | ok | ok | ok | FAIL |
+| lsquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | ok |
+| msquic | ok | ok | ok | ok | ok | ok | ok | FAIL | - | ok | ok | - | ok | ok | ok | ok | ok | FAIL | ok | FAIL | FAIL | FAIL |
+| mvfst | ok | ok | ok | - | ok | - | - | FAIL | ok | ok | - | - | ok | FAIL | ok | FAIL | ok | FAIL | - | FAIL | FAIL | FAIL |
+| neqo | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | FAIL | FAIL | FAIL |
+| ngtcp2 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | ok |
+| picoquic | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | FAIL | ok | ok | ok | ok |
+| quic-go | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | FAIL | FAIL | FAIL |
+| quiche | ok | ok | ok | - | FAIL | ok | ok | ok | ok | ok | - | - | ok | ok | ok | ok | ok | FAIL | - | ok | ok | FAIL |
+| quinn | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL |
+| s2n-quic | ok | ok | ok | - | ok | ok | ok | - | ok | ok | - | ok | ok | ok | ok | ok | ok | FAIL | - | ok | ok | FAIL |
+| xquic | ok | ok | ok | ok | - | ok | ok | FAIL | ok | ok | ok | - | ok | ok | ok | ok | ok | FAIL | - | ok | ok | FAIL |
+
+What the failures are (other than `ipv6`, which this sandbox can't run):
+
+- quinn: its client drops every reply as from an "unrecognized peer" under the IPv6 shim this
+  sandbox needs (it fails the same way against quic-go's server).
+- rebind-port / rebind-addr with quic-go, msquic, mvfst, neqo: these clients use zero-length
+  connection IDs, and the host's tshark 4.2.2 can't follow such a connection to its new 4-tuple, so
+  it can't see the PATH_CHALLENGE. Our qlog shows it in the first packet on the new path, and the
+  client answers it. Clients with connection IDs (aioquic, picoquic, ngtcp2, quiche, lsquic,
+  s2n-quic, xquic, kwik, go-x-net) pass.
+- connectionmigration with quic-go, msquic, mvfst, neqo, quiche, s2n-quic, xquic, kwik, go-x-net:
+  we offer the preferred address; these clients don't move to it (or, for neqo, tshark loses the
+  zero-length-CID connection again).
+- zerortt with xquic and kwik: their first ClientHello carries only a P-256 share, and the
+  HelloRetryRequest rejects 0-RTT. With msquic: its PMTU probes' padding counts as 1-RTT data and
+  tips the runner's size check (5130 of 5000 bytes); the 0-RTT data was accepted. With mvfst: its
+  client script sent nothing.
+- kwik http3 / amplificationlimit: its HTTP/3 client offers only P-256; amplificationlimit ends
+  with kwik closing on CRYPTO_BUFFER_EXCEEDED after the retry (kwik's log is empty; unexplained).
+- quiche multiplexing: quiche's HTTP/0.9 client wrote 3 bytes of 37 requests while its congestion
+  window was shut and never sent the rest.
+- mvfst handshakeloss / handshakecorruption: its client downloads everything on one connection
+  where the test wants one per file.
+
