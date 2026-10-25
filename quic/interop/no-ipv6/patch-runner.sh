@@ -12,9 +12,9 @@
 #      the client and the sim traverse iptables, and Docker 28+'s raw-table rule
 #      ("drop traffic to a container IP arriving on another bridge") drops every
 #      client packet routed through the sim.
-#   4. Builds v6shim.so and preloads it into the server container, so servers
-#      that bind "[::]:443" run on an AF_INET socket instead of dying with
-#      EAFNOSUPPORT.
+#   4. Builds v6shim.so and preloads it into the server and client containers,
+#      so endpoints that bind "[::]:443" or "[::]:0" run on an AF_INET socket
+#      instead of dying with EAFNOSUPPORT.
 #
 # Testcases that need real IPv6 (ipv6, connectionmigration's v6 path) can't pass
 # on such a host; treat their results as environment failures.
@@ -43,13 +43,14 @@ s = re.sub(r'\n\s+- "[a-z0-9]+:fd00:[^\n]+"', '', s)
 s = re.sub(r'\n\s+- subnet: fd00:[^\n]+', '', s)
 s = s.replace('enable_ipv6: true', 'enable_ipv6: false')
 s = re.sub(r'\n\s+ulimits:\n\s+memlock: \d+', '', s)
-# Preload the shim into the server only: our client is a JVM, which already
-# falls back to IPv4 on its own.
-server = re.search(r'\n  server:\n(?:    .*\n|\n)*?(?=\n  \w)', s)
-block = server.group(0)
-block = block.replace('      - ROLE=server\n', '      - ROLE=server\n      - LD_PRELOAD=/v6shim/v6shim.so\n      - ASAN_OPTIONS=verify_asan_link_order=0\n', 1)
-block = block.replace('      - $CERTS:/certs:ro\n', '      - $CERTS:/certs:ro\n      - %s:/v6shim:ro\n' % shim, 1)
-s = s.replace(server.group(0), block)
+# Preload the shim into both endpoints: either side can be a peer's image
+# (our JVM endpoint runs fine under it too).
+for role in ('server', 'client'):
+    m = re.search(r'\n  %s:\n(?:    .*\n|\n)*?(?=\n  \w)' % role, s)
+    block = m.group(0)
+    block = block.replace('      - ROLE=%s\n' % role, '      - ROLE=%s\n      - LD_PRELOAD=/v6shim/v6shim.so\n      - ASAN_OPTIONS=verify_asan_link_order=0\n' % role, 1)
+    block = block.replace('      - $CERTS:/certs:ro\n', '      - $CERTS:/certs:ro\n      - %s:/v6shim:ro\n' % shim, 1)
+    s = s.replace(m.group(0), block)
 open(dst, 'w').write(s)
 EOF
 

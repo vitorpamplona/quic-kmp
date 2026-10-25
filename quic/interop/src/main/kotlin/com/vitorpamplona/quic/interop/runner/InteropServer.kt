@@ -69,9 +69,9 @@ private val SERVER_TESTCASES =
         "keyupdate",
         "ecn",
         "amplificationlimit",
-        "handshakeloss",
+        // handshakeloss and handshakecorruption reach the server as multiconnect.
+        "multiconnect",
         "transferloss",
-        "handshakecorruption",
         "transfercorruption",
         "ipv6",
         "v2",
