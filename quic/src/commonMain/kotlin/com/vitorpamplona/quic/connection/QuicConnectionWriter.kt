@@ -123,6 +123,9 @@ fun drainOutbound(
     // times what it received. Our datagrams are at most the current PMTU,
     // so hold off unless a whole one fits.
     if (conn.amplificationAllowance() < conn.pmtud.currentSize) return null
+    // The same for a path a client moved to, until it answers our challenge
+    // (§9.3); small datagrams still go, so the challenge itself can.
+    if (conn.migrationSendAllowance() < MIN_MIGRATION_DATAGRAM) return null
 
     // Bug-A fix: drive the §8.2.4 3*PTO validation budget on every
     // drain, not just on PTO expiration. The peer ACKs PATH_CHALLENGE
@@ -291,6 +294,7 @@ fun drainOutbound(
         conn.initial.discardKeys()
     }
     if (!conn.addressValidated) conn.amplificationBytesSent += datagram.size
+    conn.peerMigration?.let { if (conn.sendPath == it.path) it.sent += datagram.size }
     return datagram
 }
 
@@ -307,6 +311,7 @@ private fun buildPmtuProbe(
     val proto = conn.application.sendProtection ?: return null
     val size = conn.pmtud.probeDue(nowMillis)
     if (size == 0 || conn.congestion.availableWindow(conn.bytesInFlight()) < size) return null
+    if (size > conn.migrationSendAllowance()) return null
     val state = conn.application
     val pn = state.pnSpace.allocateOutbound()
     val ping = encodeFrames(listOf(PingFrame))
@@ -953,7 +958,8 @@ private fun buildApplicationPacket(
     // larger size is proven) less ~100 bytes for headers, the AEAD tag and
     // a coalesced packet, less the frames this packet already carries.
     val controlBytes = if (frames.isEmpty()) 0 else encodeFrames(frames).size
-    var packetBudget = conn.pmtud.currentSize - 100 - controlBytes
+    val datagramCap = minOf(conn.pmtud.currentSize.toLong(), conn.migrationSendAllowance()).toInt()
+    var packetBudget = datagramCap - 100 - controlBytes
     val connRemaining =
         (conn.sendConnectionFlowCredit - conn.sendConnectionFlowConsumed).coerceAtLeast(0L)
     var connBudget = connRemaining
@@ -1552,3 +1558,9 @@ private fun appendFlowControlUpdates(
         }
     }
 }
+
+/**
+ * The smallest send worth making to a migrated client under its amplification
+ * limit: a 1-RTT packet with an ACK and a PATH_CHALLENGE.
+ */
+private const val MIN_MIGRATION_DATAGRAM = 64L

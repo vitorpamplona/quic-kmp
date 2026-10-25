@@ -32,8 +32,7 @@ server (see [Interop matrix](#interop-matrix)).
 - `TLS_AES_256_GCM_SHA384` and key shares other than X25519 (so no HelloRetryRequest): both
   wait on SHA-384 and P-256 in [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp).
 - HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
-- On the server: client certificates, and amplification limits on a path a client migrated to
-  (the handshake's 3x limit is enforced).
+- Client certificates on the server.
 - **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
   (CI compiles it as common code), but the UDP socket, packet ciphers, TLS transcript hash, lock
   and certificate validation exist only for the JVM so far.

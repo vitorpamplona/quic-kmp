@@ -245,9 +245,24 @@ class QuicConnection internal constructor(
         val previous: ServerPath,
         val challenge: ByteArray,
         val startedAtMillis: Long,
+        /** RFC 9000 §8 / §9.3: bytes from the new address, which bound what we send there until it validates. */
+        var received: Long,
     ) {
         /** The PATH_CHALLENGE still has to go out (first time or after a loss). */
         var challengePending: Boolean = true
+
+        /** Bytes we sent to the new address. */
+        var sent: Long = 0L
+    }
+
+    /**
+     * Server: the largest datagram we may send right now on a path a client
+     * moved to and that isn't validated yet — three times what came from
+     * there, less what we sent (RFC 9000 §9.3); [Long.MAX_VALUE] otherwise.
+     */
+    internal fun migrationSendAllowance(): Long {
+        val m = peerMigration ?: return Long.MAX_VALUE
+        return 3L * m.received - m.sent
     }
 
     internal var peerMigration: PeerMigration? = null
@@ -265,6 +280,7 @@ class QuicConnection internal constructor(
         frames: List<com.vitorpamplona.quic.frame.Frame>,
         largestReceived: Boolean,
         nowMillis: Long,
+        datagramSize: Int,
     ) {
         val src = datagramPath ?: return
         val current = peerPath ?: return
@@ -290,6 +306,7 @@ class QuicConnection internal constructor(
                     com.vitorpamplona.crypto.random.RandomInstance
                         .bytes(8),
                     nowMillis,
+                    received = datagramSize.toLong(),
                 )
             }
         if (back) sendPath = src
@@ -1225,6 +1242,7 @@ class QuicConnection internal constructor(
 
     internal fun onDatagramReceived(size: Int) {
         if (!addressValidated) amplificationBytesReceived += size
+        peerMigration?.let { if (datagramPath == it.path) it.received += size }
     }
 
     /**

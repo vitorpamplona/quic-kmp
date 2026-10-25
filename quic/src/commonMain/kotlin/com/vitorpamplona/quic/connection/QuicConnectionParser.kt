@@ -694,7 +694,7 @@ private fun feedShortHeaderPacket(
         )
     }
     dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
-    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, parsed.packet.packetNumber == state.pnSpace.largestReceived, nowMillis)
+    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, parsed.packet.packetNumber == state.pnSpace.largestReceived, nowMillis, datagram.size)
 }
 
 /**

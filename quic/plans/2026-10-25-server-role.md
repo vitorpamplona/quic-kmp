@@ -79,8 +79,9 @@ address.
   address), so a client moving there is followed like a rebinding.
 - `maxConnections`: past it, a new client gets an Initial CONNECTION_CLOSE with
   CONNECTION_REFUSED, built by a throwaway connection that holds only the Initial keys.
-- Not yet: amplification limits on a migrated-to path (the writer can't yet build a datagram
-  smaller than the PMTU to fit one), a separate cap on handshakes in progress.
+- A migrated-to path is held to 3x what came from it until its PATH_RESPONSE: the writer caps the
+  stream data it packs so the challenge still goes out in a small datagram.
+- Not yet: a separate cap on handshakes in progress.
 
 Found on the way and fixed for the client too: stream credit followed arrival rather than
 consumption (a fast sender overflowed the 64-chunk app channel and the connection died), 1-RTT
