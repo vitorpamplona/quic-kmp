@@ -52,6 +52,21 @@ import com.vitorpamplona.quic.packet.ShortHeaderPacket
 import com.vitorpamplona.quic.packet.ShortHeaderPlaintextPacket
 
 /**
+ * How much a datagram may carry right now (see [QuicConnection.sendAllowance]).
+ */
+internal enum class SendAllowance {
+    /** Anything: the congestion window and pacer have room, or a PTO probe is due. */
+    FULL,
+
+    /**
+     * ACKs and the small control frames that keep the peer moving (flow-control
+     * credit, path responses, connection IDs); stream data, datagrams, CRYPTO
+     * and PINGs wait.
+     */
+    CONTROL_ONLY,
+}
+
+/**
  * Build the next UDP datagram to send for [conn], or return null if there's
  * nothing to send right now.
  *
@@ -139,10 +154,14 @@ fun drainOutbound(
     conn.maybeStartPreferredAddressProbeLocked(nowMillis)
     conn.checkPathProbeTimeoutLocked(nowMillis)
 
+    // RFC 9002 §7: what the congestion window and pacer let through.
+    val allowance = conn.sendAllowance(nowMillis)
+    val inFlightBefore = conn.bytesInFlight()
+
     // Drain destructive frame sources into local lists, ONCE.
-    val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis)
-    val handshakeContents = collectHandshakeLevelFrames(conn, EncryptionLevel.HANDSHAKE, nowMillis)
-    val applicationPkt = buildApplicationPacket(conn, nowMillis)
+    val initialContents = collectHandshakeLevelFrames(conn, EncryptionLevel.INITIAL, nowMillis, allowance)
+    val handshakeContents = collectHandshakeLevelFrames(conn, EncryptionLevel.HANDSHAKE, nowMillis, allowance)
+    val applicationPkt = buildApplicationPacket(conn, nowMillis, allowance)
 
     val initialState = conn.initial
     val handshakeState = conn.handshake
@@ -230,6 +249,10 @@ fun drainOutbound(
         } else {
             concat(firstPass)
         }
+
+    // Ack-eliciting bytes went out: charge the pacer (RFC 9002 §7.7).
+    // Measured before the Initial discard below releases its in-flight bytes.
+    if (conn.bytesInFlight() > inFlightBefore) conn.pacer.onSent(datagram.size)
 
     // RFC 9001 §4.9.1: a client MUST discard Initial keys when it first
     // sends a Handshake packet. We just built one (handshakeNatural !=
@@ -532,6 +555,7 @@ private fun collectHandshakeLevelFrames(
     conn: QuicConnection,
     level: EncryptionLevel,
     nowMillis: Long,
+    allowance: SendAllowance,
 ): HandshakeLevelContents? {
     val state = conn.levelState(level)
     if (state.sendProtection == null) return null
@@ -541,7 +565,7 @@ private fun collectHandshakeLevelFrames(
         frames += it
         tokens += RecoveryToken.Ack(level = level, largestAcked = it.largestAcknowledged)
     }
-    val cryptoChunk = state.cryptoSend.takeChunk(maxBytes = 1100)
+    val cryptoChunk = if (allowance == SendAllowance.FULL) state.cryptoSend.takeChunk(maxBytes = 1100) else null
     if (cryptoChunk != null && cryptoChunk.data.isNotEmpty()) {
         frames += CryptoFrame(cryptoChunk.offset, cryptoChunk.data)
         // Step E: record a Crypto retransmit token at the matching
@@ -572,6 +596,7 @@ private fun collectHandshakeLevelFrames(
     // never sent at all). This preserves the "send something
     // ack-eliciting on every PTO" contract without wasting a frame.
     if (conn.pendingPing &&
+        allowance == SendAllowance.FULL &&
         conn.application.sendProtection == null &&
         level == highestPreApplicationLevel(conn)
     ) {
@@ -668,14 +693,15 @@ private fun buildLongHeaderFromFrames(
     // SentPacket reflects the final padded packet's size — correct
     // for retransmit purposes.
     val ackEliciting = isAckEliciting(frames)
-    state.sentPackets[pn] =
+    state.recordSent(
         SentPacket(
             packetNumber = pn,
             sentAtMillis = nowMillis,
             ackEliciting = ackEliciting,
             sizeBytes = packet.size,
             tokens = tokens,
-        )
+        ),
+    )
     // RFC 9000 §10.1.1: an ack-eliciting outbound packet resets the
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)
@@ -711,6 +737,7 @@ private fun emitQlogSent(
 private fun buildApplicationPacket(
     conn: QuicConnection,
     nowMillis: Long,
+    allowance: SendAllowance = SendAllowance.FULL,
 ): ByteArray? {
     val state = conn.application
     // Prefer 1-RTT keys when available; fall back to 0-RTT keys for the
@@ -794,7 +821,7 @@ private fun buildApplicationPacket(
     // through loss detection (steps 5–6) and surfaces any
     // outstanding losses for retransmit. The PING itself is not
     // retransmitted on loss (RFC 9002 §A.9 PROBE_TIMEOUT skipped).
-    if (conn.pendingPing) {
+    if (conn.pendingPing && allowance == SendAllowance.FULL) {
         frames += PingFrame
         conn.pendingPing = false
     }
@@ -813,7 +840,7 @@ private fun buildApplicationPacket(
     // Pre-fix the writer emitted DATAGRAM regardless and let
     // spec-conformant peers close the connection with PROTOCOL_VIOLATION.
     val peerDatagramCap = conn.peerTransportParameters?.maxDatagramFrameSize ?: 0L
-    while (conn.pendingDatagramsLocked().isNotEmpty()) {
+    while (allowance == SendAllowance.FULL && conn.pendingDatagramsLocked().isNotEmpty()) {
         val payload = conn.pendingDatagramsLocked().removeFirst()
         if (peerDatagramCap <= 0L) {
             conn.qlogObserver.onPacketDropped(
@@ -853,7 +880,7 @@ private fun buildApplicationPacket(
     // allocating a fresh `entries.toList()` per drain. The list is
     // insertion-ordered and stays in sync with the streams map.
     val streamsView = conn.streamsListLocked()
-    if (streamsView.isNotEmpty()) {
+    if (allowance == SendAllowance.FULL && streamsView.isNotEmpty()) {
         // Strict priority across tiers, round-robin within each tier.
         // Higher-priority streams (e.g. moq-lite newer-sequence group
         // streams) ALWAYS drain ahead of lower-priority ones; the
@@ -1041,14 +1068,15 @@ private fun buildApplicationPacket(
             }
         }
     val ackEliciting = isAckEliciting(frames)
-    state.sentPackets[pn] =
+    state.recordSent(
         SentPacket(
             packetNumber = pn,
             sentAtMillis = nowMillis,
             ackEliciting = ackEliciting,
             sizeBytes = sizeBytes.getOrNull()?.size ?: 0,
             tokens = tokens.toList(),
-        )
+        ),
+    )
     // RFC 9000 §10.1.1: an ack-eliciting outbound packet resets the
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)

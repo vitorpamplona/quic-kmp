@@ -425,6 +425,11 @@ class QuicConnectionDriver(
                         }
                     }
                 }
+            // RFC 9002 §7.7: the pacer held payload back; come back when it
+            // releases the next datagram. (Window-blocked sends wait for an ACK,
+            // which wakes us, or the PTO.)
+            val pacingDelta =
+                connection.pacingDelayMillis(nowForLossTimer).takeIf { it > 0L && !connection.congestionBlocked() }
             val sleepMillis =
                 minOf(
                     ptoMillis,
@@ -432,6 +437,7 @@ class QuicConnectionDriver(
                     idleDelta ?: Long.MAX_VALUE,
                     drainingDelta ?: Long.MAX_VALUE,
                     probeDelta ?: Long.MAX_VALUE,
+                    pacingDelta ?: Long.MAX_VALUE,
                 )
             // Suspend until either: a wakeup arrives, or the timer expires.
             val woke =
@@ -460,6 +466,10 @@ class QuicConnectionDriver(
                     connection.markClosedExternally(
                         "idle timeout ($idleTimeoutMs ms with no activity)",
                     )
+                    continue
+                }
+                // The pacer's timer woke us: just drain again.
+                if (pacingDelta != null && pacingDelta < ptoMillis && (nextLossDelta == null || pacingDelta < nextLossDelta)) {
                     continue
                 }
                 // The probe timer woke us: its work happens at the top of the loop.
@@ -508,6 +518,7 @@ class QuicConnectionDriver(
         for (lostPacket in result.lost) {
             conn.onTokensLost(lostPacket.tokens)
         }
+        conn.onPacketsLostLocked(state, result.lost, nowMs)
         if (result.lost.isNotEmpty()) {
             conn.qlogObserver.onLossDetected(level, result.lost.map { it.packetNumber })
         }

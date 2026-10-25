@@ -746,6 +746,13 @@ private fun dispatchFrames(
                     // exponential backoff resets.
                     conn.consecutivePtoCount = 0
                 }
+                // RFC 9002 §B.5 / §B.7: release the acknowledged bytes,
+                // grow the window, and treat a rising CE count as congestion.
+                conn.onPacketsAckedLocked(state, drained)
+                val ce = frame.ecnCounts?.ce
+                if (ce != null && level == EncryptionLevel.APPLICATION) {
+                    conn.onPeerEcnCountsLocked(ce, largestSentTime, nowMillis)
+                }
                 state.largestAckedPn?.let { largestAckedPn ->
                     val result =
                         conn.lossDetection.detectAndRemoveLost(
@@ -759,6 +766,7 @@ private fun dispatchFrames(
                     for (lostPacket in result.lost) {
                         conn.onTokensLost(lostPacket.tokens)
                     }
+                    conn.onPacketsLostLocked(state, result.lost, nowMillis)
                     if (result.lost.isNotEmpty()) {
                         conn.qlogObserver.onLossDetected(level, result.lost.map { it.packetNumber })
                     }

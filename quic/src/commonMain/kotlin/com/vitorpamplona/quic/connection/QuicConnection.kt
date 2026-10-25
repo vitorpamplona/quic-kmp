@@ -893,6 +893,96 @@ class QuicConnection(
             .QuicLossDetection()
 
     /**
+     * RFC 9002 §7 congestion controller (NewReno). One per connection,
+     * shared by the three packet-number spaces (§B.4). The writer only
+     * emits ack-eliciting packets while [bytesInFlight] is below its
+     * window, PTO probes excepted (§7.5).
+     */
+    val congestion: com.vitorpamplona.quic.connection.recovery.CongestionController =
+        com.vitorpamplona.quic.connection.recovery
+            .CongestionController()
+
+    /** RFC 9002 §7.7 pacer, spreading ack-eliciting sends over the round trip. */
+    internal val pacer: com.vitorpamplona.quic.connection.recovery.Pacer =
+        com.vitorpamplona.quic.connection.recovery
+            .Pacer()
+
+    /** Largest ECN-CE count the peer has reported in a 1-RTT ACK (RFC 9000 §13.4.2). */
+    internal var peerReportedEcnCe: Long = 0L
+
+    /** RFC 9002 §2: bytes in flight across all packet-number spaces. */
+    fun bytesInFlight(): Long = initial.bytesInFlight + handshake.bytesInFlight + application.bytesInFlight
+
+    /**
+     * What the writer may put in the next datagram. PTO probes always go
+     * (RFC 9002 §7.5); otherwise ack-eliciting payload waits for congestion
+     * window (§7) and the pacer (§7.7), while ACKs and small control frames
+     * still flow.
+     */
+    internal fun sendAllowance(nowMillis: Long): SendAllowance {
+        if (pendingPing || pendingProbePackets > 0) return SendAllowance.FULL
+        if (congestion.availableWindow(bytesInFlight()) <= 0L) return SendAllowance.CONTROL_ONLY
+        if (pacingDelayMillis(nowMillis) > 0L) return SendAllowance.CONTROL_ONLY
+        return SendAllowance.FULL
+    }
+
+    /** Milliseconds until the pacer releases another full-size datagram. */
+    internal fun pacingDelayMillis(nowMillis: Long): Long = pacer.delayMillis(nowMillis, congestion.maxDatagramSize, congestion.congestionWindow, lossDetection.smoothedRttMs)
+
+    /** True when the window, not the pacer, is what holds payload back. */
+    internal fun congestionBlocked(): Boolean = congestion.availableWindow(bytesInFlight()) <= 0L
+
+    /**
+     * RFC 9002 §7.6.1 persistent-congestion duration, or null before the
+     * first RTT sample.
+     */
+    private fun persistentCongestionDurationMs(): Long? {
+        if (!lossDetection.hasFirstRttSample) return null
+        val maxAckDelay = peerTransportParameters?.maxAckDelay ?: TransportParameterDefaults.MAX_ACK_DELAY_MS
+        val pto =
+            lossDetection.smoothedRttMs +
+                (4L * lossDetection.rttVarMs).coerceAtLeast(1L) +
+                maxAckDelay
+        return pto * com.vitorpamplona.quic.connection.recovery.CongestionController.PERSISTENT_CONGESTION_THRESHOLD
+    }
+
+    /** [acked] left flight in [state]: release their bytes and grow the window. Caller holds [streamsLock]. */
+    internal fun onPacketsAckedLocked(
+        state: LevelState,
+        acked: List<com.vitorpamplona.quic.connection.recovery.SentPacket>,
+    ) {
+        if (acked.isEmpty()) return
+        val before = bytesInFlight()
+        state.onLeftFlight(acked)
+        congestion.onPacketsAcked(acked, before)
+    }
+
+    /** [lost] were declared lost in [state]: release their bytes and react. Caller holds [streamsLock]. */
+    internal fun onPacketsLostLocked(
+        state: LevelState,
+        lost: List<com.vitorpamplona.quic.connection.recovery.SentPacket>,
+        nowMillis: Long,
+    ) {
+        if (lost.isEmpty()) return
+        state.onLeftFlight(lost)
+        congestion.onPacketsLost(lost, nowMillis, persistentCongestionDurationMs())
+    }
+
+    /**
+     * RFC 9002 §7.1 / §B.7: a rising ECN-CE count in a 1-RTT ACK is a
+     * congestion signal about the packet that ACK's largest number names.
+     */
+    internal fun onPeerEcnCountsLocked(
+        ceCount: Long,
+        largestAckedSentAtMillis: Long?,
+        nowMillis: Long,
+    ) {
+        if (ceCount <= peerReportedEcnCe) return
+        peerReportedEcnCe = ceCount
+        if (largestAckedSentAtMillis != null) congestion.onCongestionEvent(largestAckedSentAtMillis, nowMillis)
+    }
+
+    /**
      * Reusable scratch lists for [QuicConnectionWriter.buildApplicationPacket].
      * The function clears them at entry, fills them, encodes the
      * packet, snapshots the [scratchAppTokens] via `.toList()` for
@@ -1105,7 +1195,7 @@ class QuicConnection(
                 if (rejected0Rtt) {
                     requeueAllInflightStreamData()
                     application.cryptoSend.requeueAllInflight()
-                    application.sentPackets.clear()
+                    application.clearSentPackets()
                 }
                 application.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret, currentVersion)
                 application.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret, currentVersion)

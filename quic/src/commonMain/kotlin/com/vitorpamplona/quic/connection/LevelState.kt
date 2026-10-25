@@ -70,6 +70,36 @@ class LevelState {
     val sentPackets: MutableMap<Long, SentPacket> = HashMap()
 
     /**
+     * RFC 9002 §2 bytes in flight in this space: the sizes of the
+     * ack-eliciting packets in [sentPackets]. Kept in step through
+     * [recordSent] / [onLeftFlight]; every path that clears [sentPackets]
+     * zeroes it, so discarded keys and Retry resets release the bytes
+     * with the packets.
+     */
+    var bytesInFlight: Long = 0L
+        private set
+
+    /** Retain [packet] for loss recovery, replacing a same-PN rebuild (Initial padding). */
+    internal fun recordSent(packet: SentPacket) {
+        val prior = sentPackets.put(packet.packetNumber, packet)
+        if (prior != null && prior.ackEliciting) bytesInFlight -= prior.sizeBytes
+        if (packet.ackEliciting) bytesInFlight += packet.sizeBytes
+        if (bytesInFlight < 0L) bytesInFlight = 0L
+    }
+
+    /** [packets] were acknowledged or declared lost (already removed from [sentPackets]). */
+    internal fun onLeftFlight(packets: List<SentPacket>) {
+        for (p in packets) if (p.ackEliciting) bytesInFlight -= p.sizeBytes
+        if (bytesInFlight < 0L) bytesInFlight = 0L
+    }
+
+    /** Forget every retained packet, e.g. when 0-RTT is rejected. */
+    internal fun clearSentPackets() {
+        sentPackets.clear()
+        bytesInFlight = 0L
+    }
+
+    /**
      * RFC 9002 §6.1 largest acknowledged packet number observed
      * by an inbound ACK in this space. Updated only when the ACK
      * advances it — duplicate ACKs do not move the value.
@@ -143,7 +173,7 @@ class LevelState {
         ackTracker =
             com.vitorpamplona.quic.recovery
                 .AckTracker()
-        sentPackets.clear()
+        clearSentPackets()
         largestAckedPn = null
         largestAckedSentTimeMs = null
         nextLossTimeMs = null
@@ -176,7 +206,7 @@ class LevelState {
                 .AckTracker()
         cryptoSend = SendBuffer()
         cryptoReceive = ReceiveBuffer()
-        sentPackets.clear()
+        clearSentPackets()
         largestAckedPn = null
         largestAckedSentTimeMs = null
         nextLossTimeMs = null
@@ -218,7 +248,7 @@ class LevelState {
                 .AckTracker()
         cryptoSend = SendBuffer()
         cryptoReceive = ReceiveBuffer()
-        sentPackets.clear()
+        clearSentPackets()
         largestAckedPn = null
         largestAckedSentTimeMs = null
         nextLossTimeMs = null
