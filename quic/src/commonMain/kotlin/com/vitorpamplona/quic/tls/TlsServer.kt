@@ -77,8 +77,9 @@ class TlsServer(
     /** Deterministic tests only. */
     val fixedKeyPair: X25519KeyPair? = null,
     /**
-     * Sees the client's QUIC transport parameters as soon as the ClientHello
-     * is read, before anything is sent; a non-null result replaces
+     * Sees the client's QUIC transport parameters from the ClientHello we
+     * answer with a ServerHello (the second one after a HelloRetryRequest),
+     * before that answer is built; a non-null result replaces
      * [transportParameters] in EncryptedExtensions. The QUIC layer uses it to
      * switch to a compatible version the client offered (RFC 9368 §2.3).
      */
@@ -197,7 +198,6 @@ class TlsServer(
         }
         val tp = ch.quicTransportParameters ?: throw TlsAlertException(TlsConstants.ALERT_MISSING_EXTENSION, "ClientHello without quic_transport_parameters")
         peerTransportParameters = tp
-        onClientTransportParameters?.invoke(tp)?.let { sentTransportParameters = it }
         // RFC 9001 §8.1: ALPN is mandatory with QUIC.
         val alpn = alpnSelector(ch.alpns) ?: throw TlsAlertException(TlsConstants.ALERT_NO_APPLICATION_PROTOCOL, "no acceptable ALPN in ${ch.alpns.map { it.decodeToString() }}")
         negotiatedAlpn = alpn
@@ -212,6 +212,10 @@ class TlsServer(
             sendHelloRetryRequest(ch, msg, suite)
             return
         }
+        // Only for the ClientHello we answer: a compatible version switch
+        // (RFC 9368) together with a HelloRetryRequest left picoquic restarting
+        // its handshake in the new version without the retry.
+        onClientTransportParameters?.invoke(tp)?.let { sentTransportParameters = it }
 
         // RFC 8446 §4.2.11: try the offered ticket before deciding on a full handshake.
         // After a HelloRetryRequest the binder would cover the retry too; a full
