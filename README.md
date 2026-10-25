@@ -355,7 +355,8 @@ Opt-in long runs: `-PquicSoakSeconds=1800` turns on the audio-rooms soak test, a
 it against other implementations:
 
 ```bash
-quic/interop/run-matrix.sh -s aioquic -t handshake,chacha20
+quic/interop/run-matrix.sh -s aioquic -t handshake,chacha20   # our client, aioquic's server
+quic/interop/run-matrix.sh -c quic-go -t handshake,retry      # our server, quic-go's client
 ```
 
 It needs Docker, and it clones the runner next to this repo on first use. Run one peer at a time:

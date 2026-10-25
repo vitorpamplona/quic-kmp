@@ -9,6 +9,11 @@
 #   quic/interop/run-matrix.sh                                      # full matrix vs aioquic
 #   quic/interop/run-matrix.sh -s aioquic -t handshake              # one test
 #   quic/interop/run-matrix.sh -s quic-go -t handshake,chacha20     # different peer
+#   quic/interop/run-matrix.sh -c quic-go -t handshake,retry        # our server, their client
+#
+# `amethyst` is registered as both client and server, and run.py only runs
+# pairs that include it (-i), so `-s <peer>` tests our client against that
+# server and `-c <peer>` our server against that client.
 #
 # Default peer set when running the full nightly sweep:
 #   aioquic, picoquic, quic-go, quinn  — these are the four reference impls
@@ -122,8 +127,10 @@ if [ ! -d "$RUNNER_DIR/.venv" ]; then
 fi
 "$RUNNER_DIR/.venv/bin/pip" install -q -r "$RUNNER_DIR/requirements.txt"
 
-# 3. Register our endpoint in implementations_quic.json (idempotent).
-if ! jq -e '.amethyst' "$RUNNER_DIR/implementations_quic.json" >/dev/null 2>&1; then
+# 3. Register our endpoint in implementations_quic.json (idempotent; also
+# refreshes an older registration, e.g. one made when it was client-only).
+if ! jq -e --slurpfile want "$SCRIPT_DIR/quic-interop-runner-snippet.json" '.amethyst == $want[0].amethyst' \
+    "$RUNNER_DIR/implementations_quic.json" >/dev/null 2>&1; then
     echo "==> registering 'amethyst' in implementations_quic.json"
     tmp=$(mktemp)
     jq -s '.[0] * .[1]' \
