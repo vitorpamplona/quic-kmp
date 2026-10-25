@@ -186,7 +186,7 @@ class Http3GetClient(
 
     override suspend fun awaitResponse(handle: RequestHandle): GetResponse {
         val stream = (handle as Http3RequestHandle).stream
-        val reader = Http3FrameReader()
+        val reader = Http3FrameReader(streamData = true)
         var status = 0
         val body = mutableListOf<ByteArray>()
         stream.incoming.collect { chunk ->
