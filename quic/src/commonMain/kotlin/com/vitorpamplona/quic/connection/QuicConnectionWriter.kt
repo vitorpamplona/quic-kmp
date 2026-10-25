@@ -1261,6 +1261,19 @@ private fun appendFlowControlUpdates(
         }
     }
 
+    conn.pendingStreamsBlockedBidi?.let {
+        frames +=
+            com.vitorpamplona.quic.frame
+                .StreamsBlockedFrame(bidi = true, maximumStreams = it)
+        conn.pendingStreamsBlockedBidi = null
+    }
+    conn.pendingStreamsBlockedUni?.let {
+        frames +=
+            com.vitorpamplona.quic.frame
+                .StreamsBlockedFrame(bidi = false, maximumStreams = it)
+        conn.pendingStreamsBlockedUni = null
+    }
+
     // PATH_RESPONSE — drain every pending challenge response in one
     // pass. RFC 9000 §13.3 is silent on retransmission for
     // PATH_RESPONSE: it's NOT in the ack-eliciting-and-retransmittable

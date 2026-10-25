@@ -1098,6 +1098,25 @@ class QuicConnection(
     /** The connection limit a DATA_BLOCKED was last sent for (RFC 9000 §4.1); -1 before any. */
     internal var dataBlockedReportedAt: Long = -1L
 
+    /** STREAMS_BLOCKED limits waiting to be sent, and the last ones sent (RFC 9000 §19.14). */
+    internal var pendingStreamsBlockedBidi: Long? = null
+    internal var pendingStreamsBlockedUni: Long? = null
+    private var streamsBlockedReportedBidi: Long = -1L
+    private var streamsBlockedReportedUni: Long = -1L
+
+    /** An open failed on the peer's stream limit: tell it, once per limit. Caller holds [streamsLock]. */
+    private fun noteStreamsBlocked(bidi: Boolean) {
+        if (bidi) {
+            if (streamsBlockedReportedBidi != peerMaxStreamsBidi) {
+                streamsBlockedReportedBidi = peerMaxStreamsBidi
+                pendingStreamsBlockedBidi = peerMaxStreamsBidi
+            }
+        } else if (streamsBlockedReportedUni != peerMaxStreamsUni) {
+            streamsBlockedReportedUni = peerMaxStreamsUni
+            pendingStreamsBlockedUni = peerMaxStreamsUni
+        }
+    }
+
     private var receiveConnectionFlowLimit: Long = config.initialMaxData
 
     /** Streams the peer has opened that we haven't surfaced yet. */
@@ -1879,6 +1898,7 @@ class QuicConnection(
                 "STREAM per packet under multiplex load."
         }
         if (nextLocalBidiIndex >= peerMaxStreamsBidi) {
+            noteStreamsBlocked(bidi = true)
             throw QuicStreamLimitException(
                 "peer-granted bidi stream cap reached " +
                     "(used=$nextLocalBidiIndex limit=$peerMaxStreamsBidi)",
@@ -1913,6 +1933,7 @@ class QuicConnection(
             "openUniStreamLocked requires streamsLock to be held"
         }
         if (nextLocalUniIndex >= peerMaxStreamsUni) {
+            noteStreamsBlocked(bidi = false)
             throw QuicStreamLimitException(
                 "peer-granted uni stream cap reached " +
                     "(used=$nextLocalUniIndex limit=$peerMaxStreamsUni)",

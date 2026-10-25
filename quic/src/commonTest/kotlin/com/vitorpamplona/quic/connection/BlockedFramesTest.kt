@@ -103,6 +103,19 @@ class BlockedFramesTest {
         assertEquals(QuicConnection.Status.HANDSHAKING, client.status)
     }
 
+    @Test
+    fun hitting_the_stream_limit_sends_streams_blocked() {
+        val (client, pipe) = newConnectedClient(maxStreamsBidi = 1)
+        while (drainOutbound(client, 0L) != null) { /* clear */ }
+        runBlocking { client.openBidiStream() }
+        repeat(2) { assertTrue(runCatching { runBlocking { client.openBidiStream() } }.isFailure) }
+        val frames = drainOutbound(client, 0L)?.let { pipe.decryptClientApplicationFrames(it) }.orEmpty()
+        val blocked = frames.filterIsInstance<StreamsBlockedFrame>()
+        assertEquals(1, blocked.size, "once per limit: $frames")
+        assertTrue(blocked.single().bidi)
+        assertEquals(1L, blocked.single().maximumStreams)
+    }
+
     private fun newHandshakingClient() =
         QuicConnection(
             serverName = "example.test",
