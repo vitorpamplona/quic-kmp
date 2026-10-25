@@ -75,6 +75,13 @@ class TlsServer(
     val nowMillisSource: () -> Long = { Clock.System.now().toEpochMilliseconds() },
     /** Deterministic tests only. */
     val fixedKeyPair: X25519KeyPair? = null,
+    /**
+     * Sees the client's QUIC transport parameters as soon as the ClientHello
+     * is read, before anything is sent; a non-null result replaces
+     * [transportParameters] in EncryptedExtensions. The QUIC layer uses it to
+     * switch to a compatible version the client offered (RFC 9368 §2.3).
+     */
+    val onClientTransportParameters: ((ByteArray) -> ByteArray?)? = null,
 ) : TlsHandshake {
     enum class State { WAITING_CLIENT_HELLO, WAITING_CLIENT_FINISHED, CONNECTED, FAILED }
 
@@ -122,6 +129,7 @@ class TlsServer(
     private val keySchedule = TlsKeySchedule(transcript)
     private var negotiatedCipherSuite: Int = -1
     private var ticketNonce: Long = 0L
+    private var sentTransportParameters: ByteArray = transportParameters
 
     override fun pollOutbound(level: TlsClient.Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
@@ -185,6 +193,7 @@ class TlsServer(
         }
         val tp = ch.quicTransportParameters ?: throw TlsAlertException(TlsConstants.ALERT_MISSING_EXTENSION, "ClientHello without quic_transport_parameters")
         peerTransportParameters = tp
+        onClientTransportParameters?.invoke(tp)?.let { sentTransportParameters = it }
         // RFC 9001 §8.1: ALPN is mandatory with QUIC.
         val alpn = alpnSelector(ch.alpns) ?: throw TlsAlertException(TlsConstants.ALERT_NO_APPLICATION_PROTOCOL, "no acceptable ALPN in ${ch.alpns.map { it.decodeToString() }}")
         negotiatedAlpn = alpn
@@ -383,7 +392,7 @@ class TlsServer(
                 writeUint16(TlsConstants.EXT_ALPN)
                 withUint16Length { withUint16Length { writeTlsOpaque1(alpn) } }
                 writeUint16(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS)
-                writeTlsOpaque2(transportParameters)
+                writeTlsOpaque2(sentTransportParameters)
                 if (earlyData) {
                     writeUint16(TlsConstants.EXT_EARLY_DATA)
                     writeUint16(0)

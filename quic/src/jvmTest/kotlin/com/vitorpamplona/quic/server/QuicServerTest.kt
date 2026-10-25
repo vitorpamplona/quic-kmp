@@ -76,12 +76,31 @@ class QuicServerTest {
             toServer.close()
         }
 
-        fun clientSocket(address: UdpPeerAddress): QuicDatagramSocket {
+        /** A client's side; [Rebindable.address] can change like a NAT rebinding would. */
+        inner class Rebindable(
+            address: UdpPeerAddress,
+        ) {
             val inbox = Channel<ByteArray>(Channel.UNLIMITED)
-            synchronized(clients) { clients[address] = inbox }
+
+            @Volatile
+            var address: UdpPeerAddress = address
+                set(value) {
+                    synchronized(clients) { clients[value] = inbox }
+                    field = value
+                }
+
+            init {
+                synchronized(clients) { clients[address] = inbox }
+            }
+        }
+
+        fun clientSocket(address: UdpPeerAddress): QuicDatagramSocket = clientSocket(Rebindable(address))
+
+        fun clientSocket(path: Rebindable): QuicDatagramSocket {
+            val inbox = path.inbox
             return object : QuicDatagramSocket {
                 override suspend fun send(payload: ByteArray): Int {
-                    toServer.trySend(ReceivedDatagram(payload, address))
+                    toServer.trySend(ReceivedDatagram(payload, path.address))
                     return payload.size
                 }
 
@@ -118,6 +137,7 @@ class QuicServerTest {
         network: Network,
         port: Int,
         compatibleVersions: List<Int> = listOf(QuicVersion.V1),
+        path: Network.Rebindable = network.Rebindable(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), port)),
     ): QuicConnection {
         val conn =
             QuicConnection(
@@ -125,14 +145,14 @@ class QuicServerTest {
                 config = QuicConnectionConfig(compatibleVersions = compatibleVersions),
                 tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
             )
-        QuicConnectionDriver(conn, network.clientSocket(UdpPeerAddress(byteArrayOf(10, 0, 0, 1), port)), scope).start()
+        QuicConnectionDriver(conn, network.clientSocket(path), scope).start()
         return conn
     }
 
     private suspend fun echoOnce(
         server: QuicServer,
         client: QuicConnection,
-    ) {
+    ): QuicServerConnection {
         val accepted =
             try {
                 withTimeout(5_000) { assertNotNull(server.accept()) }
@@ -159,11 +179,12 @@ class QuicServerTest {
         request.send.finish()
         val reply = withTimeout(5_000) { request.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
         assertEquals("echo:ping", reply.decodeToString())
+        return accepted
     }
 
     @Test
     fun `a client connects and gets its request echoed`() =
-        runBlocking {
+        runBlocking<Unit> {
             val network = Network()
             val server = server(network)
             val client = client(network, 5000)
@@ -174,7 +195,7 @@ class QuicServerTest {
 
     @Test
     fun `a server requiring Retry validates the client's address first`() =
-        runBlocking {
+        runBlocking<Unit> {
             val network = Network()
             val server = server(network, requireRetry = true)
             val client = client(network, 5001)
@@ -183,7 +204,7 @@ class QuicServerTest {
 
     @Test
     fun `several clients are told apart by connection ID`() =
-        runBlocking {
+        runBlocking<Unit> {
             val network = Network()
             val server = server(network)
             repeat(3) { i -> echoOnce(server, client(network, 6000 + i)) }
@@ -192,7 +213,7 @@ class QuicServerTest {
 
     @Test
     fun `an unsupported version gets Version Negotiation and the client moves to v2`() =
-        runBlocking {
+        runBlocking<Unit> {
             val network = Network()
             val server = server(network, versions = listOf(QuicVersion.V2))
             val client = client(network, 5002, compatibleVersions = listOf(QuicVersion.V1, QuicVersion.V2))
@@ -201,8 +222,47 @@ class QuicServerTest {
         }
 
     @Test
+    fun `a client that starts in v1 and offers v2 is switched to v2 without Version Negotiation`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network, versions = listOf(QuicVersion.V2, QuicVersion.V1))
+            val client = client(network, 5003, compatibleVersions = listOf(QuicVersion.V1, QuicVersion.V2))
+            echoOnce(server, client)
+            assertEquals(QuicVersion.V2, client.currentVersion)
+            assertTrue(network.sentToUnknown.isEmpty)
+        }
+
+    @Test
+    fun `a client that rebinds to a new address is challenged there and followed`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network)
+            val first = UdpPeerAddress(byteArrayOf(10, 0, 0, 1), 5004)
+            val path = network.Rebindable(first)
+            val client = client(network, 5004, path = path)
+            val accepted = echoOnce(server, client)
+            assertEquals(first, accepted.peerAddress)
+
+            val moved = UdpPeerAddress(byteArrayOf(10, 0, 0, 2), 6004)
+            path.address = moved
+            val request = client.openBidiStream()
+            request.send.enqueue("after".encodeToByteArray())
+            request.send.finish()
+            val serverSide = withTimeout(5_000) { assertNotNull(accepted.connection.awaitIncomingPeerStream()) }
+            val body = withTimeout(5_000) { serverSide.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
+            assertEquals("after", body.decodeToString())
+            serverSide.send.enqueue("ok".encodeToByteArray())
+            serverSide.send.finish()
+            accepted.driver.wakeup()
+            val reply = withTimeout(5_000) { request.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
+            assertEquals("ok", reply.decodeToString())
+            assertEquals(moved, accepted.peerAddress)
+            withTimeout(5_000) { while (accepted.connection.peerMigration != null) kotlinx.coroutines.delay(10) }
+        }
+
+    @Test
     fun `a short header packet for an unknown connection gets a smaller stateless reset`() =
-        runBlocking {
+        runBlocking<Unit> {
             val network = Network()
             server(network)
             val from = UdpPeerAddress(byteArrayOf(10, 0, 0, 9), 7000)

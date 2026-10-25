@@ -689,6 +689,7 @@ private fun feedShortHeaderPacket(
         )
     }
     dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
+    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, parsed.packet.packetNumber == state.pnSpace.largestReceived, nowMillis)
 }
 
 /**
@@ -1287,7 +1288,11 @@ private fun dispatchFrames(
                 // A response to a preferred-address probe completes that
                 // migration (RFC 9000 §9.6.1); any path may carry it.
                 val probe = conn.pathProbe
-                if (probe != null && probe.matches(frame.data)) {
+                val migration = conn.peerMigration
+                if (migration != null && migration.challenge.contentEquals(frame.data)) {
+                    // The client's new address answered: it's validated (RFC 9000 §8.2.3).
+                    conn.peerMigration = null
+                } else if (probe != null && probe.matches(frame.data)) {
                     conn.completePreferredAddressMigrationLocked()
                 } else {
                     conn.applyPeerPathResponseLocked(frame.data)

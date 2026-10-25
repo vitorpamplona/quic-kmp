@@ -58,6 +58,13 @@ class CongestionController(
     /** RFC 9002 §B.2 congestion_recovery_start_time; null outside recovery. */
     private var recoveryStartTimeMs: Long? = null
 
+    /** Back to slow start from the initial window: a new path's capacity is unknown (RFC 9000 §9.4). */
+    fun reset() {
+        congestionWindow = initialWindow
+        slowStartThreshold = Long.MAX_VALUE
+        recoveryStartTimeMs = null
+    }
+
     /** Congestion-avoidance byte counter: the window grows one datagram per window's worth acked. */
     private var bytesAckedInAvoidance: Long = 0L
 

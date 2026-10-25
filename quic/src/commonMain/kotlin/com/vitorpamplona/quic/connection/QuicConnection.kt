@@ -222,6 +222,87 @@ class QuicConnection internal constructor(
     /** True for the server side of a connection. */
     val isServer: Boolean get() = serverSetup != null
 
+    /**
+     * Server: the client address we send to. It only moves inside the
+     * writer, with the datagram that carries the new path's PATH_CHALLENGE,
+     * so nothing built for the old path goes to the new one.
+     */
+    @kotlin.concurrent.Volatile
+    internal var sendAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = serverSetup?.peerAddress
+
+    /** Server: where the client's latest packets come from (RFC 9000 §9.3). */
+    internal var peerAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = serverSetup?.peerAddress
+
+    /** Server: the source of the datagram being parsed; the endpoint's socket sets it. */
+    internal var datagramSource: com.vitorpamplona.quic.transport.UdpPeerAddress? = null
+
+    /** Server: the client moved; we're validating its new address (RFC 9000 §9.3). */
+    internal class PeerMigration(
+        val address: com.vitorpamplona.quic.transport.UdpPeerAddress,
+        val previous: com.vitorpamplona.quic.transport.UdpPeerAddress,
+        val challenge: ByteArray,
+        val startedAtMillis: Long,
+    ) {
+        /** The PATH_CHALLENGE still has to go out (first time or after a loss). */
+        var challengePending: Boolean = true
+    }
+
+    internal var peerMigration: PeerMigration? = null
+
+    /**
+     * Server: after a short-header packet from [datagramSource] was
+     * processed. RFC 9000 §9.3: a non-probing packet with the highest packet
+     * number from a new address moves the connection there (NAT rebinding,
+     * or the client migrating); we then validate the new address with a
+     * PATH_CHALLENGE, and start its congestion state over unless only the
+     * port changed (§9.4). Caller holds [streamsLock].
+     */
+    internal fun notePeerAddressLocked(
+        frames: List<com.vitorpamplona.quic.frame.Frame>,
+        largestReceived: Boolean,
+        nowMillis: Long,
+    ) {
+        val src = datagramSource ?: return
+        val current = peerAddress ?: return
+        if (src == current || !largestReceived || !handshakeConfirmed) return
+        val probing =
+            frames.all {
+                it is com.vitorpamplona.quic.frame.PathChallengeFrame ||
+                    it is com.vitorpamplona.quic.frame.PathResponseFrame ||
+                    it is com.vitorpamplona.quic.frame.NewConnectionIdFrame ||
+                    it is com.vitorpamplona.quic.frame.PaddingFrame
+            }
+        if (probing) return
+        peerAddress = src
+        // Returning to the address we were validating away from needs no new challenge.
+        val back = peerMigration?.previous == src
+        peerMigration =
+            if (back) {
+                null
+            } else {
+                PeerMigration(
+                    src,
+                    current,
+                    com.vitorpamplona.crypto.random.RandomInstance
+                        .bytes(8),
+                    nowMillis,
+                )
+            }
+        if (back) sendAddress = src
+        if (!src.ip.contentEquals(current.ip)) congestion.reset()
+        QuicLog.d(TAG) { "peer moved $current -> $src" }
+    }
+
+    /** Server: a migration whose challenge got no answer in time goes back to the old address. */
+    internal fun checkPeerMigrationTimeoutLocked(nowMillis: Long) {
+        val m = peerMigration ?: return
+        if (nowMillis - m.startedAtMillis < 3 * pathProbeRetransmitMillis().coerceAtLeast(PEER_MIGRATION_MIN_TIMEOUT_MS)) return
+        QuicLog.d(TAG) { "no PATH_RESPONSE from ${m.address}; back to ${m.previous}" }
+        peerMigration = null
+        peerAddress = m.previous
+        sendAddress = m.previous
+    }
+
     /** Wakes the driver's send loop; set by [QuicConnectionDriver.start]. */
     @kotlin.concurrent.Volatile
     internal var sendWakeup: (() -> Unit)? = null
@@ -1671,6 +1752,35 @@ class QuicConnection internal constructor(
         currentVersion = chosen
     }
 
+    /**
+     * Server side of compatible version negotiation (RFC 9368 §2.3): given the
+     * client's transport parameters, switch to the most preferred of our
+     * versions the client lists as available, and return our transport
+     * parameters re-encoded with it as the chosen version; null to stay put.
+     * Runs before the first Initial we send, so every packet we send uses
+     * the new version. The client's Initials in its original version keep
+     * opening with the original keys until it switches too.
+     */
+    internal fun chooseCompatibleVersion(clientTransportParameters: ByteArray): ByteArray? {
+        val setup = serverSetup ?: return null
+        val vi =
+            try {
+                TransportParameters.decode(clientTransportParameters).versionInformation
+            } catch (_: com.vitorpamplona.quic.QuicCodecException) {
+                null
+            } ?: return null
+        val chosen = setup.supportedVersions.firstOrNull { it in vi.availableVersions && QuicVersion.isSupported(it) } ?: return null
+        if (chosen == currentVersion) return null
+        originalVersionInitialReceive = initial.receiveProtection
+        val (send, receive) = initialProtections(initialKeysDcid, chosen)
+        initial.sendProtection = send
+        initial.receiveProtection = receive
+        currentVersion = chosen
+        compatibleVersionSwitched = true
+        qlogObserver.onVersionInformation(QuicVersion.name(chosen), setup.supportedVersions.map { QuicVersion.name(it) })
+        return buildLocalTransportParameters().encode()
+    }
+
     /** Our version preference for Version Negotiation: the configured compatible versions, then the rest we speak. */
     private fun versionPreference(): List<Int> = (config.compatibleVersions.filter { QuicVersion.isSupported(it) } + QuicVersion.SUPPORTED).distinct()
 
@@ -1815,7 +1925,7 @@ class QuicConnection internal constructor(
             maxDatagramFrameSize = config.maxDatagramFrameSize,
             versionInformation =
                 if (serverSetup != null) {
-                    VersionInformation(initialVersion, serverSetup.supportedVersions)
+                    VersionInformation(currentVersion, serverSetup.supportedVersions)
                 } else {
                     offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(initialVersion, it) }
                 },
@@ -3901,6 +4011,7 @@ class QuicConnection internal constructor(
                 }
 
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.PathChallenge -> {
+                    peerMigration?.let { if (it.challenge.contentEquals(token.data)) it.challengePending = true }
                     // RFC 9000 §8.2.1: if a PATH_CHALLENGE is lost
                     // (carrying packet declared lost without an
                     // ACK), the spec permits but does not require
@@ -3936,6 +4047,9 @@ class QuicConnection internal constructor(
 
     companion object {
         private const val TAG = "QuicConnection"
+
+        /** Floor on the wait for a migrated client's PATH_RESPONSE before going back. */
+        private const val PEER_MIGRATION_MIN_TIMEOUT_MS = 1_000L
 
         /** RFC 9000 §5.1.1: the connection ID in `preferred_address` has sequence number 1. */
         internal const val PREFERRED_ADDRESS_CID_SEQUENCE: Long = 1L

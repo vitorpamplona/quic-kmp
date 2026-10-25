@@ -51,4 +51,6 @@ internal class QuicServerSetup(
     val onConnectionIdIssued: (ConnectionId) -> Unit = {},
     /** Called when the peer retires one of our connection IDs. */
     val onConnectionIdRetired: (ConnectionId) -> Unit = {},
+    /** Where the client's first Initial came from. */
+    val peerAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? = null,
 )

@@ -133,6 +133,7 @@ fun drainOutbound(
     // budget-elapsed condition reliably. Cheap (one type-cast +
     // time comparison) when the validator is in [PathValidationState.Idle].
     conn.checkPathValidationTimeoutLocked(nowMillis)
+    if (conn.isServer) conn.checkPeerMigrationTimeoutLocked(nowMillis)
 
     // RFC 9000 §5.1.1 + §19.15: once the handshake is confirmed,
     // issue spare source CIDs to the peer so it has DCIDs available
@@ -1369,6 +1370,17 @@ private fun appendFlowControlUpdates(
         val payload = conn.pathValidator.pendingChallenges.removeFirst()
         frames += PathChallengeFrame(payload)
         tokens += RecoveryToken.PathChallenge(payload)
+    }
+
+    // RFC 9000 §9.3: a server's first packet to a client's new address
+    // challenges it; the address switch rides with that packet.
+    conn.peerMigration?.let { m ->
+        if (m.challengePending) {
+            m.challengePending = false
+            frames += PathChallengeFrame(m.challenge)
+            tokens += RecoveryToken.PathChallenge(m.challenge)
+            conn.sendAddress = m.address
+        }
     }
 
     if (conn.pendingHandshakeDone) {

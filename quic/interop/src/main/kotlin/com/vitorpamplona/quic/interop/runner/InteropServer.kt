@@ -71,6 +71,9 @@ private val SERVER_TESTCASES =
         "handshakecorruption",
         "transfercorruption",
         "ipv6",
+        "v2",
+        "rebind-port",
+        "rebind-addr",
         "goodput",
         "crosstraffic",
     )

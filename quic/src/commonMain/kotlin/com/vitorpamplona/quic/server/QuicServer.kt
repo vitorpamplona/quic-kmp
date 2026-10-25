@@ -55,7 +55,7 @@ class QuicServerConnection internal constructor(
     private val socket: ServerPeerSocket,
 ) {
     /** The client's current address. */
-    val peerAddress: UdpPeerAddress get() = socket.peer
+    val peerAddress: UdpPeerAddress get() = connection.sendAddress ?: socket.peer
 
     /** The TLS server of this connection: SNI, ALPN, resumption, client random. */
     val tls: TlsServer get() = connection.tlsServer!!
@@ -190,6 +190,7 @@ class QuicServer(
                         maxEarlyDataSize = if (config.ticketKeys != null) config.maxEarlyDataSize else 0L,
                         quicVersion = { connRef?.currentVersion ?: header.version },
                         nowMillisSource = epochMillis,
+                        onClientTransportParameters = { tp -> connRef?.chooseCompatibleVersion(tp) },
                     )
                 },
                 originalDestinationConnectionId = odcid,
@@ -202,6 +203,7 @@ class QuicServer(
                 supportedVersions = config.supportedVersions,
                 onConnectionIdIssued = { cid -> synchronized(lock) { routes[cid] = socket } },
                 onConnectionIdRetired = { cid -> synchronized(lock) { if (routes[cid] === socket) routes.remove(cid) } },
+                peerAddress = d.from,
             )
         val conn =
             QuicConnection(
@@ -343,22 +345,29 @@ internal class ServerPeerSocket(
     @kotlin.concurrent.Volatile var peer: UdpPeerAddress,
 ) : QuicDatagramSocket {
     var owner: QuicServerConnection? = null
-    private val inbox = Channel<ByteArray>(INBOX_CAPACITY)
+    private val inbox = Channel<ReceivedDatagram>(INBOX_CAPACITY)
     private var datagrams = 0L
     private var bytes = 0L
 
     /** Queue a datagram for the connection; dropped like a full socket buffer would when it lags. */
     fun deliver(d: ReceivedDatagram) {
-        inbox.trySend(d.payload)
+        inbox.trySend(d)
     }
 
-    override suspend fun send(payload: ByteArray): Int = transport.send(payload, peer)
+    /** To where the connection last pointed us: it moves only with a new path's PATH_CHALLENGE. */
+    override suspend fun send(payload: ByteArray): Int = transport.send(payload, owner?.connection?.sendAddress ?: peer)
 
-    override suspend fun receive(): ByteArray? =
-        inbox.receiveCatching().getOrNull()?.also {
-            datagrams++
-            bytes += it.size
-        }
+    /**
+     * The next datagram, after telling the connection where it came from
+     * (the read loop parses it next, so the two can't interleave).
+     */
+    override suspend fun receive(): ByteArray? {
+        val d = inbox.receiveCatching().getOrNull() ?: return null
+        datagrams++
+        bytes += d.payload.size
+        owner?.connection?.datagramSource = d.from
+        return d.payload
+    }
 
     override fun close() {
         inbox.close()
