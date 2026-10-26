@@ -1,7 +1,7 @@
 # quic-kmp
 
-A from-scratch, pure-Kotlin QUIC v1 + HTTP/3 + QPACK + WebTransport client, published to Maven
-Central as `com.vitorpamplona.quic:quic`. It started inside
+A from-scratch, pure-Kotlin QUIC (v1 and v2) client and server with HTTP/3, QPACK and WebTransport,
+published to Maven Central as `com.vitorpamplona.quic:quic`. It started inside
 [Amethyst](https://github.com/vitorpamplona/amethyst) (as `:quic`). Its consumers are Amethyst's
 `nestsClient` (audio rooms over MoQ/WebTransport) and marmot-kmp's `marmot-quic` (Marmot agent
 streams over raw QUIC, its own ALPNs). Neither protocol belongs here: MoQ stays in `nestsClient`,
