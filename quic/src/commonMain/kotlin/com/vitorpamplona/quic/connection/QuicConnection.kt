@@ -1481,6 +1481,9 @@ class QuicConnection internal constructor(
     /** A server owes the client HANDSHAKE_DONE (RFC 9001 §4.1.2), first send or after a loss. */
     internal var pendingHandshakeDone: Boolean = false
 
+    /** Server: the client ACKed a HANDSHAKE_DONE; until then each PTO probe carries it again. */
+    internal var handshakeDoneAcked: Boolean = false
+
     /**
      * RFC 9002 §6.2.2 consecutive PTO count. Incremented on each
      * PTO expiration without an intervening ACK; reset to 0 when an
@@ -4227,7 +4230,6 @@ class QuicConnection internal constructor(
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewConnectionId,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.PathChallenge,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.RetireConnectionId,
-                com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewToken,
                 -> {
                     // Flow-control extensions, NEW_CONNECTION_ID,
@@ -4240,6 +4242,10 @@ class QuicConnection internal constructor(
                     // that's NOT path validation success. Validation
                     // requires the matching PATH_RESPONSE
                     // (handled in [applyPeerPathResponseLocked]).
+                }
+
+                com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone -> {
+                    handshakeDoneAcked = true
                 }
 
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.ResetStream -> {

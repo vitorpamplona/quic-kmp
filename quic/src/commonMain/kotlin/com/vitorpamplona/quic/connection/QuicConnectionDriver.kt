@@ -773,6 +773,12 @@ internal suspend fun requeueInflightForProbe(conn: QuicConnection) {
     // requires streamsLock — `openBidiStream` and friends mutate it under
     // the same lock, so unlocked iteration races with stream creation.
     if (conn.application.sendProtection != null) {
+        // RFC 9002 §6.2.4: a probe carries data in flight. HANDSHAKE_DONE
+        // gates the client's handshake confirmation: until it arrives
+        // ngtcp2's client probes only with Handshake packets, which a
+        // server that has dropped its Handshake keys can't read, and never
+        // resends its request.
+        if (conn.isServer && conn.handshakeConfirmed && !conn.handshakeDoneAcked) conn.pendingHandshakeDone = true
         conn.streamsLock.withLock {
             conn.requeueAllInflightStreamData()
             conn.requeueAllInflightCrypto(EncryptionLevel.APPLICATION)

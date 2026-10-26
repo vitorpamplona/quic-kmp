@@ -336,4 +336,26 @@ class ServerConnectionTest {
             val body = withTimeout(2_000) { accepted.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
             assertEquals("GET /index.html\r\n", body.decodeToString())
         }
+
+    @Test
+    fun `a PTO probe carries HANDSHAKE_DONE again until the client acknowledges it`() =
+        runBlocking {
+            // ngtcp2 in handshakecorruption: our HANDSHAKE_DONE was lost twice, the
+            // probes were bare PINGs, and the client never confirmed its handshake.
+            val client = client()
+            client.start()
+            val server = serverFor(client)
+            while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+            while (true) feedDatagram(client, drainOutbound(server, now) ?: break, now)
+            while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+            assertTrue(server.handshakeConfirmed)
+            // Everything the server sends now, HANDSHAKE_DONE included, is lost.
+            while (true) drainOutbound(server, now) ?: break
+            assertTrue(!client.handshakeConfirmed)
+
+            now += 1_000
+            handlePtoFired(server)
+            while (true) feedDatagram(client, drainOutbound(server, now) ?: break, now)
+            assertTrue(client.handshakeConfirmed, "the probe carried HANDSHAKE_DONE")
+        }
 }
