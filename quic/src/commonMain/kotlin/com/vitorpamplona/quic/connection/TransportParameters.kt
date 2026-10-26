@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 import com.vitorpamplona.quic.Varint
@@ -50,6 +51,112 @@ object TransportParameterId {
 
     /** RFC 9221 — `max_datagram_frame_size`. */
     const val MAX_DATAGRAM_FRAME_SIZE: Long = 0x20
+
+    /** RFC 9368 §3 — `version_information`. */
+    const val VERSION_INFORMATION: Long = 0x11
+
+    /** draft-ietf-quic-ack-frequency §3: the smallest ACK delay we can do, in microseconds. */
+    const val MIN_ACK_DELAY: Long = 0xff04de1bL
+}
+
+/**
+ * RFC 9000 §18.2 `preferred_address`: a server address (per family) the client
+ * may migrate to once the handshake is confirmed, plus the connection ID
+ * (sequence number 1, §5.1.1) and stateless-reset token to use there.
+ */
+class PreferredAddress(
+    val ipv4Address: ByteArray,
+    val ipv4Port: Int,
+    val ipv6Address: ByteArray,
+    val ipv6Port: Int,
+    val connectionId: ByteArray,
+    val statelessResetToken: ByteArray,
+) {
+    /** Dotted-quad IPv4 address, or null when the server offered none (all-zero address or port). */
+    val ipv4Host: String?
+        get() =
+            if (ipv4Port == 0 || ipv4Address.all { it == 0.toByte() }) {
+                null
+            } else {
+                ipv4Address.joinToString(".") { (it.toInt() and 0xFF).toString() }
+            }
+
+    /** Colon-hex IPv6 address, or null when the server offered none. */
+    val ipv6Host: String?
+        get() =
+            if (ipv6Port == 0 || ipv6Address.all { it == 0.toByte() }) {
+                null
+            } else {
+                (0 until 8).joinToString(":") { i ->
+                    (((ipv6Address[2 * i].toInt() and 0xFF) shl 8) or (ipv6Address[2 * i + 1].toInt() and 0xFF)).toString(16)
+                }
+            }
+
+    fun encode(): ByteArray {
+        val w = QuicWriter()
+        w.writeBytes(ipv4Address)
+        w.writeUint16(ipv4Port)
+        w.writeBytes(ipv6Address)
+        w.writeUint16(ipv6Port)
+        w.writeByte(connectionId.size)
+        w.writeBytes(connectionId)
+        w.writeBytes(statelessResetToken)
+        return w.toByteArray()
+    }
+
+    companion object {
+        fun decode(bytes: ByteArray): PreferredAddress {
+            val r = QuicReader(bytes)
+            val v4 = r.readBytes(4)
+            val v4Port = r.readUint16()
+            val v6 = r.readBytes(16)
+            val v6Port = r.readUint16()
+            val cidLen = r.readByte()
+            // §18.2: a server that uses zero-length connection IDs MUST NOT send a preferred address.
+            if (cidLen !in 1..20) throw QuicCodecException("preferred_address connection ID length $cidLen")
+            val cid = r.readBytes(cidLen)
+            val token = r.readBytes(16)
+            if (r.hasMore()) throw QuicCodecException("preferred_address has ${r.remaining} trailing bytes")
+            return PreferredAddress(v4, v4Port, v6, v6Port, cid, token)
+        }
+    }
+}
+
+/**
+ * RFC 9368 §3 Version Information: the version the sender chose for the
+ * connection, plus the versions it offers (client) or has fully deployed
+ * (server).
+ */
+data class VersionInformation(
+    val chosenVersion: Int,
+    val availableVersions: List<Int>,
+) {
+    fun encode(): ByteArray {
+        val w = QuicWriter()
+        w.writeUint32(chosenVersion)
+        for (v in availableVersions) w.writeUint32(v)
+        return w.toByteArray()
+    }
+
+    companion object {
+        /**
+         * RFC 9368 §4: a length that isn't a positive multiple of four, or a zero
+         * version anywhere, is a parsing failure (TRANSPORT_PARAMETER_ERROR).
+         */
+        fun decode(bytes: ByteArray): VersionInformation {
+            if (bytes.isEmpty() || bytes.size % 4 != 0) {
+                throw QuicCodecException("version_information length ${bytes.size} is not a positive multiple of 4")
+            }
+            val r = QuicReader(bytes)
+            val chosen = r.readUint32().toInt()
+            val available = ArrayList<Int>(bytes.size / 4 - 1)
+            while (r.hasMore()) available += r.readUint32().toInt()
+            if (chosen == 0 || available.any { it == 0 }) {
+                throw QuicCodecException("version_information carries version 0")
+            }
+            return VersionInformation(chosen, available)
+        }
+    }
 }
 
 /**
@@ -96,6 +203,10 @@ data class TransportParameters(
     val statelessResetToken: ByteArray? = null,
     val maxDatagramFrameSize: Long? = null,
     val unknown: Map<Long, ByteArray> = emptyMap(),
+    val versionInformation: VersionInformation? = null,
+    val preferredAddress: PreferredAddress? = null,
+    /** draft-ietf-quic-ack-frequency `min_ack_delay`, microseconds; non-null means ACK_FREQUENCY is welcome. */
+    val minAckDelayMicros: Long? = null,
 ) {
     fun encode(): ByteArray {
         val w = QuicWriter()
@@ -140,6 +251,9 @@ data class TransportParameters(
         retrySourceConnectionId?.let { writeBytesParam(TransportParameterId.RETRY_SOURCE_CONNECTION_ID, it) }
         statelessResetToken?.let { writeBytesParam(TransportParameterId.STATELESS_RESET_TOKEN, it) }
         maxDatagramFrameSize?.let { writeVarintParam(TransportParameterId.MAX_DATAGRAM_FRAME_SIZE, it) }
+        versionInformation?.let { writeBytesParam(TransportParameterId.VERSION_INFORMATION, it.encode()) }
+        preferredAddress?.let { writeBytesParam(TransportParameterId.PREFERRED_ADDRESS, it.encode()) }
+        minAckDelayMicros?.let { writeVarintParam(TransportParameterId.MIN_ACK_DELAY, it) }
         for ((id, bytes) in unknown) writeBytesParam(id, bytes)
 
         return w.toByteArray()
@@ -158,6 +272,7 @@ data class TransportParameters(
             var maxUdpPayloadSize: Long? = null
             var ackDelayExponent: Long? = null
             var maxAckDelay: Long? = null
+            var minAckDelayMicros: Long? = null
             var activeConnectionIdLimit: Long? = null
             var disableActiveMigration = false
             var initialSourceConnectionId: ByteArray? = null
@@ -165,6 +280,8 @@ data class TransportParameters(
             var retrySourceConnectionId: ByteArray? = null
             var statelessResetToken: ByteArray? = null
             var maxDatagramFrameSize: Long? = null
+            var versionInformation: VersionInformation? = null
+            var preferredAddress: PreferredAddress? = null
             val unknown = mutableMapOf<Long, ByteArray>()
 
             while (r.hasMore()) {
@@ -189,6 +306,9 @@ data class TransportParameters(
                     TransportParameterId.RETRY_SOURCE_CONNECTION_ID -> retrySourceConnectionId = sub.src.copyOfRange(0, len)
                     TransportParameterId.STATELESS_RESET_TOKEN -> statelessResetToken = sub.src.copyOfRange(0, len)
                     TransportParameterId.MAX_DATAGRAM_FRAME_SIZE -> maxDatagramFrameSize = sub.readVarint()
+                    TransportParameterId.VERSION_INFORMATION -> versionInformation = VersionInformation.decode(sub.src.copyOfRange(0, len))
+                    TransportParameterId.PREFERRED_ADDRESS -> preferredAddress = PreferredAddress.decode(sub.src.copyOfRange(0, len))
+                    TransportParameterId.MIN_ACK_DELAY -> minAckDelayMicros = sub.readVarint()
                     else -> unknown[id] = sub.src.copyOfRange(0, len)
                 }
             }
@@ -203,6 +323,7 @@ data class TransportParameters(
                 maxUdpPayloadSize = maxUdpPayloadSize,
                 ackDelayExponent = ackDelayExponent,
                 maxAckDelay = maxAckDelay,
+                minAckDelayMicros = minAckDelayMicros,
                 activeConnectionIdLimit = activeConnectionIdLimit,
                 disableActiveMigration = disableActiveMigration,
                 initialSourceConnectionId = initialSourceConnectionId,
@@ -211,6 +332,8 @@ data class TransportParameters(
                 statelessResetToken = statelessResetToken,
                 maxDatagramFrameSize = maxDatagramFrameSize,
                 unknown = unknown,
+                versionInformation = versionInformation,
+                preferredAddress = preferredAddress,
             )
         }
     }

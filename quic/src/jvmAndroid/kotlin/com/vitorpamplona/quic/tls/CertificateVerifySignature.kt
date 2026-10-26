@@ -62,6 +62,18 @@ internal object CertificateVerifySignature {
         }
     }
 
+    /** Server side: sign the CertificateVerify [content] (already built per RFC 8446 §4.4.3). */
+    fun sign(
+        privateKey: java.security.PrivateKey,
+        signatureAlgorithm: Int,
+        content: ByteArray,
+    ): ByteArray {
+        val sig = jcaSignatureFor(signatureAlgorithm)
+        sig.initSign(privateKey)
+        sig.update(content)
+        return sig.sign()
+    }
+
     private fun jcaSignatureFor(algorithm: Int): Signature =
         when (algorithm) {
             TlsConstants.SIG_ECDSA_SECP256R1_SHA256 -> {

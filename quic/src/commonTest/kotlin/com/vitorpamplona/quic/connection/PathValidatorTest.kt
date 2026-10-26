@@ -56,6 +56,23 @@ class PathValidatorTest {
     }
 
     @Test
+    fun resentOfferForARetiredCidStaysOutOfThePool() {
+        // quinn resent a lost NEW_CONNECTION_ID for a CID we had already moved
+        // past and retired; putting it back in the pool made us use it, and
+        // quinn answered with a stateless reset.
+        val v = PathValidator()
+        val cid1 = ByteArray(8) { 0x01 }
+        val tok1 = ByteArray(16) { 0x10 }
+        v.recordPeerNewConnectionId(1L, 0L, cid1, tok1)
+        v.recordPeerNewConnectionId(2L, 0L, ByteArray(8) { 0x02 }, ByteArray(16) { 0x20 })
+        v.adoptConnectionId(2L)
+        v.queueRetireSequence(1L)
+        assertEquals(PathValidator.RecordResult.Duplicate, v.recordPeerNewConnectionId(1L, 0L, cid1, tok1))
+        assertEquals(PathValidator.RecordResult.Duplicate, v.recordPeerNewConnectionId(0L, 0L, ByteArray(8) { 0x00 }, ByteArray(16)))
+        assertTrue(1L !in v.unusedSequences() && 0L !in v.unusedSequences())
+    }
+
+    @Test
     fun duplicateOfferWithDifferentBytesIsProtocolViolation() {
         val v = PathValidator()
         val seq = 2L

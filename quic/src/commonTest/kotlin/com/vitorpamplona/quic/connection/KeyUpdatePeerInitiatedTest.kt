@@ -303,6 +303,29 @@ class KeyUpdatePeerInitiatedTest {
             assertEquals(QuicConnection.Status.CONNECTED, client.status)
         }
 
+    @Test
+    fun `next-phase keys are derived once per receive secret`() =
+        runBlocking {
+            val (client, pipe) = newConnectedClient()
+            val first = client.deriveNextPhaseReceiveKeys()
+            assertNotNull(first)
+            assertTrue(first === client.deriveNextPhaseReceiveKeys(), "a second lookup reuses the keys")
+
+            // The cached keys still open the peer's rotated packet, and the
+            // rotation moves the cache on to the following phase.
+            pipe.rotateServerApplicationKeys()
+            feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(PingFrame))!!, nowMillis = 0L)
+            assertEquals(true, client.currentReceiveKeyPhase)
+            val second = client.deriveNextPhaseReceiveKeys()
+            assertNotNull(second)
+            assertTrue(second !== first, "the next phase has its own keys")
+
+            pipe.rotateServerApplicationKeys()
+            feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(PingFrame))!!, nowMillis = 0L)
+            assertEquals(false, client.currentReceiveKeyPhase)
+            assertEquals(QuicConnection.Status.CONNECTED, client.status)
+        }
+
     /**
      * Read the unprotected KEY_PHASE bit out of a packet so the test
      * can assert the wire shape independent of the client's

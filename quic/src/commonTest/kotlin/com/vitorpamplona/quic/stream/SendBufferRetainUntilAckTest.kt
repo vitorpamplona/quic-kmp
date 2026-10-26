@@ -249,6 +249,24 @@ class SendBufferRetainUntilAckTest {
     }
 
     @Test
+    fun fullyAcked_waitsForALostRangeBeforeTheFin() {
+        val buf = SendBuffer()
+        buf.enqueue("AAAA".encodeToByteArray())
+        buf.takeChunk(1024) // [0, 4)
+        buf.enqueue("BBBB".encodeToByteArray())
+        buf.finish()
+        buf.takeChunk(1024) // [4, 8) + FIN
+        buf.markLost(offset = 0L, length = 4L, fin = false)
+        buf.markAcked(offset = 4L, length = 4L)
+        assertTrue(buf.finAcked)
+        assertEquals(false, buf.fullyAcked, "bytes [0, 4) still wait for their retransmit")
+        buf.takeChunk(1024) // retransmit [0, 4)
+        assertEquals(false, buf.fullyAcked, "the retransmit is in flight")
+        buf.markAcked(offset = 0L, length = 4L)
+        assertTrue(buf.fullyAcked)
+    }
+
+    @Test
     fun readableBytes_reflectsRetransmitPlusFresh() {
         val buf = SendBuffer()
         buf.enqueue("AAAA".encodeToByteArray())

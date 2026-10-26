@@ -29,7 +29,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Step 3 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 3 of `plans/2026-05-04-control-frame-retransmit.md`:
  * `drainAckedSentPackets` removes SentPacket entries for every packet
  * number covered by an inbound `AckFrame`'s ranges (RFC 9000
  * §19.3.1). Equivalent in scope to the `remove_acked` test in

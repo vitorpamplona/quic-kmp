@@ -12,9 +12,9 @@ Marmot's binding in marmot-kmp.
 - `quic/` — the library. `commonMain` holds the protocol (connection, recovery, frames, packets,
   TLS 1.3 state machine, HTTP/3, QPACK, WebTransport); `jvmAndroid` holds the JCA AEADs, the
   certificate validators and the UDP socket. Targets: `jvm` and `android` only.
-- `quic/interop/` — `:quic-interop`, the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
+- `interop/` — `:quic-interop`, the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
   endpoint (JVM app + Docker image). Never published.
-- `quic/plans/`, `quic/interop/plans/` — design notes, `YYYY-MM-DD-<slug>.md`.
+- `plans/`, `interop/plans/` — design notes, `YYYY-MM-DD-<slug>.md`.
 
 ## Rules
 
@@ -40,7 +40,7 @@ Marmot's binding in marmot-kmp.
   `./gradlew :quic:jvmTest :quic:testAndroidHostTest :quic-interop:test` (the pre-push hook runs
   these plus the `commonMain` check).
   Changes that can affect wire bytes, congestion control or the TLS state machine should also run
-  the interop matrix (`quic/interop/run-matrix.sh`, one peer at a time).
+  the interop matrix (`interop/run-matrix.sh`, one peer at a time).
 - Commits: conventional commits (`feat:`, `fix:`, …). Never `--no-verify`.
 
 ## Releasing

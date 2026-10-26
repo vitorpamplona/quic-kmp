@@ -234,7 +234,18 @@ class PathValidator(
      * RETIRE_CONNECTION_ID via [pendingRetireSequences].
      */
     var activeCidSequence: Long = 0L
-        private set
+        private set(value) {
+            field = value
+            consumedSequences += value
+        }
+
+    /**
+     * Sequence numbers we've used or retired. The peer resends a lost
+     * NEW_CONNECTION_ID, and one for a CID we retired since must not go back
+     * into the pool: quinn answered our next packet on it with a stateless
+     * reset.
+     */
+    private val consumedSequences = HashSet<Long>().also { it += 0L }
 
     /**
      * Sequence numbers of CIDs we owe the peer a
@@ -386,14 +397,9 @@ class PathValidator(
         // dropped doesn't survive on a stale entry.
         if (effectiveRetirePriorTo > retirePriorToWatermark) {
             retirePriorToWatermark = effectiveRetirePriorTo
-            val it = unusedCids.entries.iterator()
-            while (it.hasNext()) {
-                val (seq, _) = it.next()
-                if (seq < retirePriorToWatermark) {
-                    queueRetireSequence(seq)
-                    it.remove()
-                }
-            }
+            for (seq in unusedCids.keys.filter { it < retirePriorToWatermark }) queueRetireSequence(seq)
+            // The watermark check below now answers for these.
+            consumedSequences.removeAll { it < retirePriorToWatermark && it != activeCidSequence }
         }
 
         // Stale offer: the peer is pushing a sequence number we've
@@ -403,6 +409,9 @@ class PathValidator(
             queueRetireSequence(sequenceNumber)
             return RecordResult.AlreadyRetired
         }
+
+        // A resent offer for a CID we've used or retired since.
+        if (sequenceNumber in consumedSequences && sequenceNumber !in unusedCids) return RecordResult.Duplicate
 
         // Duplicate handling.
         val existing = unusedCids[sequenceNumber]
@@ -454,6 +463,9 @@ class PathValidator(
      * already there and is a no-op.
      */
     fun queueRetireSequence(sequenceNumber: Long) {
+        // A retired CID is never used again.
+        consumedSequences += sequenceNumber
+        unusedCids.remove(sequenceNumber)
         if (!pendingRetireSequences.contains(sequenceNumber)) {
             pendingRetireSequences.addLast(sequenceNumber)
         }
@@ -526,6 +538,22 @@ class PathValidator(
                 priorPtoMillis = currentPtoMillis,
             )
         return PathMigrationResult.Started
+    }
+
+    /**
+     * Start stamping the connection ID with [sequenceNumber], which didn't
+     * come through the unused pool (the preferred address's CID, RFC 9000
+     * §9.6), and queue the one in use until now for retirement. Abandons any
+     * CID-rotation validation in progress: the new path supersedes it.
+     */
+    internal fun adoptConnectionId(sequenceNumber: Long) {
+        val prior = activeCidSequence
+        if (prior != sequenceNumber) queueRetireSequence(prior)
+        activeCidSequence = sequenceNumber
+        if (state is PathValidationState.Validating) {
+            pendingChallenges.clear()
+            state = PathValidationState.Idle
+        }
     }
 
     /**
@@ -603,7 +631,7 @@ class PathValidator(
      * packet carries both the RETIRE frame AND the now-retired
      * CID as its destination — quic-go / picoquic / msquic /
      * mvfst correctly read that as PROTOCOL_VIOLATION (see
-     * `quic/plans/2026-05-08-rebind-port-bug.md`).
+     * `plans/2026-05-08-rebind-port-bug.md`).
      *
      * So on timeout we have two cases:
      *

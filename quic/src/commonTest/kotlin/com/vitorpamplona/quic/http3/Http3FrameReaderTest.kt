@@ -144,4 +144,35 @@ class Http3FrameReaderTest {
             }
         }
     }
+
+    @Test
+    fun streamed_data_frames_can_exceed_the_frame_cap() {
+        val body = ByteArray(3_000_000) { (it % 251).toByte() }
+        val w = QuicWriter()
+        w.writeVarint(Http3FrameType.DATA)
+        w.writeVarint(body.size.toLong())
+        w.writeBytes(body)
+        w.writeVarint(Http3FrameType.HEADERS)
+        w.writeVarint(2)
+        w.writeBytes(byteArrayOf(0, 0))
+        val wire = w.toByteArray()
+        val reader = Http3FrameReader(streamData = true)
+        val out = ArrayList<ByteArray>()
+        var headers = 0
+        var off = 0
+        while (off < wire.size) {
+            val n = minOf(1200, wire.size - off)
+            reader.push(wire.copyOfRange(off, off + n))
+            off += n
+            while (true) {
+                when (val f = reader.next() ?: break) {
+                    is Http3Frame.Data -> out += f.body
+                    is Http3Frame.Headers -> headers++
+                    else -> {}
+                }
+            }
+        }
+        assertEquals(1, headers)
+        assertContentEquals(body, out.fold(ByteArray(0)) { a, b -> a + b })
+    }
 }

@@ -65,7 +65,7 @@ import kotlin.time.Clock
  *
  * The actual UDP socket I/O is in the higher-level [QuicConnectionDriver].
  */
-class QuicConnection(
+class QuicConnection internal constructor(
     val serverName: String,
     val config: QuicConnectionConfig,
     /**
@@ -120,6 +120,7 @@ class QuicConnection(
     val cipherSuites: IntArray =
         intArrayOf(
             TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
     /**
@@ -165,11 +166,332 @@ class QuicConnection(
      * latest.
      */
     val onResumptionTicket: ((com.vitorpamplona.quic.tls.TlsResumptionState) -> Unit)? = null,
+    /**
+     * RFC 9000 §8.1.3: a token a previous connection to this server received
+     * in a NEW_TOKEN frame ([onNewToken]). Sent in the first Initial so the
+     * server can validate our address without a Retry round trip. A Retry
+     * token replaces it. Tokens are bound to the QUIC version that issued
+     * them (RFC 9369 §5).
+     */
+    val addressValidationToken: ByteArray? = null,
+    /** Called with each NEW_TOKEN the server sends, for a future [addressValidationToken]. */
+    val onNewToken: ((ByteArray) -> Unit)? = null,
+    /**
+     * Non-null for the server side of a connection, which [QuicServer] builds;
+     * null for a client.
+     */
+    internal val serverSetup: QuicServerSetup?,
 ) {
-    val sourceConnectionId: ConnectionId = ConnectionId.random(8)
-    var destinationConnectionId: ConnectionId = ConnectionId.random(8)
+    /** A client connection to [serverName]. */
+    constructor(
+        serverName: String,
+        config: QuicConnectionConfig,
+        tlsCertificateValidator: com.vitorpamplona.quic.tls.CertificateValidator,
+        nowMillis: () -> Long = defaultMonotonicNowMillis(),
+        epochMillis: () -> Long = { defaultEpochMillis() },
+        alpnList: List<ByteArray> = listOf(TlsConstants.ALPN_H3),
+        extraSecretsListener: TlsSecretsListener? = null,
+        cipherSuites: IntArray =
+            intArrayOf(
+                TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+                TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
+                TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
+            ),
+        initialVersion: Int = QuicVersion.V1,
+        qlogObserver: QlogObserver = QlogObserver.NoOp,
+        resumption: com.vitorpamplona.quic.tls.TlsResumptionState? = null,
+        onResumptionTicket: ((com.vitorpamplona.quic.tls.TlsResumptionState) -> Unit)? = null,
+        addressValidationToken: ByteArray? = null,
+        onNewToken: ((ByteArray) -> Unit)? = null,
+    ) : this(
+        serverName,
+        config,
+        tlsCertificateValidator,
+        nowMillis,
+        epochMillis,
+        alpnList,
+        extraSecretsListener,
+        cipherSuites,
+        initialVersion,
+        qlogObserver,
+        resumption,
+        onResumptionTicket,
+        addressValidationToken,
+        onNewToken,
+        serverSetup = null,
+    )
+
+    /** True for the server side of a connection. */
+    val isServer: Boolean get() = serverSetup != null
+
+    /**
+     * Server: the path we send on. It only moves inside the writer, with the
+     * datagram that carries the new path's PATH_CHALLENGE, so nothing built
+     * for the old path goes to the new one.
+     */
+    @kotlin.concurrent.Volatile
+    internal var sendPath: ServerPath? = serverSetup?.peerAddress?.let { ServerPath(0, it) }
+
+    /** Server: the client address we send to. */
+    internal val sendAddress: com.vitorpamplona.quic.transport.UdpPeerAddress? get() = sendPath?.peer
+
+    /** Server: the path the client's latest packets came on (RFC 9000 §9.3). */
+    internal var peerPath: ServerPath? = sendPath
+
+    /** Server: the path of the datagram being parsed; the endpoint's socket sets it. */
+    internal var datagramPath: ServerPath? = null
+
+    /**
+     * Server: 1-RTT packets that came before the handshake completed, kept
+     * (RFC 9001 §5.7 allows it) and read once it has. A client sends its
+     * request right after its Finished; with the Finished lost, dropping the
+     * request left lsquic's client waiting out its own retransmit timer.
+     */
+    internal val earlyShortHeaderPackets = ArrayList<EarlyShortHeaderPacket>()
+
+    internal class EarlyShortHeaderPacket(
+        val bytes: ByteArray,
+        val path: NetworkPath,
+    )
+
+    /** Bytes held in [earlyShortHeaderPackets]. */
+    internal var earlyShortHeaderBytes: Int = 0
+
+    /** Server: the client moved; we're validating its new path (RFC 9000 §9.3). */
+    internal class PeerMigration(
+        val path: ServerPath,
+        val previous: ServerPath,
+        val challenge: ByteArray,
+        val startedAtMillis: Long,
+        /** RFC 9000 §8 / §9.3: bytes from the new address, which bound what we send there until it validates. */
+        var received: Long,
+    ) {
+        /** The PATH_CHALLENGE still has to go out (first time or after a loss). */
+        var challengePending: Boolean = true
+
+        /** Bytes we sent to the new address. */
+        var sent: Long = 0L
+    }
+
+    /**
+     * Server: the largest datagram we may send right now on a path a client
+     * moved to and that isn't validated yet — three times what came from
+     * there, less what we sent (RFC 9000 §9.3); [Long.MAX_VALUE] otherwise.
+     */
+    internal fun migrationSendAllowance(): Long {
+        val m = peerMigration ?: return Long.MAX_VALUE
+        return 3L * m.received - m.sent
+    }
+
+    internal var peerMigration: PeerMigration? = null
+
+    /** Server: PATH_RESPONSEs owed on paths other than [sendPath], with the path to send each on. */
+    internal val serverProbeResponses = ArrayDeque<Pair<ServerPath, ByteArray>>()
+
+    /**
+     * Server: the PATH_CHALLENGE that rode with our PATH_RESPONSE on a path the
+     * client probed (RFC 9000 §8.2), so the client's address there is validated
+     * before it moves (it probes our preferred address first, §9.6).
+     */
+    internal val serverPathChallenges = HashMap<ServerPath, ByteArray>()
+
+    /**
+     * Server: paths whose challenge was answered, with when; a client moving
+     * to one within [RECENTLY_VALIDATED_MS] is followed at once (RFC 9000
+     * §9.3 skips validation only for an address seen recently).
+     */
+    internal val validatedServerPaths = HashMap<ServerPath, Long>()
+
+    private fun recentlyValidated(
+        path: ServerPath,
+        nowMillis: Long,
+    ): Boolean = validatedServerPaths[path]?.let { nowMillis - it <= RECENTLY_VALIDATED_MS } == true
+
+    /** Server: the PATH_CHALLENGE to send with a probe response on [path], or null for none. */
+    internal fun serverPathChallengeFor(path: ServerPath): ByteArray? {
+        if (path == sendPath || recentlyValidated(path, nowMillis())) return null
+        serverPathChallenges[path]?.let { return it }
+        // Unanswered probes (a client churning NAT ports) start over rather than turn this off for good.
+        if (serverPathChallenges.size >= MAX_PENDING_PATH_RESPONSES) serverPathChallenges.clear()
+        return com.vitorpamplona.crypto.random.RandomInstance
+            .bytes(8)
+            .also { serverPathChallenges[path] = it }
+    }
+
+    /** Server: a PATH_RESPONSE answering one of [serverPathChallenges]; true when it did. */
+    internal fun onServerPathResponseLocked(
+        data: ByteArray,
+        nowMillis: Long,
+    ): Boolean {
+        val path = serverPathChallenges.entries.firstOrNull { it.value.contentEquals(data) }?.key ?: return false
+        serverPathChallenges.remove(path)
+        if (validatedServerPaths.size >= MAX_PENDING_PATH_RESPONSES) validatedServerPaths.clear()
+        validatedServerPaths[path] = nowMillis
+        return true
+    }
+
+    /** Server: sends a datagram on a given path; the endpoint sets it. */
+    @kotlin.concurrent.Volatile
+    internal var sendOnServerPath: (suspend (ServerPath, ByteArray) -> Unit)? = null
+
+    /**
+     * Server: after a short-header packet on [datagramPath] was processed.
+     * RFC 9000 §9.3: a non-probing packet with the highest packet number on a
+     * new path moves the connection there — the client's address changed (NAT
+     * rebinding, migration) or it moved to our preferred address (§9.6). We
+     * then validate the path with a PATH_CHALLENGE, and start its congestion
+     * state over unless only the client's port changed (§9.4). Caller holds
+     * [streamsLock].
+     */
+    internal fun notePeerAddressLocked(
+        frames: List<com.vitorpamplona.quic.frame.Frame>,
+        largestReceived: Boolean,
+        nowMillis: Long,
+        datagramSize: Int,
+    ) {
+        val src = datagramPath ?: return
+        val current = peerPath ?: return
+        if (src == current || !largestReceived || !handshakeConfirmed) return
+        val probing =
+            frames.all {
+                it is com.vitorpamplona.quic.frame.PathChallengeFrame ||
+                    it is com.vitorpamplona.quic.frame.PathResponseFrame ||
+                    it is com.vitorpamplona.quic.frame.NewConnectionIdFrame ||
+                    it is com.vitorpamplona.quic.frame.PaddingFrame
+            }
+        if (probing) return
+        peerPath = src
+        if (recentlyValidated(src, nowMillis)) {
+            // Its PATH_CHALLENGE was answered while the client probed it.
+            peerMigration = null
+            sendPath = src
+            if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) resetPathStateLocked()
+            QuicLog.d(TAG) { "peer moved $current -> $src (already validated)" }
+            return
+        }
+        // Returning to the path we were validating away from needs no new challenge.
+        val back = peerMigration?.previous == src
+        peerMigration =
+            if (back) {
+                null
+            } else {
+                PeerMigration(
+                    src,
+                    current,
+                    com.vitorpamplona.crypto.random.RandomInstance
+                        .bytes(8),
+                    nowMillis,
+                    received = datagramSize.toLong(),
+                )
+            }
+        if (back) sendPath = src
+        if (src.local != current.local || !src.peer.ip.contentEquals(current.peer.ip)) resetPathStateLocked()
+        QuicLog.d(TAG) { "peer moved $current -> $src" }
+    }
+
+    /**
+     * Server: the client sent its ClientHello again from the start, after
+     * we answered it. It didn't take our flight in: picoquic, switched to
+     * a compatible version by our first Initial, starts its handshake over
+     * in that version and ignores what that packet carried, though it ACKs
+     * it. Send the whole flight again, as ngtcp2's server does.
+     */
+    internal fun onRepeatedClientHelloLocked() {
+        // Packet-number duplicates (a replayed copy) are dropped before this.
+        if (!isServer || handshakeConfirmed || initial.keysDiscarded || handshake.sendProtection == null) return
+        QuicLog.d(TAG) { "ClientHello repeated; sending our handshake flight again" }
+        initial.cryptoSend.resendAllSent()
+        if (!handshake.keysDiscarded) handshake.cryptoSend.requeueAllInflight()
+    }
+
+    /**
+     * Server, before the handshake is confirmed: an Initial or Handshake packet
+     * with the highest packet number came from a new address, e.g. a NAT
+     * rebound while the handshake was still going. There's no migration yet
+     * (RFC 9000 §9), so no PATH_CHALLENGE: answer there, resending the
+     * handshake flight that went to the old address. An Initial
+     * proves nothing about the address, so the amplification limit applies
+     * again until a Handshake packet from it validates it (§8.1). Caller holds
+     * [streamsLock].
+     */
+    internal fun notePeerAddressDuringHandshakeLocked(
+        level: EncryptionLevel,
+        largestReceived: Boolean,
+    ) {
+        // 0-RTT can't move the server: a copy can be replayed from anywhere.
+        if (level == EncryptionLevel.APPLICATION) return
+        val src = datagramPath ?: return
+        if (handshakeConfirmed || !largestReceived || src == peerPath) return
+        // Only the client's address changes here; our preferred address isn't in use yet (§9.6).
+        if (src.local != peerPath?.local) return
+        QuicLog.d(TAG) { "peer address changed during the handshake: $peerPath -> $src" }
+        peerPath = src
+        sendPath = src
+        if (level == EncryptionLevel.INITIAL) {
+            // Anyone who saw the first Initial can forge one, so it proves
+            // nothing about the address: the amplification limit starts over,
+            // funded only by what arrives from there (RFC 9000 §8.1).
+            addressValidated = false
+            amplificationBytesReceived = lastDatagramSize.toLong()
+            amplificationBytesSent = 0L
+        }
+        // What we sent so far went to the old address and is most likely
+        // lost: send it again now rather than wait out a backed-off PTO.
+        for (l in listOf(initial, handshake)) {
+            if (l.sendProtection != null && !l.keysDiscarded) l.cryptoSend.requeueAllInflight()
+        }
+    }
+
+    /**
+     * RFC 9000 §9.4 / §14.3: a new path (not just a new port) has unknown
+     * capacity, RTT and MTU — start the congestion controller, the RTT
+     * estimate and PMTU discovery over.
+     */
+    internal fun resetPathStateLocked() {
+        congestion.reset()
+        lossDetection.resetRttForNewPath()
+        pmtud.resetForNewPath()
+    }
+
+    /** Server: a migration whose challenge got no answer in time goes back to the old path. */
+    internal fun checkPeerMigrationTimeoutLocked(nowMillis: Long) {
+        val m = peerMigration ?: return
+        if (nowMillis - m.startedAtMillis < 3 * pathProbeRetransmitMillis().coerceAtLeast(PEER_MIGRATION_MIN_TIMEOUT_MS)) return
+        QuicLog.d(TAG) { "no PATH_RESPONSE on ${m.path}; back to ${m.previous}" }
+        peerMigration = null
+        peerPath = m.previous
+        sendPath = m.previous
+    }
+
+    /** Wakes the driver's send loop; set by [QuicConnectionDriver.start]. */
+    @kotlin.concurrent.Volatile
+    internal var sendWakeup: (() -> Unit)? = null
+
+    /**
+     * The application wrote to a stream, or read from one (the writer may owe
+     * the peer more credit): either way the send loop has work.
+     */
+    private val wakeSender: () -> Unit = { sendWakeup?.invoke() }
+
+    /** Called once when the connection terminates; a server endpoint drops its routes. */
+    internal var onTerminated: (() -> Unit)? = null
+    private val terminationLock = com.vitorpamplona.quic.SynchronizedObject()
+
+    /** True when [id] is in our stream id space (RFC 9000 §2.1: bit 0 names the initiator). */
+    internal fun isLocalStream(id: Long): Boolean = StreamId.isServerInitiated(id) == isServer
+
+    val sourceConnectionId: ConnectionId = serverSetup?.localConnectionId ?: ConnectionId.random(8)
+    var destinationConnectionId: ConnectionId = serverSetup?.clientSourceConnectionId ?: ConnectionId.random(8)
         internal set
-    val originalDestinationConnectionId: ConnectionId = destinationConnectionId
+
+    /**
+     * The DCID of the client's very first Initial: ours on a client; on a
+     * server, the one the client chose (echoed in the
+     * `original_destination_connection_id` transport parameter). A client
+     * that restarts after Version Negotiation starts over with a new one.
+     */
+    var originalDestinationConnectionId: ConnectionId = serverSetup?.originalDestinationConnectionId ?: destinationConnectionId
+        private set
 
     /**
      * Version the writer stamps into the long-header version field on the
@@ -191,6 +513,49 @@ class QuicConnection(
     @Volatile
     var vnConsumed: Boolean = false
         internal set
+
+    /**
+     * Versions our first flight is compatible with (RFC 9368 §3), most preferred
+     * first, always including the version the first Initial uses. Empty when
+     * [initialVersion] is not a version we speak (the forced Version Negotiation
+     * probe), in which case we send no `version_information`.
+     */
+    internal val offeredVersions: List<Int> =
+        if (QuicVersion.isSupported(initialVersion)) {
+            (config.compatibleVersions.filter { QuicVersion.isSupported(it) } + initialVersion).distinct()
+        } else {
+            emptyList()
+        }
+
+    /**
+     * The DCID the current Initial keys were derived from: our random first
+     * DCID, then the fresh one after Version Negotiation, then the server's
+     * SCID after a Retry. A compatible version switch re-derives Initial keys
+     * from this same value (RFC 9368 §2.3).
+     */
+    internal var initialKeysDcid: ConnectionId = serverSetup?.clientInitialDestinationConnectionId ?: destinationConnectionId
+
+    /**
+     * RFC 9000 §7.2: the SCID of the first Initial the server sent (after any
+     * Retry). Long-header packets with another SCID are dropped. Cleared when
+     * Retry or Version Negotiation starts the exchange over.
+     */
+    internal var serverInitialScid: ConnectionId? = serverSetup?.clientSourceConnectionId
+
+    /**
+     * RFC 9368 §2.3 / RFC 9369 §4.1: set once the server switched us to a
+     * compatible version by answering in it. The original version's Initial
+     * receive keys stay in [originalVersionInitialReceive] so the server's
+     * early original-version Initials (sent before it read our transport
+     * parameters) still decrypt.
+     */
+    @Volatile
+    internal var compatibleVersionSwitched: Boolean = false
+
+    internal var originalVersionInitialReceive: PacketProtection? = null
+
+    /** Version the 0-RTT keys were derived for. RFC 9369 §4.1: 0-RTT never moves to the negotiated version. */
+    internal var zeroRttVersion: Int = initialVersion
 
     /**
      * RFC 9000 §17.2.5.1: the Retry token the server handed us in a Retry
@@ -307,6 +672,13 @@ class QuicConnection(
     @Volatile
     internal var zeroRttSendProtection: PacketProtection? = null
 
+    /**
+     * 0-RTT packet protection a server opens the client's early data with,
+     * when its TLS server accepted 0-RTT; dropped at the first 1-RTT packet
+     * (RFC 9001 §4.9.3).
+     */
+    internal var zeroRttReceiveProtection: PacketProtection? = null
+
     @Volatile
     var handshakeComplete: Boolean = false
         private set
@@ -326,7 +698,7 @@ class QuicConnection(
      * error") when a client rolls KEY_PHASE before HANDSHAKE_DONE has
      * been delivered. The interop runner's `keyupdate` testcase against
      * quinn flushed this — see
-     * `quic/plans/2026-05-08-keyupdate-vs-quinn.md`.
+     * `plans/2026-05-08-keyupdate-vs-quinn.md`.
      *
      * Awaitable via [awaitHandshakeConfirmed].
      */
@@ -335,6 +707,10 @@ class QuicConnection(
         private set
 
     private val handshakeConfirmedSignal = CompletableDeferred<Unit>()
+
+    /** When [handshakeConfirmed] flipped, on [nowMillis]'s clock; MIN_VALUE before. */
+    @Volatile
+    internal var handshakeConfirmedAtMillis: Long = Long.MIN_VALUE
 
     /**
      * Lock-split refactor (2026-05-08): @Volatile because the writer/parser
@@ -403,6 +779,26 @@ class QuicConnection(
     @Volatile
     internal var lastActivityMs: Long = nowMillis()
 
+    /** An ack-eliciting packet went out since we last processed one (RFC 9000 §10.1). */
+    private var ackElicitingSentSinceReceive: Boolean = false
+
+    /** A packet from the peer was processed: the idle timer restarts. */
+    internal fun noteReceived(nowMillis: Long) {
+        lastActivityMs = nowMillis
+        ackElicitingSentSinceReceive = false
+    }
+
+    /**
+     * RFC 9000 §10.1: sending restarts the idle timer only for the first
+     * ack-eliciting packet since the last receive, so PTO probes into a peer
+     * that went silent can't keep the connection alive forever.
+     */
+    internal fun noteAckElicitingSent(nowMillis: Long) {
+        if (ackElicitingSentSinceReceive) return
+        ackElicitingSentSinceReceive = true
+        lastActivityMs = nowMillis
+    }
+
     /**
      * RFC 9000 §10.2.2 draining-period deadline. Set by
      * [enterDraining] to `now + 3 * PTO`; the driver's send loop
@@ -436,6 +832,17 @@ class QuicConnection(
      * teardown paths are safe.
      */
     internal val closingDrainSignal: CompletableDeferred<Unit> = CompletableDeferred()
+
+    /**
+     * The CONNECTION_CLOSE a locally detected error left to send (see
+     * [markClosedExternally]); the driver sends it once via
+     * [takeFinalCloseDatagram]. Null when the close was silent (idle timeout,
+     * stateless reset, the peer's own CONNECTION_CLOSE).
+     */
+    @Volatile
+    internal var finalCloseDatagram: ByteArray? = null
+
+    internal fun takeFinalCloseDatagram(): ByteArray? = finalCloseDatagram.also { finalCloseDatagram = null }
 
     /** App-level error code for graceful close. */
     var closeReason: String? = null
@@ -638,6 +1045,12 @@ class QuicConnection(
     /** Bidi counterpart of [peerInitiatedUniCount]. */
     internal var peerInitiatedBidiCount: Long = 0L
 
+    /** Peer-opened uni streams retired so far; MAX_STREAMS_UNI stays within reach of it. */
+    internal var retiredPeerUniCount: Long = 0L
+
+    /** Bidi counterpart of [retiredPeerUniCount]. */
+    internal var retiredPeerBidiCount: Long = 0L
+
     /**
      * The peer-initiated uni stream cap we've currently advertised to
      * the peer. Starts at [config.initialMaxStreamsUni]; the writer
@@ -659,7 +1072,7 @@ class QuicConnection(
      * supersede-check from neqo's `fc.rs::frame_lost` (if a newer,
      * higher extension has since gone out, the older lost frame is
      * irrelevant). Step 6 of
-     * `quic/plans/2026-05-04-control-frame-retransmit.md` populates
+     * `plans/2026-05-04-control-frame-retransmit.md` populates
      * this field via the loss dispatcher; step 4 (this commit) wires
      * the writer to drain it before running the rolling-extension
      * threshold check.
@@ -786,6 +1199,30 @@ class QuicConnection(
     internal val pendingPathChallengePayloads: ArrayDeque<ByteArray> = ArrayDeque()
 
     /**
+     * RFC 9000 §9.6 probe toward the server's preferred address; null when
+     * there is none in flight. The writer builds its datagrams with
+     * [drainProbe], the driver sends them on a second socket. Lifecycle:
+     * created by [maybeStartPreferredAddressProbeLocked] once the handshake is
+     * confirmed, finished by a matching PATH_RESPONSE
+     * ([completePreferredAddressMigrationLocked]) or by its timeout.
+     */
+    @Volatile
+    var pathProbe: PathProbe? = null
+        internal set
+
+    /** True once the connection moved to the server's preferred address. */
+    @Volatile
+    var migratedToPreferredAddress: Boolean = false
+        internal set
+
+    /**
+     * Set by the driver when the connection's socket talks IPv6, so the
+     * preferred address of the same family is picked (RFC 9000 §9.6.3).
+     */
+    @Volatile
+    internal var activePathIsIpv6: Boolean = false
+
+    /**
      * RFC 9000 §9 client-initiated path validation + DCID rotation.
      * The pool of unused peer-issued connection IDs, the outbound
      * `PATH_CHALLENGE` queue, the matching state machine, and the
@@ -822,6 +1259,153 @@ class QuicConnection(
             .QuicLossDetection()
 
     /**
+     * RFC 9002 §7 congestion controller (NewReno). One per connection,
+     * shared by the three packet-number spaces (§B.4). The writer only
+     * emits ack-eliciting packets while [bytesInFlight] is below its
+     * window, PTO probes excepted (§7.5).
+     */
+    val congestion: com.vitorpamplona.quic.connection.recovery.CongestionController =
+        com.vitorpamplona.quic.connection.recovery
+            .CongestionController(algorithm = config.congestionControl)
+
+    /** RFC 9002 §7.7 pacer, spreading ack-eliciting sends over the round trip. */
+    internal val pacer: com.vitorpamplona.quic.connection.recovery.Pacer =
+        com.vitorpamplona.quic.connection.recovery
+            .Pacer()
+
+    /** RFC 9000 §14.3 / RFC 8899 path MTU discovery; [PmtuDiscovery.currentSize] bounds every packet. */
+    val pmtud: PmtuDiscovery = PmtuDiscovery()
+
+    /** Largest ECN-CE count the peer has reported in a 1-RTT ACK (RFC 9000 §13.4.2). */
+    internal var peerReportedEcnCe: Long = 0L
+
+    /** Largest ECT(0) count the peer has reported in a 1-RTT ACK. */
+    private var peerReportedEcnEct0: Long = 0L
+
+    /**
+     * RFC 9000 §13.4.2.1: the peer's ECN counts failed validation, so they
+     * are no longer a congestion signal.
+     */
+    internal var ecnValidationFailed: Boolean = false
+        private set
+
+    /** RFC 9002 §2: bytes in flight across all packet-number spaces. */
+    fun bytesInFlight(): Long = initial.bytesInFlight + handshake.bytesInFlight + application.bytesInFlight
+
+    /**
+     * What the writer may put in the next datagram. PTO probes always go
+     * (RFC 9002 §7.5); otherwise ack-eliciting payload waits for congestion
+     * window (§7) and the pacer (§7.7), while ACKs and small control frames
+     * still flow.
+     */
+    internal fun sendAllowance(nowMillis: Long): SendAllowance {
+        if (pendingPing || pendingProbePackets > 0) return SendAllowance.FULL
+        if (congestion.availableWindow(bytesInFlight()) <= 0L) return SendAllowance.CONTROL_ONLY
+        if (pacingDelayMillis(nowMillis) > 0L) return SendAllowance.CONTROL_ONLY
+        return SendAllowance.FULL
+    }
+
+    /** Milliseconds until the pacer releases another full-size datagram. */
+    internal fun pacingDelayMillis(nowMillis: Long): Long = pacer.delayMillis(nowMillis, congestion.maxDatagramSize, congestion.congestionWindow, lossDetection.smoothedRttMs)
+
+    /** True when the window, not the pacer, is what holds payload back. */
+    internal fun congestionBlocked(): Boolean = congestion.availableWindow(bytesInFlight()) <= 0L
+
+    /**
+     * RFC 9002 §7.6.1 persistent-congestion duration, or null before the
+     * first RTT sample.
+     */
+    private fun persistentCongestionDurationMs(): Long? {
+        if (!lossDetection.hasFirstRttSample) return null
+        val maxAckDelay = peerTransportParameters?.maxAckDelay ?: TransportParameterDefaults.MAX_ACK_DELAY_MS
+        val pto =
+            lossDetection.smoothedRttMs +
+                (4L * lossDetection.rttVarMs).coerceAtLeast(1L) +
+                maxAckDelay
+        return pto * com.vitorpamplona.quic.connection.recovery.CongestionController.PERSISTENT_CONGESTION_THRESHOLD
+    }
+
+    /** [acked] left flight in [state]: release their bytes and grow the window. Caller holds [streamsLock]. */
+    internal fun onPacketsAckedLocked(
+        state: LevelState,
+        acked: List<com.vitorpamplona.quic.connection.recovery.SentPacket>,
+    ) {
+        if (acked.isEmpty()) return
+        val before = bytesInFlight()
+        state.onLeftFlight(acked)
+        for (p in acked) if (p.mtuProbeSize > 0) pmtud.onProbeAcked(p.mtuProbeSize)
+        congestion.onPacketsAcked(acked, before, nowMillis(), lossDetection.smoothedRttMs)
+    }
+
+    /** [lost] were declared lost in [state]: release their bytes and react. Caller holds [streamsLock]. */
+    internal fun onPacketsLostLocked(
+        state: LevelState,
+        lost: List<com.vitorpamplona.quic.connection.recovery.SentPacket>,
+        nowMillis: Long,
+    ) {
+        if (lost.isEmpty()) return
+        state.onLeftFlight(lost)
+        // A lost PMTU probe says the path doesn't carry that size, not that
+        // it's congested (RFC 8899 §4.4).
+        var probes = false
+        for (p in lost) {
+            if (p.mtuProbeSize > 0) {
+                pmtud.onProbeLost(p.mtuProbeSize)
+                probes = true
+            }
+        }
+        val congestionLosses = if (probes) lost.filter { it.mtuProbeSize == 0 } else lost
+        val persistentBefore = congestion.persistentCongestionEvents
+        congestion.onPacketsLost(congestionLosses, nowMillis, persistentCongestionDurationMs())
+        // Persistent congestion right after growing the packet size looks like
+        // a PMTU black hole: fall back to the base size (RFC 8899 §4.3).
+        if (congestion.persistentCongestionEvents > persistentBefore) pmtud.onBlackHoleSuspected(nowMillis)
+    }
+
+    /**
+     * The peer sent a 1-RTT ACK with ECN counts, so it handles ACK_ECN frames:
+     * our 1-RTT ACKs carry counts too from then on. Ours are always zero (the
+     * JVM can't read the ECN bits), so they tell a peer that doesn't do ECN
+     * nothing, and nginx closes the connection with INTERNAL_ERROR on the
+     * first ACK_ECN it receives.
+     */
+    @Volatile
+    internal var peerSendsAckEcn: Boolean = false
+
+    /**
+     * RFC 9002 §7.1 / §B.7: a rising ECN-CE count in a 1-RTT ACK is a
+     * congestion signal about the packet that ACK's largest number names.
+     *
+     * Only an ACK that raises the largest acknowledged number is looked at,
+     * since reordered ACKs carry older counts (RFC 9000 §13.4.2.1). Counts
+     * that can't be right end ECN for the connection: we mark only ECT(0),
+     * so ECT(1) is a path or peer re-marking, a count may never go down, and
+     * no count may exceed the 1-RTT packets we have sent.
+     */
+    internal fun onPeerEcnCountsLocked(
+        counts: com.vitorpamplona.quic.frame.AckEcnCounts,
+        advancesLargestAcked: Boolean,
+        packetsSent: Long,
+        largestAckedSentAtMillis: Long?,
+        nowMillis: Long,
+    ) {
+        if (ecnValidationFailed || !advancesLargestAcked) return
+        if (counts.ect1 != 0L ||
+            counts.ect0 < peerReportedEcnEct0 ||
+            counts.ce < peerReportedEcnCe ||
+            counts.ect0 > packetsSent - counts.ce
+        ) {
+            ecnValidationFailed = true
+            QuicLog.d(TAG) { "ECN validation failed: ect0=${counts.ect0} ect1=${counts.ect1} ce=${counts.ce} sent=$packetsSent" }
+            return
+        }
+        peerReportedEcnEct0 = counts.ect0
+        if (counts.ce <= peerReportedEcnCe) return
+        peerReportedEcnCe = counts.ce
+        if (largestAckedSentAtMillis != null) congestion.onCongestionEvent(largestAckedSentAtMillis, nowMillis)
+    }
+
+    /**
      * Reusable scratch lists for [QuicConnectionWriter.buildApplicationPacket].
      * The function clears them at entry, fills them, encodes the
      * packet, snapshots the [scratchAppTokens] via `.toList()` for
@@ -852,6 +1436,115 @@ class QuicConnection(
     internal var pendingPing: Boolean = false
 
     /**
+     * RFC 9000 §8.1: true once the peer's address is validated. Always true
+     * on a client; a server gets there through a Retry or NEW_TOKEN token,
+     * or its first Handshake packet from the client.
+     */
+    internal var addressValidated: Boolean = serverSetup?.addressValidated ?: true
+
+    /** Bytes received from the peer while [addressValidated] was false. */
+    internal var amplificationBytesReceived: Long = 0L
+
+    /** Bytes sent to the peer while [addressValidated] was false. */
+    internal var amplificationBytesSent: Long = 0L
+
+    /** Size of the datagram being parsed. */
+    internal var lastDatagramSize: Int = 0
+
+    internal fun onDatagramReceived(size: Int) {
+        lastDatagramSize = size
+        if (!addressValidated) amplificationBytesReceived += size
+        peerMigration?.let { if (datagramPath == it.path) it.received += size }
+    }
+
+    /**
+     * What a server may still send to an unvalidated address: three times
+     * what it received (RFC 9000 §8.1), less what it already sent.
+     * [Long.MAX_VALUE] once validated.
+     */
+    internal fun amplificationAllowance(): Long = if (addressValidated) Long.MAX_VALUE else 3L * amplificationBytesReceived - amplificationBytesSent
+
+    /**
+     * RFC 9000 §17.4: whether this connection spins (a random one in 16 doesn't,
+     * even with [QuicConnectionConfig.spinBit]).
+     */
+    internal var spinEnabled: Boolean =
+        config.spinBit &&
+            (
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes(1)[0]
+                    .toInt() and 0x0F
+            ) != 0
+
+    /** The spin bit our 1-RTT packets carry; a random constant when [spinEnabled] is off. */
+    internal var spinValue: Boolean =
+        !spinEnabled &&
+            (
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes(1)[0]
+                    .toInt() and 1
+            ) == 1
+
+    /**
+     * RFC 9000 §17.4: on a 1-RTT packet that raised the highest packet number
+     * seen, a server echoes the peer's spin bit and a client inverts it.
+     */
+    internal fun onSpinBitReceived(spin: Boolean) {
+        if (spinEnabled) spinValue = if (isServer) spin else !spin
+    }
+
+    /**
+     * The longest we hold back an ACK: our advertised max_ack_delay, or what
+     * the peer's latest ACK_FREQUENCY asked for.
+     */
+    internal var localMaxAckDelayMillis: Long = config.maxAckDelay
+
+    /** The sequence number the next ACK_FREQUENCY must reach to count (draft §4). */
+    private var nextAckFrequencySequence: Long = 0L
+
+    /**
+     * draft-ietf-quic-ack-frequency §4: apply the peer's latest ACK_FREQUENCY
+     * to how the application space acknowledges. Caller holds [streamsLock].
+     */
+    internal fun applyAckFrequencyLocked(frame: com.vitorpamplona.quic.frame.AckFrequencyFrame) {
+        if (!config.ackFrequency) {
+            markClosedExternally("PROTOCOL_VIOLATION: ACK_FREQUENCY without min_ack_delay", errorCode = QuicTransportError.PROTOCOL_VIOLATION)
+            return
+        }
+        if (frame.requestedMaxAckDelayMicros < MIN_ACK_DELAY_MICROS) {
+            markClosedExternally(
+                "PROTOCOL_VIOLATION: ACK_FREQUENCY delay ${frame.requestedMaxAckDelayMicros} us below our min_ack_delay",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+        if (frame.sequenceNumber < nextAckFrequencySequence) return
+        nextAckFrequencySequence = frame.sequenceNumber + 1
+        val tracker = application.ackTracker
+        tracker.ackElicitingThreshold = (frame.ackElicitingThreshold + 1).coerceIn(1L, MAX_ACK_ELICITING_THRESHOLD).toInt()
+        tracker.ackOnReorder = frame.reorderingThreshold != 0L
+        localMaxAckDelayMillis = (frame.requestedMaxAckDelayMicros / 1000L).coerceAtLeast(1L)
+    }
+
+    /** Whether the writer could send an ACK now: not draining or closed, and no amplification limit in the way. */
+    internal fun canSendAck(): Boolean =
+        (status == Status.CONNECTED || status == Status.HANDSHAKING) &&
+            amplificationAllowance() >= pmtud.currentSize &&
+            migrationSendAllowance() >= MIN_MIGRATION_DATAGRAM
+
+    /** Where the writer encodes a 1-RTT packet's frames; single writer under [streamsLock]. */
+    internal val scratchPayloadWriter = com.vitorpamplona.quic.QuicWriter(2048)
+
+    /** A server owes the client this NEW_TOKEN token (RFC 9000 §8.1.3), first send or after a loss. */
+    internal var pendingNewToken: ByteArray? = null
+
+    /** A server owes the client HANDSHAKE_DONE (RFC 9001 §4.1.2), first send or after a loss. */
+    internal var pendingHandshakeDone: Boolean = false
+
+    /** Server: the client ACKed a HANDSHAKE_DONE; until then each PTO probe carries it again. */
+    internal var handshakeDoneAcked: Boolean = false
+
+    /**
      * RFC 9002 §6.2.2 consecutive PTO count. Incremented on each
      * PTO expiration without an intervening ACK; reset to 0 when an
      * inbound ACK acknowledges any ack-eliciting packet. The driver
@@ -868,6 +1561,50 @@ class QuicConnection(
      */
     @Volatile
     internal var consecutivePtoCount: Int = 0
+
+    /**
+     * RFC 9002 §6.2.1: the PTO timer runs only while ack-eliciting packets are
+     * in flight, or, on a client, until the handshake is confirmed (the
+     * server may still be blocked by its amplification limit). Without the
+     * check an idle connection sends a PING every PTO.
+     */
+    internal fun ptoArmed(): Boolean =
+        !isServer && !handshakeConfirmed || lastAppPacketAckOnly ||
+            initial.bytesInFlight > 0L || handshake.bytesInFlight > 0L || application.bytesInFlight > 0L
+
+    /**
+     * Our latest 1-RTT packet carried only ACKs. The PTO timer stays armed, so
+     * a PTO of silence after it brings one PING (RFC 9000 §13.2.4 suggests a
+     * receiver make a packet ack-eliciting now and then). A receiver that only
+     * sends ACKs otherwise goes silent when the peer's packets stop reaching it,
+     * as after a NAT rebinding, and the peer never learns its new address: our
+     * client against haproxy's rebind tests. Once the PING is acknowledged the
+     * connection is quiet again.
+     */
+    @Volatile
+    internal var lastAppPacketAckOnly: Boolean = false
+
+    /**
+     * When the PTO period starts counting (RFC 9002 §6.2.1): the latest
+     * ack-eliciting packet sent, or 1-RTT ACK-only packet (see
+     * [lastAppPacketAckOnly]), or the latest PTO expiry.
+     */
+    @Volatile
+    internal var ptoReferenceMs: Long = Long.MIN_VALUE
+
+    /**
+     * Milliseconds until the PTO fires, or [Long.MAX_VALUE] when it isn't
+     * armed. Counted from [ptoReferenceMs], so waking the send loop (a stream
+     * write, an ACK) doesn't push it back.
+     */
+    internal fun ptoDelayMillis(nowMs: Long): Long {
+        if (!ptoArmed()) return Long.MAX_VALUE
+        // max_ack_delay only applies to the application space (RFC 9002 §6.2.1).
+        val maxAckDelayMs = if (application.sendProtection != null) peerTransportParameters?.maxAckDelay ?: 0L else 0L
+        val period = (lossDetection.ptoBaseMs(maxAckDelayMs).coerceAtLeast(1L) * (1L shl consecutivePtoCount.coerceAtMost(6))).coerceAtMost(60_000L)
+        val reference = ptoReferenceMs
+        return if (reference == Long.MIN_VALUE) period else (reference + period - nowMs).coerceAtLeast(0L)
+    }
 
     /**
      * RFC 9002 §6.2.4 probe budget. Set to 2 each time the PTO timer
@@ -927,6 +1664,28 @@ class QuicConnection(
     /** Total stream bytes we've already sent against [sendConnectionFlowCredit]. */
     internal var sendConnectionFlowConsumed: Long = 0L
 
+    /** The connection limit a DATA_BLOCKED was last sent for (RFC 9000 §4.1); -1 before any. */
+    internal var dataBlockedReportedAt: Long = -1L
+
+    /** STREAMS_BLOCKED limits waiting to be sent, and the last ones sent (RFC 9000 §19.14). */
+    internal var pendingStreamsBlockedBidi: Long? = null
+    internal var pendingStreamsBlockedUni: Long? = null
+    private var streamsBlockedReportedBidi: Long = -1L
+    private var streamsBlockedReportedUni: Long = -1L
+
+    /** An open failed on the peer's stream limit: tell it, once per limit. Caller holds [streamsLock]. */
+    private fun noteStreamsBlocked(bidi: Boolean) {
+        if (bidi) {
+            if (streamsBlockedReportedBidi != peerMaxStreamsBidi) {
+                streamsBlockedReportedBidi = peerMaxStreamsBidi
+                pendingStreamsBlockedBidi = peerMaxStreamsBidi
+            }
+        } else if (streamsBlockedReportedUni != peerMaxStreamsUni) {
+            streamsBlockedReportedUni = peerMaxStreamsUni
+            pendingStreamsBlockedUni = peerMaxStreamsUni
+        }
+    }
+
     private var receiveConnectionFlowLimit: Long = config.initialMaxData
 
     /** Streams the peer has opened that we haven't surfaced yet. */
@@ -965,8 +1724,13 @@ class QuicConnection(
                 clientSecret: ByteArray,
                 serverSecret: ByteArray,
             ) {
-                handshake.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret)
-                handshake.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret)
+                handshake.sendProtection = packetProtectionFromSecret(cipherSuite, if (isServer) serverSecret else clientSecret, currentVersion)
+                handshake.receiveProtection = packetProtectionFromSecret(cipherSuite, if (isServer) clientSecret else serverSecret, currentVersion)
+                // RFC 9000 §7.4: the client's parameters arrive in its
+                // ClientHello, before our first Handshake packet; check them
+                // now so a bad set never gets a response at that level.
+                extraSecretsListener?.onHandshakeKeysReady(cipherSuite, clientSecret, serverSecret)
+                if (isServer) applyPeerTransportParameters()
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.HANDSHAKE)
                 qlogObserver.onKeyUpdated("server", EncryptionLevel.HANDSHAKE)
             }
@@ -981,8 +1745,20 @@ class QuicConnection(
                 // keys arrive. Cleared in onApplicationKeysReady (RFC
                 // 9001 §4.10 forbids using 0-RTT keys once 1-RTT is
                 // available).
-                zeroRttSendProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret)
+                zeroRttVersion = currentVersion
+                extraSecretsListener?.onEarlyDataKeysReady(cipherSuite, clientEarlySecret)
+                if (isServer) {
+                    zeroRttReceiveProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret, currentVersion)
+                    return
+                }
+                zeroRttSendProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret, currentVersion)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.APPLICATION)
+            }
+
+            override fun onEarlyDataRejected() {
+                // What already went out in 0-RTT is requeued once 1-RTT keys arrive (earlyDataAccepted is false).
+                zeroRttSendProtection = null
+                extraSecretsListener?.onEarlyDataRejected()
             }
 
             override fun onApplicationKeysReady(
@@ -1021,22 +1797,24 @@ class QuicConnection(
                 // post-EE check is the safety net for a non-conforming
                 // server that picks a different ALPN from what we
                 // remembered.
-                val resumed = effectiveResumption
+                val resumed = effectiveResumption.takeUnless { isServer }
                 val alpnMismatch =
                     resumed != null &&
                         resumed.negotiatedAlpn != null &&
-                        !resumed.negotiatedAlpn.contentEquals(tls.negotiatedAlpn)
+                        !resumed.negotiatedAlpn.contentEquals(handshakeTls.negotiatedAlpn)
                 val rejected0Rtt =
                     resumed != null &&
                         resumed.maxEarlyDataSize > 0 &&
-                        (!tls.earlyDataAccepted || alpnMismatch)
+                        (!handshakeTls.earlyDataAccepted || alpnMismatch)
                 if (rejected0Rtt) {
                     requeueAllInflightStreamData()
                     application.cryptoSend.requeueAllInflight()
-                    application.sentPackets.clear()
+                    application.clearSentPackets()
                 }
-                application.sendProtection = packetProtectionFromSecret(cipherSuite, clientSecret)
-                application.receiveProtection = packetProtectionFromSecret(cipherSuite, serverSecret)
+                val sendSecret = if (isServer) serverSecret else clientSecret
+                val receiveSecret = if (isServer) clientSecret else serverSecret
+                application.sendProtection = packetProtectionFromSecret(cipherSuite, sendSecret, currentVersion)
+                application.receiveProtection = packetProtectionFromSecret(cipherSuite, receiveSecret, currentVersion)
                 // Drop 0-RTT keys — the writer must use 1-RTT short
                 // headers from here on (RFC 9001 §4.10).
                 zeroRttSendProtection = null
@@ -1047,8 +1825,9 @@ class QuicConnection(
                 // Initial / Handshake levels are short-lived and never see
                 // the KEY_PHASE bit (long headers don't carry it).
                 appCipherSuite = cipherSuite
-                appReceiveSecret = serverSecret.copyOf()
-                appSendSecret = clientSecret.copyOf()
+                appReceiveSecret = receiveSecret.copyOf()
+                appSendSecret = sendSecret.copyOf()
+                extraSecretsListener?.onApplicationKeysReady(cipherSuite, clientSecret, serverSecret)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.APPLICATION)
                 qlogObserver.onKeyUpdated("server", EncryptionLevel.APPLICATION)
             }
@@ -1056,8 +1835,18 @@ class QuicConnection(
             override fun onHandshakeComplete() {
                 handshakeComplete = true
                 if (status == Status.HANDSHAKING) status = Status.CONNECTED
-                applyPeerTransportParameters()
-                tls.negotiatedAlpn?.let { qlogObserver.onAlpnNegotiated(it.decodeToString()) }
+                if (isServer) {
+                    // RFC 9001 §4.1.2: the server's handshake is confirmed
+                    // once it completes; it tells the client with
+                    // HANDSHAKE_DONE and drops its Handshake keys (§4.9.2).
+                    pendingHandshakeDone = true
+                    pendingNewToken = serverSetup?.newTokenFactory?.invoke()
+                    markHandshakeConfirmed()
+                    handshake.discardKeys()
+                } else {
+                    applyPeerTransportParameters()
+                }
+                handshakeTls.negotiatedAlpn?.let { qlogObserver.onAlpnNegotiated(it.decodeToString()) }
                 handshakeDoneSignal.complete(Unit)
                 extraSecretsListener?.onHandshakeComplete()
             }
@@ -1108,6 +1897,7 @@ class QuicConnection(
      */
     internal fun markHandshakeConfirmed() {
         if (!handshakeConfirmed) {
+            handshakeConfirmedAtMillis = nowMillis()
             handshakeConfirmed = true
             handshakeConfirmedSignal.complete(Unit)
         }
@@ -1171,7 +1961,27 @@ class QuicConnection(
             alpnList.any { it.contentEquals(cachedAlpn) }
         }
 
-    val tls: TlsClient =
+    /**
+     * Server: the connection ID (sequence 1, RFC 9000 §5.1.1) that comes with
+     * our `preferred_address`; spares are numbered after it.
+     */
+    private val serverPreferredAddressCid: IssuedSourceConnectionIdEntry? =
+        serverSetup?.preferredAddress?.let {
+            val (cid, token) = mintOwnConnectionId()
+            IssuedSourceConnectionIdEntry(PREFERRED_ADDRESS_CID_SEQUENCE, cid, token).also { entry ->
+                issuedSourceConnectionIds[entry.sequenceNumber] = entry
+                nextOwnSourceCidSeq = entry.sequenceNumber + 1
+            }
+        }
+
+    /** The TLS side this connection plays: a [TlsClient], or a [TlsServer] on a server. */
+    internal var handshakeTls: com.vitorpamplona.quic.tls.TlsHandshake =
+        serverSetup?.tlsServerFactory?.invoke(buildLocalTransportParameters().encode(), tlsListener)
+            ?: newTlsClient()
+        private set
+
+    /** A TLS client carrying our transport parameters as they stand now. */
+    private fun newTlsClient(): TlsClient =
         TlsClient(
             serverName = serverName,
             transportParameters = buildLocalTransportParameters().encode(),
@@ -1182,17 +1992,22 @@ class QuicConnection(
             resumption = effectiveResumption,
         )
 
+    /** The TLS client of a client connection. A server connection has [tlsServer] instead. */
+    val tls: TlsClient
+        get() = handshakeTls as? TlsClient ?: error("server-side connection: use tlsServer")
+
+    /** The TLS server of a server-side connection; null on a client. */
+    val tlsServer: com.vitorpamplona.quic.tls.TlsServer?
+        get() = handshakeTls as? com.vitorpamplona.quic.tls.TlsServer
+
     init {
-        // Install Initial keys based on the random destination CID we just generated.
-        val proto = InitialSecrets.derive(destinationConnectionId.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
-        // Initial packets always use AES-128-GCM (RFC 9001 §5). Use the
-        // platform's cached-cipher implementation so per-packet seal/open
-        // doesn't pay for `Cipher.getInstance`.
-        initial.sendProtection =
-            PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp)
-        initial.receiveProtection =
-            PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+        // Install Initial keys, derived from the DCID of the client's Initial
+        // (our random one on a client).
+        val (send, receive) = initialProtections(initialKeysDcid, initialVersion)
+        initial.sendProtection = send
+        initial.receiveProtection = receive
+        // A server keeps its Initial flight to send it all again (onRepeatedClientHelloLocked).
+        initial.cryptoSend.retainAcked = isServer
 
         // Resumption + 0-RTT: pre-load flow-control limits from the
         // remembered transport parameters so streams opened BEFORE the
@@ -1221,6 +2036,12 @@ class QuicConnection(
 
     /** Begin the handshake — emits ClientHello into Initial CRYPTO. */
     fun start() {
+        // A server's handshake starts with the client's Initial, which its
+        // endpoint feeds in.
+        if (isServer) {
+            qlogObserver.onTransportParametersSet("local", localTransportParametersSummary())
+            return
+        }
         // qlog: emit connection_started + initial transport_parameters_set
         // before any wire traffic so the trace makes chronological sense
         // when handed to qvis.
@@ -1230,9 +2051,7 @@ class QuicConnection(
             scid = sourceConnectionId.bytes,
         )
         qlogObserver.onTransportParametersSet("local", localTransportParametersSummary())
-        // RFC 9000 §6: we're not doing version negotiation, so the
-        // chosen version is unconditional.
-        qlogObserver.onVersionInformation("v1", emptyList())
+        qlogObserver.onVersionInformation(QuicVersion.name(initialVersion), offeredVersions.map { QuicVersion.name(it) })
         tls.start()
         // Drain ClientHello bytes into the Initial-level CRYPTO send buffer.
         // Cache the bytes so [applyVersionNegotiation] can re-enqueue them
@@ -1269,12 +2088,13 @@ class QuicConnection(
         // Anti-downgrade: server-claimed support for the version we
         // already offered indicates VN replay / spoof. Drop silently.
         if (supportedVersions.contains(initialVersion)) return
-        // Pick a version we can speak. Today that's only v1.
-        if (!supportedVersions.contains(QuicVersion.V1)) {
+        // Pick the version we prefer among those the server speaks.
+        val chosen = versionPreference().firstOrNull { it in supportedVersions }
+        if (chosen == null) {
             signalHandshakeFailed(
                 QuicVersionNegotiationException(
-                    "VERSION_NEGOTIATION: server offered ${supportedVersions.map { v -> "0x" + v.toUInt().toString(16) }}, " +
-                        "client only supports 0x" + QuicVersion.V1.toUInt().toString(16),
+                    "VERSION_NEGOTIATION: server offered ${supportedVersions.map { v -> QuicVersion.name(v) }}, " +
+                        "client supports ${QuicVersion.SUPPORTED.map { v -> QuicVersion.name(v) }}",
                 ),
             )
             markClosedExternally("VERSION_NEGOTIATION: no mutually supported version")
@@ -1292,26 +2112,120 @@ class QuicConnection(
         // cryptographically isolated from the pre-VN exchange.
         val newDcid = ConnectionId.random(8)
         destinationConnectionId = newDcid
+        // RFC 9000 §7.3: original_destination_connection_id names the first
+        // Initial of this attempt, and the new attempt starts here (§6.2).
+        originalDestinationConnectionId = newDcid
 
         // Reset Initial-level state in place: fresh PN space (next
         // allocateOutbound returns 0), fresh ackTracker, fresh
         // cryptoSend / cryptoReceive, fresh sentPackets retention.
         // Writer + parser only ever reach the level via [conn.initial],
         // so we mutate the fields rather than swap the instance.
-        val proto = InitialSecrets.derive(newDcid.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
-        val newSend =
-            PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp)
-        val newReceive =
-            PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+        initialKeysDcid = newDcid
+        serverInitialScid = null
+        val (newSend, newReceive) = initialProtections(newDcid, chosen)
         initial.resetForVersionNegotiation(sendProtection = newSend, receiveProtection = newReceive)
-        // Re-enqueue the ClientHello so the next drainOutbound emits a v1
-        // Initial datagram with the same TLS handshake the original carried.
-        originalClientHello?.let { initial.cryptoSend.enqueue(it) }
 
-        // Switch the writer's stamp to v1 so the next Initial / Handshake
+        // Switch the writer's stamp so the next Initial / Handshake
         // long-header carries the right version.
-        currentVersion = QuicVersion.V1
+        currentVersion = chosen
+
+        // A new attempt needs a new ClientHello: its version_information must
+        // name the version we now use (RFC 9368 §4). Early data sent under
+        // the old one never reached a server that processed it; send it again
+        // under the new attempt's 0-RTT keys, or 1-RTT.
+        if (zeroRttSendProtection != null) {
+            zeroRttSendProtection = null
+            requeueAllInflightStreamData()
+            application.clearSentPackets()
+        }
+        val tlsClient = newTlsClient()
+        handshakeTls = tlsClient
+        tlsClient.start()
+        tlsClient.pollOutbound(TlsClient.Level.INITIAL)?.let {
+            originalClientHello = it
+            initial.cryptoSend.enqueue(it)
+        }
+    }
+
+    /**
+     * Server side of compatible version negotiation (RFC 9368 §2.3): given the
+     * client's transport parameters, switch to the most preferred of our
+     * versions the client lists as available, and return our transport
+     * parameters re-encoded with it as the chosen version; null to stay put.
+     * Runs before the first Initial we send, so every packet we send uses
+     * the new version. The client's Initials in its original version keep
+     * opening with the original keys until it switches too.
+     */
+    internal fun chooseCompatibleVersion(clientTransportParameters: ByteArray): ByteArray? {
+        val setup = serverSetup ?: return null
+        val vi =
+            try {
+                TransportParameters.decode(clientTransportParameters).versionInformation
+            } catch (_: com.vitorpamplona.quic.QuicCodecException) {
+                null
+            } ?: return null
+        val chosen = setup.supportedVersions.firstOrNull { it in vi.availableVersions && QuicVersion.isSupported(it) } ?: return null
+        if (chosen == currentVersion) return null
+        originalVersionInitialReceive = initial.receiveProtection
+        val (send, receive) = initialProtections(initialKeysDcid, chosen)
+        initial.sendProtection = send
+        initial.receiveProtection = receive
+        currentVersion = chosen
+        compatibleVersionSwitched = true
+        qlogObserver.onVersionInformation(QuicVersion.name(chosen), setup.supportedVersions.map { QuicVersion.name(it) })
+        return buildLocalTransportParameters().encode()
+    }
+
+    /** Our version preference for Version Negotiation: the configured compatible versions, then the rest we speak. */
+    private fun versionPreference(): List<Int> = (config.compatibleVersions.filter { QuicVersion.isSupported(it) } + QuicVersion.SUPPORTED).distinct()
+
+    /**
+     * Initial packet protection (send, receive) for our role, derived from
+     * [dcid] under [version]'s salt and labels.
+     */
+    private fun initialProtections(
+        dcid: ConnectionId,
+        version: Int,
+    ): Pair<PacketProtection, PacketProtection> {
+        val proto = InitialSecrets.derive(dcid.bytes, version)
+        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
+        // Initial packets always use AES-128-GCM (RFC 9001 §5). Use the
+        // platform's cached-cipher implementation so per-packet seal/open
+        // doesn't pay for `Cipher.getInstance`.
+        val client = PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp)
+        val server = PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp)
+        return if (isServer) server to client else client to server
+    }
+
+    /**
+     * RFC 9368 §2.3 compatible version negotiation, client side. The server
+     * answered our first flight in [version] instead of [currentVersion]:
+     * returns the Initial receive keys for that version so the parser can try
+     * the packet, or null if [version] isn't one we offered (drop it). Nothing
+     * changes until [commitCompatibleVersion], which the parser calls only once
+     * a packet authenticates under these keys, so a forged version field can't
+     * move us.
+     */
+    internal fun compatibleVersionCandidate(version: Int): PacketProtection? {
+        if (compatibleVersionSwitched || vnConsumed) return null
+        if (version == currentVersion || version !in offeredVersions) return null
+        return initialProtections(initialKeysDcid, version).second
+    }
+
+    /** Switch the connection to [version] after a packet in it authenticated with [receive]. */
+    internal fun commitCompatibleVersion(
+        version: Int,
+        receive: PacketProtection,
+    ) {
+        compatibleVersionSwitched = true
+        originalVersionInitialReceive = initial.receiveProtection
+        // RFC 9369 §4.1: once the negotiated version is known, send our
+        // remaining Initials in it. Same packet-number space, same CRYPTO stream.
+        initial.sendProtection = initialProtections(initialKeysDcid, version).first
+        initial.receiveProtection = receive
+        currentVersion = version
+        qlogObserver.onVersionInformation(QuicVersion.name(version), offeredVersions.map { QuicVersion.name(it) })
     }
 
     /**
@@ -1342,19 +2256,18 @@ class QuicConnection(
         }
         val savedClientHello = originalClientHello ?: return false
 
+        // RFC 9369 §4.1: a Retry always uses the original version, and the
+        // Initial that echoes its token must too.
+        if (retryPacket.version != currentVersion || compatibleVersionSwitched) return false
         destinationConnectionId = retryPacket.scid
-        val proto = InitialSecrets.derive(destinationConnectionId.bytes)
-        val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
+        initialKeysDcid = retryPacket.scid
+        serverInitialScid = null
+        val (send, receive) = initialProtections(retryPacket.scid, currentVersion)
         // Use resetForRetry, NOT resetForVersionNegotiation: RFC 9001 §5.7
         // requires the Initial PN namespace to continue across the Retry
         // boundary. Resetting PN to 0 caused the runner to flag
         // "Client reset the packet number. Check failed for PN 0".
-        initial.resetForRetry(
-            sendProtection =
-                PacketProtection(bestAes128GcmAead(proto.clientKey), proto.clientKey, proto.clientIv, hp, proto.clientHp),
-            receiveProtection =
-                PacketProtection(bestAes128GcmAead(proto.serverKey), proto.serverKey, proto.serverIv, hp, proto.serverHp),
-        )
+        initial.resetForRetry(sendProtection = send, receiveProtection = receive)
         initial.cryptoSend.enqueue(savedClientHello)
 
         retryToken = retryPacket.retryToken
@@ -1406,7 +2319,46 @@ class QuicConnection(
             activeConnectionIdLimit = config.activeConnectionIdLimit,
             initialSourceConnectionId = sourceConnectionId.bytes,
             maxDatagramFrameSize = config.maxDatagramFrameSize,
+            minAckDelayMicros = if (config.ackFrequency) MIN_ACK_DELAY_MICROS else null,
+            versionInformation =
+                if (serverSetup != null) {
+                    VersionInformation(currentVersion, serverSetup.supportedVersions)
+                } else {
+                    // The version this attempt's Initials use: after Version
+                    // Negotiation, the one we restarted in (RFC 9368 §4).
+                    offeredVersions.takeIf { it.isNotEmpty() }?.let { VersionInformation(currentVersion, it) }
+                },
+            originalDestinationConnectionId = serverSetup?.originalDestinationConnectionId?.bytes,
+            retrySourceConnectionId = serverSetup?.retrySourceConnectionId?.bytes,
+            statelessResetToken = serverSetup?.let { it.statelessResetTokenFor(it.localConnectionId) },
+            preferredAddress =
+                serverPreferredAddressCid?.let { entry ->
+                    val pa = serverSetup!!.preferredAddress!!
+                    PreferredAddress(
+                        ipv4Address = pa.ipv4?.ip ?: ByteArray(4),
+                        ipv4Port = pa.ipv4?.port ?: 0,
+                        ipv6Address = pa.ipv6?.ip ?: ByteArray(16),
+                        ipv6Port = pa.ipv6?.port ?: 0,
+                        connectionId = entry.connectionId,
+                        statelessResetToken = entry.statelessResetToken,
+                    )
+                },
+            unknown = if (config.greaseTransportParameters) greaseTransportParameter() else emptyMap(),
         )
+
+    /** One reserved transport parameter, id 31*N+27 (RFC 9000 §18.1), with a few random bytes. */
+    private fun greaseTransportParameter(): Map<Long, ByteArray> {
+        val random =
+            com.vitorpamplona.crypto.random.RandomInstance
+                .bytes(3)
+        val n = (random[0].toLong() and 0xFF) or ((random[1].toLong() and 0x7F) shl 8)
+        val id = 31L * n + 27L
+        return mapOf(
+            id to
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes((random[2].toInt() and 0x07) + 1),
+        )
+    }
 
     /**
      * Lock-split refactor (2026-05-08): caller must hold [streamsLock]
@@ -1416,8 +2368,51 @@ class QuicConnection(
      * around CRYPTO-frame handling.
      */
     private fun applyPeerTransportParameters() {
-        val raw = tls.peerTransportParameters ?: return
-        val tp = TransportParameters.decode(raw)
+        val raw = handshakeTls.peerTransportParameters ?: return
+        val tp =
+            try {
+                TransportParameters.decode(raw)
+            } catch (e: com.vitorpamplona.quic.QuicCodecException) {
+                markClosedExternally(
+                    "TRANSPORT_PARAMETER_ERROR: ${e.message}",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
+                )
+                return
+            }
+        if (isServer) {
+            // RFC 9000 §18.2: these are the server's to send; a client that
+            // sends one is in error.
+            val serverOnly =
+                when {
+                    tp.originalDestinationConnectionId != null -> "original_destination_connection_id"
+                    tp.preferredAddress != null -> "preferred_address"
+                    tp.retrySourceConnectionId != null -> "retry_source_connection_id"
+                    tp.statelessResetToken != null -> "stateless_reset_token"
+                    else -> null
+                }
+            if (serverOnly != null) {
+                markClosedExternally(
+                    "TRANSPORT_PARAMETER_ERROR: client sent $serverOnly",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
+                )
+                return
+            }
+            // RFC 9368 §4: the client's Chosen Version must be the version of
+            // its Initial, or someone rewrote the packet to downgrade it.
+            val chosen = tp.versionInformation?.chosenVersion
+            if (chosen != null && chosen != initialVersion) {
+                markClosedExternally(
+                    "VERSION_NEGOTIATION_ERROR: client chose ${QuicVersion.name(chosen)} but its Initial was ${QuicVersion.name(initialVersion)}",
+                    errorCode = QuicTransportError.VERSION_NEGOTIATION_ERROR,
+                )
+                return
+            }
+        } else {
+            versionNegotiationError(tp.versionInformation)?.let { reason ->
+                markClosedExternally("VERSION_NEGOTIATION_ERROR: $reason", errorCode = QuicTransportError.VERSION_NEGOTIATION_ERROR)
+                return
+            }
+        }
         // Audit-4 #7: RFC 9000 §7.3 MUST checks. The peer's
         //   initial_source_connection_id MUST equal the SCID it put in its
         //     first Initial (which we adopted as `destinationConnectionId`).
@@ -1429,6 +2424,7 @@ class QuicConnection(
         if (iscid == null || !iscid.contentEquals(destinationConnectionId.bytes)) {
             markClosedExternally(
                 "TRANSPORT_PARAMETER_ERROR: peer initial_source_connection_id mismatch",
+                errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
             )
             return
         }
@@ -1436,9 +2432,10 @@ class QuicConnection(
         // We don't speak Retry yet, so the peer SHOULD echo our original DCID.
         // If it's missing (some servers omit it pre-handshake-complete) we
         // accept; if present but wrong we close.
-        if (odcid != null && !odcid.contentEquals(originalDestinationConnectionId.bytes)) {
+        if (!isServer && odcid != null && !odcid.contentEquals(originalDestinationConnectionId.bytes)) {
             markClosedExternally(
                 "TRANSPORT_PARAMETER_ERROR: peer original_destination_connection_id mismatch",
+                errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
             )
             return
         }
@@ -1458,6 +2455,7 @@ class QuicConnection(
             if (v < 1200L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: max_udp_payload_size $v < 1200",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
@@ -1466,6 +2464,7 @@ class QuicConnection(
             if (v > 20L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: ack_delay_exponent $v > 20",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
@@ -1474,11 +2473,19 @@ class QuicConnection(
             if (v < 2L) {
                 markClosedExternally(
                     "TRANSPORT_PARAMETER_ERROR: active_connection_id_limit $v < 2",
+                    errorCode = QuicTransportError.TRANSPORT_PARAMETER_ERROR,
                 )
                 return
             }
         }
         peerTransportParameters = tp
+        pmtud.setCeiling(
+            minOf(
+                config.maxUdpPayloadSize,
+                tp.maxUdpPayloadSize ?: MAX_UDP_PAYLOAD_DEFAULT,
+                PmtuDiscovery.MAX_PROBE_SIZE.toLong(),
+            ).toInt(),
+        )
         qlogObserver.onTransportParametersSet("remote", peerTransportParametersSummary(tp))
         sendConnectionFlowCredit = tp.initialMaxData ?: 0L
         peerMaxStreamsBidi = tp.initialMaxStreamsBidi ?: 0L
@@ -1488,7 +2495,7 @@ class QuicConnection(
             stream.sendCredit =
                 when (StreamId.kindOf(id)) {
                     StreamId.Kind.CLIENT_BIDI, StreamId.Kind.SERVER_BIDI -> {
-                        if (StreamId.isClientInitiated(id)) tp.initialMaxStreamDataBidiRemote ?: 0L else tp.initialMaxStreamDataBidiLocal ?: 0L
+                        if (isLocalStream(id)) tp.initialMaxStreamDataBidiRemote ?: 0L else tp.initialMaxStreamDataBidiLocal ?: 0L
                     }
 
                     StreamId.Kind.CLIENT_UNI, StreamId.Kind.SERVER_UNI -> {
@@ -1496,6 +2503,37 @@ class QuicConnection(
                     }
                 }
         }
+    }
+
+    /**
+     * RFC 9368 §4 downgrade checks on the server's Version Information.
+     * Returns why the connection must close, or null when it checks out.
+     */
+    private fun versionNegotiationError(vi: VersionInformation?): String? {
+        if (vi == null) {
+            // Servers MAY omit it, but not once we reacted to a Version
+            // Negotiation packet or the server switched our version.
+            return when {
+                vnConsumed -> "server sent no version_information after Version Negotiation"
+                compatibleVersionSwitched -> "server switched to ${QuicVersion.name(currentVersion)} without version_information"
+                else -> null
+            }
+        }
+        if (vi.chosenVersion != currentVersion) {
+            return "server chose ${QuicVersion.name(vi.chosenVersion)} but the connection runs ${QuicVersion.name(currentVersion)}"
+        }
+        if (offeredVersions.isNotEmpty() && !vnConsumed && vi.chosenVersion !in offeredVersions) {
+            return "server chose ${QuicVersion.name(vi.chosenVersion)}, which we did not offer"
+        }
+        if (vnConsumed) {
+            // We'd have picked the same version had the VN listed what the
+            // server really deploys; otherwise the VN was forged.
+            val wouldPick = versionPreference().firstOrNull { it in vi.availableVersions || it == vi.chosenVersion }
+            if (vi.availableVersions.isEmpty() || wouldPick != currentVersion) {
+                return "server's available versions ${vi.availableVersions.map { QuicVersion.name(it) }} contradict the Version Negotiation packet"
+            }
+        }
+        return null
     }
 
     /**
@@ -1621,15 +2659,18 @@ class QuicConnection(
                 "STREAM per packet under multiplex load."
         }
         if (nextLocalBidiIndex >= peerMaxStreamsBidi) {
+            noteStreamsBlocked(bidi = true)
             throw QuicStreamLimitException(
                 "peer-granted bidi stream cap reached " +
                     "(used=$nextLocalBidiIndex limit=$peerMaxStreamsBidi)",
             )
         }
-        val id = StreamId.build(StreamId.Kind.CLIENT_BIDI, nextLocalBidiIndex++)
+        val id = StreamId.build(if (isServer) StreamId.Kind.SERVER_BIDI else StreamId.Kind.CLIENT_BIDI, nextLocalBidiIndex++)
         val stream = QuicStream(id, QuicStream.Direction.BIDIRECTIONAL)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataBidiRemote ?: config.initialMaxStreamDataBidiRemote
         stream.receiveLimit = config.initialMaxStreamDataBidiLocal
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -1655,15 +2696,18 @@ class QuicConnection(
             "openUniStreamLocked requires streamsLock to be held"
         }
         if (nextLocalUniIndex >= peerMaxStreamsUni) {
+            noteStreamsBlocked(bidi = false)
             throw QuicStreamLimitException(
                 "peer-granted uni stream cap reached " +
                     "(used=$nextLocalUniIndex limit=$peerMaxStreamsUni)",
             )
         }
-        val id = StreamId.build(StreamId.Kind.CLIENT_UNI, nextLocalUniIndex++)
+        val id = StreamId.build(if (isServer) StreamId.Kind.SERVER_UNI else StreamId.Kind.CLIENT_UNI, nextLocalUniIndex++)
         val stream = QuicStream(id, QuicStream.Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE, bestEffort = bestEffort)
         stream.sendCredit = peerTransportParameters?.initialMaxStreamDataUni ?: config.initialMaxStreamDataUni
         stream.receiveLimit = 0L // can't receive
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         return stream
@@ -1829,7 +2873,10 @@ class QuicConnection(
 
     suspend fun streamById(id: Long): QuicStream? = streamsLock.withLock { streams[id] }
 
-    suspend fun queueDatagram(payload: ByteArray) = streamsLock.withLock { pendingDatagrams.addLast(payload) }
+    suspend fun queueDatagram(payload: ByteArray) {
+        streamsLock.withLock { pendingDatagrams.addLast(payload) }
+        wakeSender()
+    }
 
     suspend fun pollIncomingDatagram(): ByteArray? = streamsLock.withLock { incomingDatagrams.removeFirstOrNull() }
 
@@ -1938,6 +2985,12 @@ class QuicConnection(
         // to call after the monitor — complete() is idempotent and the
         // CLOSED transition has already been published via @Volatile.
         if (firstClose) closingDrainSignal.complete(Unit)
+        // RFC 9000 §10.2: an error we detected is an immediate close — tell the
+        // peer why instead of leaving it to time out. Built now, while the
+        // caller still holds the lock, and sent by the driver on its way out.
+        if (firstClose && errorCode != QuicTransportError.NO_ERROR) {
+            finalCloseDatagram = runCatching { buildTransportCloseDatagram(this, nowMillis(), errorCode, reason) }.getOrNull()
+        }
         if (firstClose) {
             // "remote" covers both peer-initiated CONNECTION_CLOSE and
             // local invariant violations (CID mismatch, frame decode
@@ -1973,6 +3026,10 @@ class QuicConnection(
      * delivered are surfaced to the collector before the Flow completes.
      */
     private fun closeAllSignals() {
+        // close() and markClosedExternally can race here from two threads;
+        // the endpoint's bookkeeping must run once.
+        val terminated = com.vitorpamplona.quic.synchronized(terminationLock) { onTerminated.also { onTerminated = null } }
+        terminated?.invoke()
         closedSignal.close()
         peerStreamSignal.close()
         incomingDatagramSignal.close()
@@ -1996,14 +3053,16 @@ class QuicConnection(
     internal fun getOrCreatePeerStreamLocked(id: Long): QuicStream {
         streams[id]?.let { return it }
         val kind = StreamId.kindOf(id)
+        val bidi = StreamId.isBidirectional(id)
+        val local = isLocalStream(id)
         val direction =
-            when (kind) {
-                StreamId.Kind.CLIENT_BIDI, StreamId.Kind.SERVER_BIDI -> QuicStream.Direction.BIDIRECTIONAL
-                StreamId.Kind.SERVER_UNI -> QuicStream.Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL
-                StreamId.Kind.CLIENT_UNI -> QuicStream.Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE
+            when {
+                bidi -> QuicStream.Direction.BIDIRECTIONAL
+                local -> QuicStream.Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE
+                else -> QuicStream.Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL
             }
         val stream = QuicStream(id, direction)
-        // Audit-4 #11: SERVER_BIDI peer-opened streams inherit
+        // Audit-4 #11: peer-opened bidi streams inherit
         // peerTransportParameters.initialMaxStreamDataBidiLocal as their
         // sendCredit (we are writing back on a stream the peer initiated;
         // the local-flow side's value applies). Previously they got 0L,
@@ -2011,22 +3070,24 @@ class QuicConnection(
         // MAX_STREAM_DATA arrived.
         val tp = peerTransportParameters
         stream.sendCredit =
-            when (kind) {
-                StreamId.Kind.SERVER_BIDI -> tp?.initialMaxStreamDataBidiLocal ?: 0L
-
-                // Peer-uni and (defensively) peer-attempted CLIENT_* streams
-                // can't be written from our side, so 0 is correct.
-                else -> 0L
+            if (bidi && !local) {
+                tp?.initialMaxStreamDataBidiLocal ?: 0L
+            } else {
+                // Peer-uni and (defensively) peer-attempted streams on our
+                // id space can't be written from our side, so 0 is correct.
+                0L
             }
         // Pick the local receive-limit appropriate for the stream's direction
         // — peer-bidi → we advertised initialMaxStreamDataBidiRemote;
         // peer-uni → we advertised initialMaxStreamDataUni.
         stream.receiveLimit =
-            when (kind) {
-                StreamId.Kind.SERVER_UNI, StreamId.Kind.CLIENT_UNI -> config.initialMaxStreamDataUni
-                StreamId.Kind.SERVER_BIDI -> config.initialMaxStreamDataBidiRemote
-                StreamId.Kind.CLIENT_BIDI -> config.initialMaxStreamDataBidiLocal
+            when {
+                !bidi -> config.initialMaxStreamDataUni
+                !local -> config.initialMaxStreamDataBidiRemote
+                else -> config.initialMaxStreamDataBidiLocal
             }
+        stream.consumptionListener = wakeSender
+        stream.sendListener = wakeSender
         streams[id] = stream
         streamsList = streamsList + stream
         newPeerStreams.addLast(stream)
@@ -2150,6 +3211,16 @@ class QuicConnection(
         }
     }
 
+    /** RFC 9001 §6.1: next_secret = HKDF-Expand-Label(current, "quic ku", "", Hash.length), on the suite's hash. */
+    private fun nextKeyPhaseSecret(current: ByteArray): ByteArray =
+        com.vitorpamplona.quic.tls.TlsHash
+            .forSecret(current)
+            .expandLabel(current, QuicVersion.keyUpdateLabel(currentVersion), current.size)
+
+    /** The keys [deriveNextPhaseReceiveKeys] last built, and the receive secret they came from. */
+    private var nextPhaseReceiveCache: com.vitorpamplona.quic.connection.PacketProtection? = null
+    private var nextPhaseReceiveCacheSecret: ByteArray? = null
+
     /**
      * RFC 9001 §6.1 key update — rotate application-level keys forward by
      * one phase. Called from [com.vitorpamplona.quic.connection.feedShortHeaderPacket]
@@ -2179,23 +3250,30 @@ class QuicConnection(
      * [newPhase] (concurrent path raced us to the rotation), this returns
      * the current keys unchanged. Should never happen given the parser is
      * single-threaded, but cheap insurance.
+     *
+     * The keys are cached until the receive secret moves on, so a run of
+     * packets with a flipped key-phase bit (a peer's update, or garbage
+     * that fails AEAD) costs one derivation, not one each.
      */
     internal fun deriveNextPhaseReceiveKeys(): com.vitorpamplona.quic.connection.PacketProtection? {
         val current = appReceiveSecret ?: return null
         val cs = appCipherSuite.takeIf { it != 0 } ?: return null
+        val live = application.receiveProtection ?: return null
+        nextPhaseReceiveCache?.let { cached ->
+            if (nextPhaseReceiveCacheSecret === current && cached.hp === live.hp) return cached
+        }
         // RFC 9001 §6.1 — secret rotation label.
         val nextSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(current, "quic ku", ByteArray(0), current.size)
+            nextKeyPhaseSecret(current)
         // Reuse the existing builder; it derives key + iv + hp from a secret,
         // and the spec just discards the new HP key (we keep the old one).
         val nextProtection =
             com.vitorpamplona.quic.connection.packetProtectionFromSecret(
                 cipherSuite = cs,
                 secret = nextSecret,
+                version = currentVersion,
             )
         // Keep the OLD HP key — RFC 9001 §6.1 forbids rotating it.
-        val live = application.receiveProtection ?: return null
         val rebound =
             com.vitorpamplona.quic.connection.PacketProtection(
                 aead = nextProtection.aead,
@@ -2204,6 +3282,8 @@ class QuicConnection(
                 hp = live.hp,
                 hpKey = live.hpKey,
             )
+        nextPhaseReceiveCache = rebound
+        nextPhaseReceiveCacheSecret = current
         // Rotation is committed by the caller after AEAD success — return
         // the new keys without mutating state. The caller calls
         // [commitKeyUpdate] on success.
@@ -2244,8 +3324,7 @@ class QuicConnection(
         val curRx = appReceiveSecret
         if (curRx != null && cs != 0) {
             appReceiveSecret =
-                com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curRx, "quic ku", ByteArray(0), curRx.size)
+                nextKeyPhaseSecret(curRx)
         }
         currentReceiveKeyPhase = !currentReceiveKeyPhase
 
@@ -2255,13 +3334,13 @@ class QuicConnection(
         val curTx = appSendSecret
         if (curTx != null && cs != 0) {
             val nextSendSecret =
-                com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curTx, "quic ku", ByteArray(0), curTx.size)
+                nextKeyPhaseSecret(curTx)
             appSendSecret = nextSendSecret
             val freshSend =
                 com.vitorpamplona.quic.connection.packetProtectionFromSecret(
                     cipherSuite = cs,
                     secret = nextSendSecret,
+                    version = currentVersion,
                 )
             val liveSend = application.sendProtection
             if (liveSend != null) {
@@ -2346,13 +3425,11 @@ class QuicConnection(
         // wasteful) and then promote them, ending up with our previous
         // receive keys orphaned in [previousReceiveProtection].
         val nextRxSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curRx, "quic ku", ByteArray(0), curRx.size)
+            nextKeyPhaseSecret(curRx)
         val nextTxSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curTx, "quic ku", ByteArray(0), curTx.size)
-        val freshRx = packetProtectionFromSecret(cs, nextRxSecret)
-        val freshTx = packetProtectionFromSecret(cs, nextTxSecret)
+            nextKeyPhaseSecret(curTx)
+        val freshRx = packetProtectionFromSecret(cs, nextRxSecret, currentVersion)
+        val freshTx = packetProtectionFromSecret(cs, nextTxSecret, currentVersion)
 
         previousReceiveProtection = liveRx
         application.receiveProtection =
@@ -2414,9 +3491,9 @@ class QuicConnection(
      *
      * Why retirement is safe even though the QUIC spec requires the peer
      * to deliver retransmits if its ACK never reached us:
-     *  - SEND side waits for `finAcked` / `resetAcked`, i.e. the peer has
-     *    already confirmed receipt of our FIN. After that point the peer
-     *    will not re-send anything on the stream.
+     *  - SEND side waits for `fullyAcked` / `resetAcked`, i.e. the peer has
+     *    confirmed every byte and the FIN (or our RESET_STREAM), so nothing
+     *    is left for us to retransmit.
      *  - RECEIVE side waits for the parser to have pushed every byte to
      *    the application's incoming Channel ([ReceiveBuffer.isFullyRead]).
      *    Retired stream IDs are recorded in [retiredStreamIdSet] so a
@@ -2427,7 +3504,8 @@ class QuicConnection(
      */
     internal fun retireFullyDoneStreamsLocked(): Int {
         val current = streamsList
-        if (current.isEmpty()) return 0
+        // Runs on every packet build: nothing to retire is the usual case, so check before allocating.
+        if (current.none { it.isFullyRetired }) return 0
         // Build the post-retire snapshot in one pass. Mutating the live
         // [streamsList] in-place would force readers (closeAllSignals,
         // diagnostic accessors) to take [streamsLock] just to iterate;
@@ -2443,7 +3521,10 @@ class QuicConnection(
             // Fold the per-stream receive high-water into the cumulative
             // counter BEFORE we drop it — once we lose the reference the
             // writer can no longer reconstruct the contribution.
-            retiredStreamsRecvBytes += stream.receive.contiguousEnd()
+            retiredStreamsRecvBytes += stream.creditedReceiveBytes
+            if (!isLocalStream(stream.streamId)) {
+                if (StreamId.isUnidirectional(stream.streamId)) retiredPeerUniCount++ else retiredPeerBidiCount++
+            }
             // Defence-in-depth: ensure the application-side incoming
             // channel is closed even if the parser somehow missed the
             // closeIncoming call (e.g. a stream that finished via
@@ -2544,6 +3625,7 @@ class QuicConnection(
             PathValidator.RecordResult.RetirePriorToExceedsSequence -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID retire_prior_to ($retirePriorTo) > sequence_number ($sequenceNumber)",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2551,6 +3633,7 @@ class QuicConnection(
             PathValidator.RecordResult.DuplicateSequenceMismatch -> {
                 markClosedExternally(
                     "PROTOCOL_VIOLATION: NEW_CONNECTION_ID seq=$sequenceNumber re-issued with different bytes",
+                    errorCode = QuicTransportError.PROTOCOL_VIOLATION,
                 )
                 return
             }
@@ -2558,6 +3641,7 @@ class QuicConnection(
             PathValidator.RecordResult.InvalidCidLength -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID has invalid cid length",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2565,6 +3649,7 @@ class QuicConnection(
             PathValidator.RecordResult.InvalidStatelessResetToken -> {
                 markClosedExternally(
                     "FRAME_ENCODING_ERROR: NEW_CONNECTION_ID has invalid stateless reset token length",
+                    errorCode = QuicTransportError.FRAME_ENCODING_ERROR,
                 )
                 return
             }
@@ -2586,6 +3671,7 @@ class QuicConnection(
                 // CONNECTION_ID_LIMIT_ERROR is the canonical close.
                 markClosedExternally(
                     "CONNECTION_ID_LIMIT_ERROR: peer retired our active CID with no spare available",
+                    errorCode = QuicTransportError.CONNECTION_ID_LIMIT_ERROR,
                 )
             }
 
@@ -2664,10 +3750,12 @@ class QuicConnection(
         if (sequenceNumber >= nextOwnSourceCidSeq) {
             markClosedExternally(
                 "PROTOCOL_VIOLATION: RETIRE_CONNECTION_ID seq=$sequenceNumber ≥ next-issued seq=$nextOwnSourceCidSeq",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
             )
             return
         }
         val removed = issuedSourceConnectionIds.remove(sequenceNumber)
+        removed?.let { serverSetup?.onConnectionIdRetired(ConnectionId(it.connectionId)) }
         if (removed == null) {
             // Already-retired entry; benign §19.16 retransmit.
             return
@@ -2683,6 +3771,7 @@ class QuicConnection(
             markClosedExternally(
                 "PROTOCOL_VIOLATION: peer retired our initial SCID (seq=0) and no spare " +
                     "is left in the issued pool",
+                errorCode = QuicTransportError.PROTOCOL_VIOLATION,
             )
             return
         }
@@ -2716,12 +3805,7 @@ class QuicConnection(
         repeat(count) {
             val seq = nextOwnSourceCidSeq
             nextOwnSourceCidSeq += 1
-            val cidBytes =
-                com.vitorpamplona.crypto.random.RandomInstance
-                    .bytes(sourceConnectionId.length)
-            val token =
-                com.vitorpamplona.crypto.random.RandomInstance
-                    .bytes(16)
+            val (cidBytes, token) = mintOwnConnectionId()
             issuedSourceConnectionIds[seq] = IssuedSourceConnectionIdEntry(seq, cidBytes, token)
             pendingOwnNewConnectionIdEmits.addLast(
                 com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewConnectionId(
@@ -2735,6 +3819,20 @@ class QuicConnection(
         ownSourceCidsIssued = true
     }
 
+    /** A fresh source CID and its stateless reset token; a server registers the CID with its endpoint. */
+    private fun mintOwnConnectionId(): Pair<ByteArray, ByteArray> {
+        val cid =
+            com.vitorpamplona.crypto.random.RandomInstance
+                .bytes(sourceConnectionId.length)
+        val setup =
+            serverSetup ?: return cid to
+                com.vitorpamplona.crypto.random.RandomInstance
+                    .bytes(16)
+        val id = ConnectionId(cid)
+        setup.onConnectionIdIssued(id)
+        return cid to setup.statelessResetTokenFor(id)
+    }
+
     /**
      * Issue exactly one replacement source CID after the peer has
      * retired one of ours (RFC 9000 §5.1.2: the peer is allowed to
@@ -2746,12 +3844,7 @@ class QuicConnection(
     internal fun issueOwnReplacementSourceCidLocked() {
         val seq = nextOwnSourceCidSeq
         nextOwnSourceCidSeq += 1
-        val cidBytes =
-            com.vitorpamplona.crypto.random.RandomInstance
-                .bytes(sourceConnectionId.length)
-        val token =
-            com.vitorpamplona.crypto.random.RandomInstance
-                .bytes(16)
+        val (cidBytes, token) = mintOwnConnectionId()
         issuedSourceConnectionIds[seq] = IssuedSourceConnectionIdEntry(seq, cidBytes, token)
         pendingOwnNewConnectionIdEmits.addLast(
             com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewConnectionId(
@@ -2810,6 +3903,94 @@ class QuicConnection(
         }
         return result
     }
+
+    /**
+     * Start probing the server's preferred address (RFC 9000 §9.6.1) if it
+     * offered one, the handshake is confirmed and no probe ran yet. Picks the
+     * address of the active path's family, falling back to the other.
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun maybeStartPreferredAddressProbeLocked(nowMillis: Long) {
+        if (!config.migrateToPreferredAddress || !handshakeConfirmed || status != Status.CONNECTED) return
+        if (pathProbe != null || migratedToPreferredAddress) return
+        val pa = peerTransportParameters?.preferredAddress ?: return
+        val v4 = pa.ipv4Host?.let { it to pa.ipv4Port }
+        val v6 = pa.ipv6Host?.let { it to pa.ipv6Port }
+        val (host, port) = (if (activePathIsIpv6) v6 ?: v4 else v4 ?: v6) ?: return
+        val ptoMs = lossDetection.ptoBaseMs(peerTransportParameters?.maxAckDelay ?: 0L)
+        pathProbe =
+            PathProbe(
+                host = host,
+                port = port,
+                connectionId = ConnectionId(pa.connectionId),
+                connectionIdSequence = PREFERRED_ADDRESS_CID_SEQUENCE,
+                startedAtMillis = nowMillis,
+                timeoutMillis = maxOf(3L * ptoMs * PathProbe.MAX_CHALLENGES / 2, PathProbe.MIN_TIMEOUT_MILLIS),
+            )
+        QuicLog.d(TAG) { "probing preferred address $host:$port" }
+    }
+
+    /**
+     * A PATH_RESPONSE matched the probe: send everything to the preferred
+     * address from now on, with its connection ID, and retire the one the old
+     * path used (RFC 9000 §9.5: a connection ID is not reused across paths).
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun completePreferredAddressMigrationLocked() {
+        val probe = pathProbe ?: return
+        if (probe.state != PathProbe.State.PROBING) return
+        probe.state = PathProbe.State.VALIDATED
+        migratedToPreferredAddress = true
+        // A different server address is a new path.
+        resetPathStateLocked()
+        val priorSeq = pathValidator.activeCidSequence
+        destinationConnectionId = probe.connectionId
+        pathValidator.adoptConnectionId(probe.connectionIdSequence)
+        // Path state that belonged to the old path. The new path's RTT is
+        // unknown, so restart PTO backoff from the estimator's baseline.
+        pendingPathChallengePayloads.clear()
+        // Challenges the server sent on the probed path and we haven't answered
+        // yet are now owed on the active path: the probe sends nothing more, and
+        // lsquic kept sending on the old path while its challenge went unanswered.
+        pendingPathChallengePayloads.addAll(probe.pendingResponses)
+        probe.pendingResponses.clear()
+        consecutivePtoCount = 0
+        // §9.6.2: the server moves its own sending once it sees a non-probing
+        // packet from us at the preferred address; make the next one go now.
+        pendingPing = true
+        qlogObserver.onPathValidationSucceeded(probe.connectionIdSequence)
+        qlogObserver.onConnectionIdActivated("peer", probe.connectionIdSequence, probe.connectionId.bytes)
+        qlogObserver.onConnectionIdRetired("peer", priorSeq)
+        QuicLog.d(TAG) { "migrated to preferred address ${probe.host}:${probe.port}" }
+    }
+
+    /**
+     * Abandon a probe that ran out of time or couldn't open its socket. The
+     * connection keeps using its original path (RFC 9000 §9.6.1).
+     *
+     * Caller must hold [streamsLock].
+     */
+    internal fun failPathProbeLocked(reason: String) {
+        val probe = pathProbe ?: return
+        if (probe.state == PathProbe.State.VALIDATED || probe.state == PathProbe.State.FAILED) return
+        probe.state = PathProbe.State.FAILED
+        QuicLog.d(TAG) { "preferred address ${probe.host}:${probe.port} unusable: $reason" }
+    }
+
+    /** Fails the probe once its validation budget is spent. Caller must hold [streamsLock]. */
+    internal fun checkPathProbeTimeoutLocked(nowMillis: Long) {
+        val probe = pathProbe ?: return
+        if (probe.state != PathProbe.State.PROBING && probe.state != PathProbe.State.AWAITING_SOCKET) return
+        if (probe.isTimedOut(nowMillis)) failPathProbeLocked("no PATH_RESPONSE within ${probe.timeoutMillis} ms")
+    }
+
+    /**
+     * Re-send cadence for probe challenges: the active path's PTO, floored so a
+     * near-zero RTT estimate can't turn the probe into a flood.
+     */
+    internal fun pathProbeRetransmitMillis(): Long = lossDetection.ptoBaseMs(peerTransportParameters?.maxAckDelay ?: 0L).coerceAtLeast(MIN_PROBE_RETRANSMIT_MS)
 
     /**
      * Public counterpart to [triggerPathMigrationLocked] — acquires
@@ -2956,6 +4137,11 @@ class QuicConnection(
                 anyMatch = true
             }
         }
+        peerTransportParameters?.preferredAddress?.statelessResetToken?.let { tok ->
+            if (tok.size == 16 && constantTimeEqualsRange(tok, datagram, tokenStart)) {
+                anyMatch = true
+            }
+        }
         for (token in pathValidator.allKnownStatelessResetTokens()) {
             if (token.size != 16) continue
             if (constantTimeEqualsRange(token, datagram, tokenStart)) {
@@ -2996,7 +4182,7 @@ class QuicConnection(
      *    [destinationConnectionId] to the new bytes synchronously
      *    here, before the lock is released. Otherwise the next
      *    drain would stamp the just-retired CID on the wire (the
-     *    bug from `quic/plans/2026-05-08-rebind-port-bug.md` —
+     *    bug from `plans/2026-05-08-rebind-port-bug.md` —
      *    quic-go / picoquic / msquic / mvfst correctly close us
      *    with PROTOCOL_VIOLATION when they see "RETIRE(seq=N) +
      *    DCID=seq=N bytes" in the same packet).
@@ -3051,7 +4237,39 @@ class QuicConnection(
      *
      * Caller must hold [streamsLock].
      */
-    internal fun queuePathResponseLocked(challengeData: ByteArray) {
+    internal fun queuePathResponseLocked(
+        challengeData: ByteArray,
+        path: NetworkPath = NetworkPath.ACTIVE,
+    ) {
+        // RFC 9000 §8.2.2: answer on the path the challenge arrived on. A
+        // challenge on the path we just left has no socket to answer on.
+        // A server tells paths apart by [datagramPath]: one other than the
+        // path we send on gets its answer there, in a datagram of its own.
+        if (isServer) {
+            val arrived = datagramPath
+            if (arrived != null && arrived != sendPath) {
+                if (serverProbeResponses.size < MAX_PENDING_PATH_RESPONSES) serverProbeResponses.addLast(arrived to challengeData)
+                return
+            }
+        }
+        when (path) {
+            NetworkPath.ACTIVE -> {}
+
+            NetworkPath.PROBE -> {
+                val probe = pathProbe ?: return
+                // A PATH_RESPONSE earlier in the same packet may have validated
+                // the probe, which makes its path the active one: answer there.
+                if (probe.state == PathProbe.State.PROBING) {
+                    if (probe.pendingResponses.size < MAX_PENDING_PATH_RESPONSES) probe.pendingResponses.addLast(challengeData)
+                    return
+                }
+                if (probe.state != PathProbe.State.VALIDATED) return
+            }
+
+            NetworkPath.RETIRED -> {
+                return
+            }
+        }
         if (pendingPathChallengePayloads.size >= MAX_PENDING_PATH_RESPONSES) return
         // The parser produces a fresh ByteArray per PATH_CHALLENGE
         // (see [com.vitorpamplona.quic.Buffer.QuicReader.readBytes],
@@ -3114,6 +4332,7 @@ class QuicConnection(
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewConnectionId,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.PathChallenge,
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.RetireConnectionId,
+                is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewToken,
                 -> {
                     // Flow-control extensions, NEW_CONNECTION_ID,
                     // PATH_CHALLENGE, and RETIRE_CONNECTION_ID have
@@ -3125,6 +4344,10 @@ class QuicConnection(
                     // that's NOT path validation success. Validation
                     // requires the matching PATH_RESPONSE
                     // (handled in [applyPeerPathResponseLocked]).
+                }
+
+                com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone -> {
+                    handshakeDoneAcked = true
                 }
 
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.ResetStream -> {
@@ -3162,7 +4385,7 @@ class QuicConnection(
     }
 
     /**
-     * Step 6 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+     * Step 6 of `plans/2026-05-04-control-frame-retransmit.md`:
      * dispatch the tokens of declared-lost packets to the matching
      * `pending*` field, applying the supersede check from neqo's
      * `fc.rs::frame_lost`. The supersede invariant: only re-flag for
@@ -3251,6 +4474,7 @@ class QuicConnection(
                 }
 
                 is com.vitorpamplona.quic.connection.recovery.RecoveryToken.PathChallenge -> {
+                    peerMigration?.let { if (it.challenge.contentEquals(token.data)) it.challengePending = true }
                     // RFC 9000 §8.2.1: if a PATH_CHALLENGE is lost
                     // (carrying packet declared lost without an
                     // ACK), the spec permits but does not require
@@ -3276,11 +4500,38 @@ class QuicConnection(
                     // duplicate (queueRetireSequence dedupes).
                     pathValidator.queueRetireSequence(token.sequenceNumber)
                 }
+
+                com.vitorpamplona.quic.connection.recovery.RecoveryToken.HandshakeDone -> {
+                    pendingHandshakeDone = true
+                }
+
+                is com.vitorpamplona.quic.connection.recovery.RecoveryToken.NewToken -> {
+                    pendingNewToken = token.token
+                }
             }
         }
     }
 
     companion object {
+        private const val TAG = "QuicConnection"
+
+        /** Our `min_ack_delay`: the millisecond clock can't do better. */
+        internal const val MIN_ACK_DELAY_MICROS: Long = 1_000L
+
+        /** Bounds what an ACK_FREQUENCY can make us hold back. */
+        private const val MAX_ACK_ELICITING_THRESHOLD: Long = 1_000L
+
+        /** Floor on the wait for a migrated client's PATH_RESPONSE before going back. */
+        private const val PEER_MIGRATION_MIN_TIMEOUT_MS = 1_000L
+
+        /** RFC 9000 §5.1.1: the connection ID in `preferred_address` has sequence number 1. */
+        internal const val PREFERRED_ADDRESS_CID_SEQUENCE: Long = 1L
+
+        private const val MIN_PROBE_RETRANSMIT_MS: Long = 100L
+
+        /** RFC 9000 §18.2 default `max_udp_payload_size`. */
+        private const val MAX_UDP_PAYLOAD_DEFAULT: Long = 65_527L
+
         /**
          * RFC 9000 §10.2.2 floor on the draining-period grace. The
          * spec mandates "at least 3 * PTO" which can be vanishingly
@@ -3332,6 +4583,9 @@ class QuicConnection(
          * PTO if path validation matters to them).
          */
         const val MAX_PENDING_PATH_RESPONSES: Int = 64
+
+        /** How long a path a client probed counts as validated (RFC 9000 §9.3 "recently"). */
+        const val RECENTLY_VALIDATED_MS: Long = 30_000L
     }
 }
 
@@ -3341,7 +4595,7 @@ class QuicConnection(
  * fresh [kotlin.time.TimeSource.Monotonic.markNow] mark. Only differences are
  * meaningful; an NTP step / suspend-resume does not affect the values.
  */
-private fun defaultMonotonicNowMillis(): () -> Long {
+internal fun defaultMonotonicNowMillis(): () -> Long {
     val anchor =
         kotlin.time.TimeSource.Monotonic
             .markNow()
@@ -3354,7 +4608,7 @@ private fun defaultMonotonicNowMillis(): () -> Long {
  * stamp `TlsResumptionState.issuedAtMillis`, so deltas across the pair are
  * meaningful even across process restarts.
  */
-private fun defaultEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
+internal fun defaultEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
 
 /**
  * One source CID we've issued to the peer (RFC 9000 §5.1.1 +

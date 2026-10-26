@@ -21,6 +21,7 @@
 package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.crypto.sha2.sha256
+import com.vitorpamplona.crypto.sha2.sha384
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -29,7 +30,8 @@ import kotlin.test.assertFalse
 /**
  * Regression coverage for [TlsTranscriptHash] after the switch from the
  * O(n²) "concatenate-and-rehash on every snapshot" implementation to an
- * incremental SHA-256 driven by [TlsRunningSha256].
+ * incremental digest, and its choice of hash (SHA-256, or SHA-384 for
+ * TLS_AES_256_GCM_SHA384) once the cipher suite is known.
  *
  * The contract that production TLS code depends on:
  *
@@ -39,7 +41,7 @@ import kotlin.test.assertFalse
  *      keep extending the same digest. This is the non-obvious bit: a naive
  *      `digest.digest()` finalizes and resets, so without the clone trick a
  *      handshake-mid snapshot would silently corrupt later snapshots.
- *   4. Output is always 32 bytes.
+ *   4. Output is always 32 bytes, until SHA-384 is selected.
  */
 class TlsTranscriptHashTest {
     @Test
@@ -112,5 +114,36 @@ class TlsTranscriptHashTest {
         transcript.append(byteArrayOf(0x01))
         val after = transcript.snapshot()
         assertFalse(before.contentEquals(after))
+    }
+
+    @Test
+    fun the_hash_is_chosen_after_the_first_messages() {
+        // A client hashes its ClientHello before the ServerHello names the suite.
+        val transcript = TlsTranscriptHash()
+        val ch = byteArrayOf(1, 0, 0, 1, 7)
+        val sh = byteArrayOf(2, 0, 0, 1, 9)
+        transcript.append(ch)
+        assertContentEquals(sha384(ch), transcript.peek(TlsHash.SHA384))
+        assertContentEquals(sha256(ch + sh), transcript.peek(TlsHash.SHA256, sh), "peek hashes extra bytes without appending them")
+        transcript.select(TlsHash.SHA384)
+        transcript.append(sh)
+        val snapshot = transcript.snapshot()
+        assertEquals(48, snapshot.size)
+        assertContentEquals(sha384(ch + sh), snapshot)
+        assertContentEquals(sha384(ch + sh + ch), transcript.peek(TlsHash.SHA384, ch))
+        assertContentEquals(snapshot, transcript.snapshot(), "peek did not append")
+    }
+
+    @Test
+    fun a_retry_replaces_the_client_hello_with_message_hash() {
+        // RFC 8446 §4.4.1: message_hash = 254, 00 00 Hash.length, Hash(ClientHello1).
+        val transcript = TlsTranscriptHash()
+        val ch1 = byteArrayOf(1, 0, 0, 2, 5, 6)
+        val hrr = byteArrayOf(2, 0, 0, 1, 3)
+        transcript.append(ch1)
+        transcript.replaceWithMessageHash(TlsHash.SHA384)
+        transcript.append(hrr)
+        val messageHash = byteArrayOf(254.toByte(), 0, 0, 48) + sha384(ch1)
+        assertContentEquals(sha384(messageHash + hrr), transcript.snapshot())
     }
 }

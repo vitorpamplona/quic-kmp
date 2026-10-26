@@ -34,6 +34,11 @@ class QuicWriter(
 
     fun toByteArray(): ByteArray = buf.copyOf(pos)
 
+    /** Empty the writer, keeping its buffer for reuse. */
+    fun reset() {
+        pos = 0
+    }
+
     fun writeByte(value: Int) {
         ensure(1)
         buf[pos++] = value.toByte()

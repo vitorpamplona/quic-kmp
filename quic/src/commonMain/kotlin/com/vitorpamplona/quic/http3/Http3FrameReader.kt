@@ -62,10 +62,21 @@ class Http3FrameReader(
     private val context: StreamContext = StreamContext.UNCHECKED,
     private val maxPendingBytes: Int = DEFAULT_MAX_PENDING_BYTES,
     private val maxFrameBodyBytes: Int = DEFAULT_MAX_FRAME_BODY_BYTES,
+    /**
+     * Hand out DATA bodies as they arrive, as several [Http3Frame.Data] for
+     * one frame on the wire, instead of buffering each whole frame: a DATA
+     * frame can then be any size (RFC 9114 sets no limit, and some servers
+     * send a whole response as one). [maxFrameBodyBytes] still bounds the
+     * other frame types.
+     */
+    private val streamData: Boolean = false,
 ) {
     private var buf: ByteArray = ByteArray(0)
     private var pos: Int = 0
     private var framesEmitted: Int = 0
+
+    /** With [streamData]: bytes of the current DATA frame's body still to come. */
+    private var dataRemaining: Long = 0L
 
     /** Bytes currently buffered awaiting a complete frame. Diagnostic; tests use this. */
     val bufferedBytes: Int get() = buf.size - pos
@@ -124,11 +135,19 @@ class Http3FrameReader(
 
     /** Pop the next complete frame, or null if the buffer doesn't contain one yet. */
     fun next(): Http3Frame? {
+        if (dataRemaining > 0L) return nextDataChunk()
         val typeRes = Varint.decode(buf, pos) ?: return null
         val typeEnd = pos + typeRes.bytesConsumed
         val lenRes = Varint.decode(buf, typeEnd) ?: return null
         val bodyStart = typeEnd + lenRes.bytesConsumed
         val len = lenRes.value
+        if (streamData && typeRes.value == Http3FrameType.DATA && len >= 0) {
+            validateFrameType(Http3FrameType.DATA)
+            pos = bodyStart
+            framesEmitted++
+            dataRemaining = len
+            return if (len == 0L) Http3Frame.Data(ByteArray(0)) else nextDataChunk()
+        }
         if (len < 0 || len > maxFrameBodyBytes.toLong()) {
             throw QuicCodecException(
                 "HTTP/3 frame length out of range: $len (cap $maxFrameBodyBytes)",
@@ -148,6 +167,17 @@ class Http3FrameReader(
             Http3FrameType.GOAWAY -> Http3Frame.Goaway(body)
             else -> Http3Frame.Unknown(type, body)
         }
+    }
+
+    /** The buffered part of the current DATA frame's body; null when none is buffered yet. */
+    private fun nextDataChunk(): Http3Frame.Data? {
+        val available = buf.size - pos
+        if (available == 0) return null
+        val n = minOf(available.toLong(), dataRemaining).toInt()
+        val body = buf.copyOfRange(pos, pos + n)
+        pos += n
+        dataRemaining -= n
+        return Http3Frame.Data(body)
     }
 
     /**

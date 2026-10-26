@@ -31,7 +31,7 @@ import kotlin.math.abs
  * single path). Per-encryption-space state — `largestAckedPn`,
  * `largestAckedSentTime` — lives on [com.vitorpamplona.quic.connection.LevelState].
  *
- * Step 5 of `quic/plans/2026-05-04-control-frame-retransmit.md`: this
+ * Step 5 of `plans/2026-05-04-control-frame-retransmit.md`: this
  * file implements the algorithm; the parser invokes it on every
  * inbound ACK; step 6 dispatches the returned lost-token list to
  * the `pending*` setters.
@@ -72,6 +72,15 @@ class QuicLossDetection {
     /** True after the first valid RTT sample has been processed. */
     var hasFirstRttSample: Boolean = false
         private set
+
+    /** A new path (RFC 9000 §9.4): its RTT is unknown, so start from the initial estimate. */
+    fun resetRttForNewPath() {
+        smoothedRttMs = INITIAL_RTT_MS
+        rttVarMs = INITIAL_RTT_MS / 2
+        latestRttMs = INITIAL_RTT_MS
+        minRttMs = Long.MAX_VALUE
+        hasFirstRttSample = false
+    }
 
     /**
      * Update RTT estimates from a new ACK that newly-acknowledged

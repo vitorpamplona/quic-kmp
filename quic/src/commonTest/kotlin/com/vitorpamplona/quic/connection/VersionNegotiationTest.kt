@@ -38,7 +38,7 @@ import kotlin.test.assertTrue
  *
  *   1. Validate the VN packet (DCID echoed = our SCID, list does NOT
  *      include the version we offered).
- *   2. Pick a version it can speak from the list (we only support v1).
+ *   2. Pick a version it can speak from the list (v1 or v2).
  *   3. Generate a fresh DCID, re-derive Initial keys, reset Initial PN
  *      space, re-emit the cached ClientHello, and switch the writer's
  *      stamped version to v1.
@@ -172,13 +172,12 @@ class VersionNegotiationTest {
         val client = newClient(QuicVersion.FORCE_VERSION_NEGOTIATION)
         client.start()
 
-        // quic-go's force-VN test version. We don't support it, so the
-        // handshake must fail.
+        // QUIC draft-29. We don't support it, so the handshake must fail.
         val vn =
             encodeVnPacket(
                 echoedDcid = client.sourceConnectionId,
                 serverScid = ConnectionId.random(8),
-                supportedVersions = listOf(0x6b3343cf),
+                supportedVersions = listOf(0xff00001d.toInt()),
             )
 
         feedDatagram(client, vn, nowMillis = 0L)

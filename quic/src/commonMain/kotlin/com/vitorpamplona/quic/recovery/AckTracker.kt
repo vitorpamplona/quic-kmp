@@ -35,12 +35,42 @@ class AckTracker {
     private var ackElicitingPending: Boolean = false
     private var largestRecvTimeMillis: Long = 0L
 
+    /** Ack-eliciting packets received since the last ACK we built (RFC 9000 §13.2.2). */
+    private var ackElicitingSinceAck: Int = 0
+
+    /** Arrival time of the oldest ack-eliciting packet the next ACK will cover. */
+    private var firstUnackedAtMillis: Long = Long.MIN_VALUE
+
+    /** An arrival out of order (a gap or a fill) since the last ACK: acknowledge at once (§13.2.1). */
+    private var reorderedSinceAck: Boolean = false
+
+    /**
+     * Ack-eliciting packets that make an ACK due; RFC 9000's two unless the
+     * peer asked otherwise with ACK_FREQUENCY (draft-ietf-quic-ack-frequency).
+     */
+    var ackElicitingThreshold: Int = ACK_ELICITING_THRESHOLD
+
+    /** Whether reordering makes an ACK due at once; an ACK_FREQUENCY can turn it off. */
+    var ackOnReorder: Boolean = true
+
+    /** An IMMEDIATE_ACK arrived: the next drain acknowledges. */
+    private var immediateAckRequested: Boolean = false
+
+    fun requestImmediateAck() {
+        immediateAckRequested = true
+    }
+
     fun receivedPacket(
         packetNumber: Long,
         ackEliciting: Boolean,
         receivedAtMillis: Long,
     ) {
-        if (ackEliciting) ackElicitingPending = true
+        if (ackEliciting) {
+            if (!ackElicitingPending) firstUnackedAtMillis = receivedAtMillis
+            ackElicitingPending = true
+            ackElicitingSinceAck++
+            if (ranges.isNotEmpty() && packetNumber != ranges[0].endInclusive + 1) reorderedSinceAck = true
+        }
         if (ranges.isEmpty()) {
             ranges += LongRange(packetNumber, packetNumber)
             largestRecvTimeMillis = receivedAtMillis
@@ -105,6 +135,25 @@ class AckTracker {
     fun hasUnackedAckEliciting(): Boolean = ackElicitingPending
 
     /**
+     * RFC 9000 §13.2.1–§13.2.2 delayed-ACK policy for the application space:
+     * an ACK is due once two ack-eliciting packets arrived, as soon as one
+     * arrived out of order, or when the oldest unacknowledged one has waited
+     * [maxAckDelayMillis]. Initial and Handshake packets are acknowledged at
+     * once, so callers don't consult this for those spaces.
+     */
+    fun ackDue(
+        nowMillis: Long,
+        maxAckDelayMillis: Long,
+    ): Boolean {
+        if (!ackElicitingPending) return false
+        if (immediateAckRequested || ackElicitingSinceAck >= ackElicitingThreshold || reorderedSinceAck && ackOnReorder) return true
+        return nowMillis - firstUnackedAtMillis >= maxAckDelayMillis
+    }
+
+    /** When the pending ACK becomes due on its timer, or null when none is pending. */
+    fun ackDeadlineMillis(maxAckDelayMillis: Long): Long? = if (ackElicitingPending) firstUnackedAtMillis + maxAckDelayMillis else null
+
+    /**
      * Drop ranges entirely below [threshold] — typically called after the peer
      * acknowledges a packet whose number ≥ threshold, since older ranges no
      * longer need to be advertised in our outbound ACKs. Without this the
@@ -132,7 +181,41 @@ class AckTracker {
 
     fun isEmpty(): Boolean = ranges.isEmpty()
 
+    /** Whether [packetNumber] lies in a range still tracked (older ranges get purged or trimmed). */
+    fun hasReceived(packetNumber: Long): Boolean {
+        for (r in ranges) {
+            if (packetNumber > r.endInclusive) return false
+            if (packetNumber >= r.start) return true
+        }
+        return false
+    }
+
     fun largestReceived(): Long = if (ranges.isEmpty()) -1L else ranges[0].endInclusive
+
+    /**
+     * The encoded size of the ACK [buildAckFrame] would return now (ack
+     * delay counted at its widest, 4 bytes), without consuming it; 0 when
+     * none is pending. Lets a packet leave room for an ACK that rides along.
+     */
+    fun pendingAckFrameSize(): Int {
+        if (ranges.isEmpty() || !ackElicitingPending) return 0
+        val largest = ranges[0].endInclusive
+        var size =
+            1 +
+                com.vitorpamplona.quic.Varint
+                    .size(largest) + 4 +
+                com.vitorpamplona.quic.Varint
+                    .size((ranges.size - 1).toLong()) +
+                com.vitorpamplona.quic.Varint
+                    .size(largest - ranges[0].start)
+        for (i in 1 until ranges.size) {
+            size += com.vitorpamplona.quic.Varint
+                .size(ranges[i - 1].start - ranges[i].endInclusive - 2) +
+                com.vitorpamplona.quic.Varint
+                    .size(ranges[i].endInclusive - ranges[i].start)
+        }
+        return size
+    }
 
     /**
      * Build an ACK frame covering everything we've received, OR null if nothing
@@ -152,9 +235,11 @@ class AckTracker {
     fun buildAckFrame(
         nowMillis: Long,
         ackDelayExponent: Int = 3,
+        /** Repeat the latest ACK even with nothing new to acknowledge. */
+        force: Boolean = false,
     ): AckFrame? {
         if (ranges.isEmpty()) return null
-        if (!ackElicitingPending) return null
+        if (!ackElicitingPending && !force) return null
         val largest = ranges[0].endInclusive
         val firstRangeLength = largest - ranges[0].start
         val rest = mutableListOf<AckRange>()
@@ -173,6 +258,9 @@ class AckTracker {
         val rawDelayMicros = (nowMillis - largestRecvTimeMillis).coerceAtLeast(0L) * 1000L
         val ackDelay = rawDelayMicros ushr ackDelayExponent
         ackElicitingPending = false
+        ackElicitingSinceAck = 0
+        reorderedSinceAck = false
+        immediateAckRequested = false
         return AckFrame(
             largestAcknowledged = largest,
             ackDelay = ackDelay,
@@ -182,6 +270,9 @@ class AckTracker {
     }
 
     companion object {
+        /** RFC 9000 §13.2.2: acknowledge at least every second ack-eliciting packet. */
+        const val ACK_ELICITING_THRESHOLD: Int = 2
+
         /**
          * Cap on stored disjoint ranges. 64 is far above any healthy-link
          * count (a single in-order receive needs 1 range; tens of

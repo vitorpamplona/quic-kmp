@@ -74,23 +74,41 @@ class InMemoryQuicPipe(
      * to construct their own. Tests that want to exercise specific TP values
      * build their own server and pass it.
      */
-    private val tlsServer: InProcessTlsServer =
-        InProcessTlsServer(
-            transportParameters =
-                TransportParameters(
-                    initialMaxData = 1_000_000,
-                    initialMaxStreamDataBidiLocal = 100_000,
-                    initialMaxStreamDataBidiRemote = 100_000,
-                    initialMaxStreamDataUni = 100_000,
-                    initialMaxStreamsBidi = 16,
-                    initialMaxStreamsUni = 16,
-                    initialSourceConnectionId = serverScid.bytes,
-                    originalDestinationConnectionId = initialDcid,
-                ).encode(),
-        ),
+    tlsServer: InProcessTlsServer? = null,
+    /**
+     * Version the server answers in. Anything other than the client's first
+     * Initial version models RFC 9368 compatible version negotiation: the
+     * server switches the connection and says so in its `version_information`.
+     */
+    val serverVersion: Int = QuicVersion.V1,
 ) {
-    private val initial = InitialSecrets.derive(initialDcid)
+    private val tlsServer: InProcessTlsServer =
+        tlsServer
+            ?: InProcessTlsServer(
+                transportParameters =
+                    TransportParameters(
+                        initialMaxData = 1_000_000,
+                        initialMaxStreamDataBidiLocal = 100_000,
+                        initialMaxStreamDataBidiRemote = 100_000,
+                        initialMaxStreamDataUni = 100_000,
+                        initialMaxStreamsBidi = 16,
+                        initialMaxStreamsUni = 16,
+                        initialSourceConnectionId = serverScid.bytes,
+                        originalDestinationConnectionId = initialDcid,
+                        versionInformation =
+                            if (serverVersion != QuicVersion.V1) {
+                                VersionInformation(serverVersion, listOf(QuicVersion.V1, QuicVersion.V2))
+                            } else {
+                                null
+                            },
+                    ).encode(),
+            )
+
+    private val initial = InitialSecrets.derive(initialDcid, serverVersion)
     private val hp = AesEcbHeaderProtection(PlatformAesOneBlock)
+
+    /** Client Initials arrive in the original version until the client learns the switch. */
+    private fun clientInitialKeys(version: Int) = InitialSecrets.derive(initialDcid, version)
 
     // Server's per-direction packet protection at each level.
     private var serverHandshakeRx: PacketProtection? = null
@@ -137,6 +155,9 @@ class InMemoryQuicPipe(
     private val initialPnSpace = PacketNumberSpaceState()
     private val handshakePnSpace = PacketNumberSpaceState()
     private val applicationPnSpace = PacketNumberSpaceState()
+
+    /** (type, version) of every long-header packet the client sent, in order. */
+    val clientLongHeaders = mutableListOf<Pair<LongHeaderType, Int>>()
 
     /**
      * Run the handshake to completion. Returns when both sides have
@@ -186,9 +207,10 @@ class InMemoryQuicPipe(
                 return
             }
             val peeked = LongHeaderPacket.peekHeader(datagram, offset) ?: return
+            clientLongHeaders += peeked.type to peeked.version
             val proto =
                 when (peeked.type) {
-                    LongHeaderType.INITIAL -> PacketProtection(Aes128Gcm, initial.clientKey, initial.clientIv, hp, initial.clientHp)
+                    LongHeaderType.INITIAL -> clientInitialKeys(peeked.version).let { PacketProtection(Aes128Gcm, it.clientKey, it.clientIv, hp, it.clientHp) }
                     LongHeaderType.HANDSHAKE -> serverHandshakeRx ?: return
                     else -> return
                 }
@@ -259,10 +281,10 @@ class InMemoryQuicPipe(
         check(cipher == TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256) {
             "InMemoryQuicPipe currently only supports AES-128-GCM"
         }
-        serverHandshakeRx = packetProtectionFromSecret(cipher, tlsServer.clientHandshakeSecret!!)
-        serverHandshakeTx = packetProtectionFromSecret(cipher, tlsServer.serverHandshakeSecret!!)
-        serverApplicationRx = packetProtectionFromSecret(cipher, tlsServer.clientApplicationSecret!!)
-        serverApplicationTx = packetProtectionFromSecret(cipher, tlsServer.serverApplicationSecret!!)
+        serverHandshakeRx = packetProtectionFromSecret(cipher, tlsServer.clientHandshakeSecret!!, serverVersion)
+        serverHandshakeTx = packetProtectionFromSecret(cipher, tlsServer.serverHandshakeSecret!!, serverVersion)
+        serverApplicationRx = packetProtectionFromSecret(cipher, tlsServer.clientApplicationSecret!!, serverVersion)
+        serverApplicationTx = packetProtectionFromSecret(cipher, tlsServer.serverApplicationSecret!!, serverVersion)
         serverSendApplicationSecret = tlsServer.serverApplicationSecret
         serverApplicationCipherSuite = cipher
     }
@@ -285,7 +307,7 @@ class InMemoryQuicPipe(
                 LongHeaderPacket.build(
                     LongHeaderPlaintextPacket(
                         type = LongHeaderType.HANDSHAKE,
-                        version = QuicVersion.V1,
+                        version = serverVersion,
                         dcid = client.sourceConnectionId,
                         scid = serverScid,
                         packetNumber = pn,
@@ -366,8 +388,8 @@ class InMemoryQuicPipe(
             }
         val cs = serverApplicationCipherSuite
         check(cs != 0) { "negotiated cipher suite not yet recorded" }
-        val nextSecret = expandLabel(curSecret, "quic ku", curSecret.size)
-        val nextProto = packetProtectionFromSecret(cipherSuite = cs, secret = nextSecret)
+        val nextSecret = expandLabel(curSecret, QuicVersion.keyUpdateLabel(serverVersion), curSecret.size)
+        val nextProto = packetProtectionFromSecret(cipherSuite = cs, secret = nextSecret, version = serverVersion)
         val live =
             checkNotNull(serverApplicationTx) {
                 "rotateServerApplicationKeys called before serverApplicationTx installed"
@@ -487,6 +509,34 @@ class InMemoryQuicPipe(
         return null
     }
 
+    /**
+     * Test-only: a server Initial packet carrying exactly [frames], from
+     * [scid] (the pipe's own by default). Lets tests send what a real server
+     * wouldn't, e.g. frames not allowed at the Initial level.
+     */
+    fun buildServerInitialDatagram(
+        frames: List<com.vitorpamplona.quic.frame.Frame>,
+        scid: ConnectionId = serverScid,
+    ): ByteArray {
+        val payload = encodeFrames(frames)
+        return LongHeaderPacket.build(
+            LongHeaderPlaintextPacket(
+                type = LongHeaderType.INITIAL,
+                version = serverVersion,
+                dcid = client.sourceConnectionId,
+                scid = scid,
+                packetNumber = initialPnSpace.allocateOutbound(),
+                payload = if (payload.size < 4) payload.copyOf(4) else payload,
+            ),
+            Aes128Gcm,
+            initial.serverKey,
+            initial.serverIv,
+            hp,
+            initial.serverHp,
+            largestAckedInSpace = -1L,
+        )
+    }
+
     private fun buildServerInitialPacket(crypto: ByteArray): ByteArray {
         val proto =
             PacketProtection(
@@ -517,7 +567,7 @@ class InMemoryQuicPipe(
         return LongHeaderPacket.build(
             LongHeaderPlaintextPacket(
                 type = LongHeaderType.INITIAL,
-                version = QuicVersion.V1,
+                version = serverVersion,
                 dcid = client.sourceConnectionId,
                 scid = serverScid,
                 packetNumber = pn,

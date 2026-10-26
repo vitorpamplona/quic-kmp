@@ -44,7 +44,12 @@ import com.vitorpamplona.quic.QuicWriter
  */
 class TlsClientHello(
     val random: ByteArray = RandomInstance.bytes(32),
-    val cipherSuites: IntArray = intArrayOf(TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256, TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256),
+    val cipherSuites: IntArray =
+        intArrayOf(
+            TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
+            TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
+        ),
     val extensions: List<TlsExtension>,
 ) {
     init {
@@ -79,7 +84,7 @@ class TlsClientHello(
  * Convenience builder that wires up the standard QUIC + WebTransport ClientHello:
  *   - SNI
  *   - supported_versions = [ TLS 1.3 ]
- *   - supported_groups   = [ X25519 ]
+ *   - supported_groups   = [ X25519, secp256r1 ]
  *   - signature_algorithms covering ECDSA / RSA-PSS / Ed25519
  *   - key_share with the caller's X25519 public
  *   - psk_key_exchange_modes = [ psk_dhe_ke ]
@@ -103,26 +108,82 @@ fun buildQuicClientHello(
     cipherSuites: IntArray =
         intArrayOf(
             TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
-): TlsClientHello {
-    val exts =
-        buildList {
-            // RFC 6066 §3: omit the SNI extension entirely for IP-literal
-            // targets — a literal address is not a valid host_name and a
-            // strict server rejects the extension, then fails cert selection.
-            if (!isIpLiteralHostname(serverName)) {
-                add(TlsExtension(TlsConstants.EXT_SERVER_NAME, encodeServerNameExtension(serverName)))
-            }
-            add(TlsExtension(TlsConstants.EXT_SUPPORTED_VERSIONS, encodeSupportedVersionsExtensionClient()))
-            add(TlsExtension(TlsConstants.EXT_SUPPORTED_GROUPS, encodeSupportedGroupsX25519()))
-            add(TlsExtension(TlsConstants.EXT_SIGNATURE_ALGORITHMS, encodeSignatureAlgorithms()))
-            add(TlsExtension(TlsConstants.EXT_KEY_SHARE, encodeKeyShareClientX25519(x25519PublicKey)))
-            add(TlsExtension(TlsConstants.EXT_PSK_KEY_EXCHANGE_MODES, encodePskKeyExchangeModesDhe()))
-            add(TlsExtension(TlsConstants.EXT_ALPN, encodeAlpn(alpns)))
-            add(TlsExtension(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS, quicTransportParams))
+): TlsClientHello =
+    TlsClientHello(
+        random = random,
+        cipherSuites = cipherSuites,
+        extensions = clientHelloExtensions(serverName, TlsConstants.GROUP_X25519, x25519PublicKey, quicTransportParams, alpns),
+    )
+
+/** The groups we can exchange keys on, most preferred first; the ClientHello carries an X25519 share. */
+internal val CLIENT_SUPPORTED_GROUPS: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1)
+
+/**
+ * The ClientHello extensions, in the order we send them: a share for
+ * [keyShareGroup], the [cookie] extension a HelloRetryRequest asked us to
+ * echo, `early_data` and, last as RFC 8446 §4.2.11 requires, the
+ * [pskPlaceholder] `pre_shared_key` whose binder is spliced in afterwards.
+ */
+internal fun clientHelloExtensions(
+    serverName: String,
+    keyShareGroup: Int,
+    keySharePublic: ByteArray,
+    quicTransportParams: ByteArray,
+    alpns: List<ByteArray>,
+    cookie: ByteArray? = null,
+    includeEarlyData: Boolean = false,
+    pskPlaceholder: ByteArray? = null,
+): List<TlsExtension> =
+    buildList {
+        // RFC 6066 §3: omit the SNI extension entirely for IP-literal
+        // targets — a literal address is not a valid host_name and a
+        // strict server rejects the extension, then fails cert selection.
+        if (!isIpLiteralHostname(serverName)) {
+            add(TlsExtension(TlsConstants.EXT_SERVER_NAME, encodeServerNameExtension(serverName)))
         }
-    return TlsClientHello(random = random, cipherSuites = cipherSuites, extensions = exts)
+        add(TlsExtension(TlsConstants.EXT_SUPPORTED_VERSIONS, encodeSupportedVersionsExtensionClient()))
+        add(TlsExtension(TlsConstants.EXT_SUPPORTED_GROUPS, encodeSupportedGroups(CLIENT_SUPPORTED_GROUPS)))
+        add(TlsExtension(TlsConstants.EXT_SIGNATURE_ALGORITHMS, encodeSignatureAlgorithms()))
+        add(TlsExtension(TlsConstants.EXT_KEY_SHARE, encodeKeyShareClient(keyShareGroup, keySharePublic)))
+        add(TlsExtension(TlsConstants.EXT_PSK_KEY_EXCHANGE_MODES, encodePskKeyExchangeModesDhe()))
+        add(TlsExtension(TlsConstants.EXT_ALPN, encodeAlpn(alpns)))
+        add(TlsExtension(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS, quicTransportParams))
+        if (cookie != null) add(TlsExtension(TlsConstants.EXT_COOKIE, cookie))
+        if (includeEarlyData) {
+            // RFC 8446 §4.2.10 — empty body in ClientHello signals
+            // "I'm about to send 0-RTT data". Goes BEFORE
+            // pre_shared_key (which must be last per §4.2.11).
+            add(TlsExtension(TlsConstants.EXT_EARLY_DATA, encodeEarlyDataEmpty()))
+        }
+        if (pskPlaceholder != null) add(TlsExtension(TlsConstants.EXT_PRE_SHARED_KEY, pskPlaceholder))
+    }
+
+/**
+ * Encode [ch], whose last extension is a one-identity `pre_shared_key`
+ * placeholder, with its binder computed and spliced in: the binder is
+ * HMAC(finished_key, hash of the ClientHello up to the binders list), and
+ * is as long as [binderFinishedKey] (the PSK's Hash.length).
+ */
+internal fun encodeWithPskBinder(
+    ch: TlsClientHello,
+    binderFinishedKey: ByteArray,
+    transcriptHashOfPartialCh: (ByteArray) -> ByteArray,
+    binderHmac: (key: ByteArray, data: ByteArray) -> ByteArray,
+): ByteArray {
+    val withPlaceholder = ch.encode()
+    val binderLength = binderFinishedKey.size
+    // PartialClientHello = encoded bytes minus the trailing binders block
+    // (uint16 outer length + uint8 inner length + the binder bytes).
+    val partialCh = withPlaceholder.copyOfRange(0, withPlaceholder.size - (2 + 1 + binderLength))
+    val binder = binderHmac(binderFinishedKey, transcriptHashOfPartialCh(partialCh))
+    require(binder.size == binderLength) {
+        "binder size ${binder.size} != expected $binderLength"
+    }
+    binder.copyInto(withPlaceholder, withPlaceholder.size - binderLength)
+    return withPlaceholder
 }
 
 /**
@@ -166,46 +227,15 @@ fun buildResumptionClientHelloBytes(
     includeEarlyData: Boolean = false,
 ): ByteArray {
     val exts =
-        buildList {
-            // RFC 6066 §3: no SNI for IP-literal targets — see buildQuicClientHello.
-            if (!isIpLiteralHostname(serverName)) {
-                add(TlsExtension(TlsConstants.EXT_SERVER_NAME, encodeServerNameExtension(serverName)))
-            }
-            add(TlsExtension(TlsConstants.EXT_SUPPORTED_VERSIONS, encodeSupportedVersionsExtensionClient()))
-            add(TlsExtension(TlsConstants.EXT_SUPPORTED_GROUPS, encodeSupportedGroupsX25519()))
-            add(TlsExtension(TlsConstants.EXT_SIGNATURE_ALGORITHMS, encodeSignatureAlgorithms()))
-            add(TlsExtension(TlsConstants.EXT_KEY_SHARE, encodeKeyShareClientX25519(x25519PublicKey)))
-            add(TlsExtension(TlsConstants.EXT_PSK_KEY_EXCHANGE_MODES, encodePskKeyExchangeModesDhe()))
-            add(TlsExtension(TlsConstants.EXT_ALPN, encodeAlpn(alpns)))
-            add(TlsExtension(TlsConstants.EXT_QUIC_TRANSPORT_PARAMETERS, quicTransportParams))
-            if (includeEarlyData) {
-                // RFC 8446 §4.2.10 — empty body in ClientHello signals
-                // "I'm about to send 0-RTT data". Goes BEFORE
-                // pre_shared_key (which must be last per §4.2.11).
-                add(TlsExtension(TlsConstants.EXT_EARLY_DATA, encodeEarlyDataEmpty()))
-            }
-            // pre_shared_key MUST be last (RFC 8446 §4.2.11).
-            add(
-                TlsExtension(
-                    TlsConstants.EXT_PRE_SHARED_KEY,
-                    encodePreSharedKeyPlaceholder(ticket, obfuscatedTicketAge),
-                ),
-            )
-        }
+        clientHelloExtensions(
+            serverName,
+            TlsConstants.GROUP_X25519,
+            x25519PublicKey,
+            quicTransportParams,
+            alpns,
+            includeEarlyData = includeEarlyData,
+            pskPlaceholder = encodePreSharedKeyPlaceholder(ticket, obfuscatedTicketAge, binderFinishedKey.size),
+        )
     val ch = TlsClientHello(random = random, cipherSuites = cipherSuites, extensions = exts)
-    val withPlaceholder = ch.encode()
-    // PartialClientHello = encoded bytes minus the trailing binders block
-    // (uint16 outer length + uint8 inner length + 32 binder bytes for one
-    // SHA-256 PSK).
-    val partialCh = withPlaceholder.copyOfRange(0, withPlaceholder.size - BINDERS_TRAILING_BYTES)
-    val transcriptHash = transcriptHashOfPartialCh(partialCh)
-    val binder = binderHmac(binderFinishedKey, transcriptHash)
-    require(binder.size == BINDER_BYTES) {
-        "binder size ${binder.size} != expected $BINDER_BYTES"
-    }
-    // Splice the binder bytes into the placeholder zeros: the binder
-    // sits at the very end of the encoded message, after the
-    // 3-byte trailer (uint16 outer + uint8 inner length).
-    binder.copyInto(withPlaceholder, withPlaceholder.size - BINDER_BYTES)
-    return withPlaceholder
+    return encodeWithPskBinder(ch, binderFinishedKey, transcriptHashOfPartialCh, binderHmac)
 }

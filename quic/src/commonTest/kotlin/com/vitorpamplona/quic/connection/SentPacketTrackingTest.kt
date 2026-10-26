@@ -30,7 +30,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
- * Step 2 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 2 of `plans/2026-05-04-control-frame-retransmit.md`:
  * the writer must record a [com.vitorpamplona.quic.connection.recovery.SentPacket]
  * keyed by packet number whenever it emits an Application packet,
  * carrying the matching tokens for any retransmittable control

@@ -535,8 +535,11 @@ class ClientPathMigrationTest {
             // the failed seq (cidSeq1) — the bug we're guarding
             // against. The packet carries RETIRE(1) on a DCID of
             // seq=2's bytes.
-            val out = drainOutbound(client, nowMillis = 100L + pto * 4L)!!
-            val frames = pipe.decryptClientApplicationFrames(out)!!
+            // A PMTU probe may take the first datagram; the RETIRE follows.
+            val frames =
+                (0 until 3).flatMap {
+                    drainOutbound(client, nowMillis = 100L + pto * 4L)?.let { pipe.decryptClientApplicationFrames(it) }.orEmpty()
+                }
             val retire = frames.firstOrNull { it is RetireConnectionIdFrame } as? RetireConnectionIdFrame
             assertTrue(retire != null, "outbound must carry RETIRE for the failed seq — got ${frames.map { it::class.simpleName }}")
             assertEquals(1L, retire.sequenceNumber)

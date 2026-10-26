@@ -63,6 +63,12 @@ object FrameType {
     /** RFC 9221 — DATAGRAM frame. 0x30 = no length, 0x31 = length-prefixed. */
     const val DATAGRAM: Long = 0x30
     const val DATAGRAM_LEN: Long = 0x31
+
+    /** draft-ietf-quic-ack-frequency §4 — ACK_FREQUENCY. */
+    const val ACK_FREQUENCY: Long = 0xaf
+
+    /** draft-ietf-quic-ack-frequency §5 — IMMEDIATE_ACK. */
+    const val IMMEDIATE_ACK: Long = 0x1f
 }
 
 /**
@@ -112,6 +118,13 @@ object QuicTransportError {
     const val AEAD_LIMIT_REACHED: Long = 0x0f
 
     const val NO_VIABLE_PATH: Long = 0x10
+
+    /**
+     * RFC 9368 §10.2: version negotiation failed or a downgrade was
+     * detected (the server's Version Information disagrees with the
+     * version the connection actually ended up on).
+     */
+    const val VERSION_NEGOTIATION_ERROR: Long = 0x11
 }
 
 sealed class Frame {
@@ -324,6 +337,39 @@ class MaxStreamsFrame(
     }
 }
 
+/** RFC 9000 §19.12: the sender wants to send more but the connection limit [maximumData] stops it. */
+class DataBlockedFrame(
+    val maximumData: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(FrameType.DATA_BLOCKED.toInt())
+        out.writeVarint(maximumData)
+    }
+}
+
+/** RFC 9000 §19.13: stream [streamId] is blocked at its limit [maximumStreamData]. */
+class StreamDataBlockedFrame(
+    val streamId: Long,
+    val maximumStreamData: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(FrameType.STREAM_DATA_BLOCKED.toInt())
+        out.writeVarint(streamId)
+        out.writeVarint(maximumStreamData)
+    }
+}
+
+/** RFC 9000 §19.14: the sender wants to open a stream but the limit [maximumStreams] stops it. */
+class StreamsBlockedFrame(
+    val bidi: Boolean,
+    val maximumStreams: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeByte(if (bidi) FrameType.STREAMS_BLOCKED_BIDI.toInt() else FrameType.STREAMS_BLOCKED_UNI.toInt())
+        out.writeVarint(maximumStreams)
+    }
+}
+
 class DatagramFrame(
     val data: ByteArray,
     val explicitLength: Boolean = true,
@@ -336,6 +382,34 @@ class DatagramFrame(
             out.writeByte(FrameType.DATAGRAM.toInt())
         }
         out.writeBytes(data)
+    }
+}
+
+/**
+ * draft-ietf-quic-ack-frequency §4: the peer asks us to acknowledge after
+ * [ackElicitingThreshold] + 1 ack-eliciting packets, within
+ * [requestedMaxAckDelayMicros], and on reordering of [reorderingThreshold]
+ * packets or more (0: don't hurry on reordering).
+ */
+class AckFrequencyFrame(
+    val sequenceNumber: Long,
+    val ackElicitingThreshold: Long,
+    val requestedMaxAckDelayMicros: Long,
+    val reorderingThreshold: Long,
+) : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeVarint(FrameType.ACK_FREQUENCY)
+        out.writeVarint(sequenceNumber)
+        out.writeVarint(ackElicitingThreshold)
+        out.writeVarint(requestedMaxAckDelayMicros)
+        out.writeVarint(reorderingThreshold)
+    }
+}
+
+/** draft-ietf-quic-ack-frequency §5: acknowledge this packet right away. */
+class ImmediateAckFrame : Frame() {
+    override fun encode(out: QuicWriter) {
+        out.writeVarint(FrameType.IMMEDIATE_ACK)
     }
 }
 
@@ -462,13 +536,8 @@ fun decodeFrames(data: ByteArray): List<Frame> {
                     val len = r.readVarint()
                     ranges += AckRange(gap, len)
                 }
-                if (type == FrameType.ACK_ECN) {
-                    // Skip ECT0, ECT1, CE counts.
-                    r.readVarint()
-                    r.readVarint()
-                    r.readVarint()
-                }
-                out += AckFrame(largest, delay, firstRange, ranges)
+                val ecn = if (type == FrameType.ACK_ECN) AckEcnCounts(ect0 = r.readVarint(), ect1 = r.readVarint(), ce = r.readVarint()) else null
+                out += AckFrame(largest, delay, firstRange, ranges, ecn)
             }
 
             type == FrameType.RESET_STREAM -> {
@@ -531,17 +600,15 @@ fun decodeFrames(data: ByteArray): List<Frame> {
             }
 
             type == FrameType.DATA_BLOCKED -> {
-                r.readVarint()
+                out += DataBlockedFrame(r.readVarint())
             }
 
-            // ignored
             type == FrameType.STREAM_DATA_BLOCKED -> {
-                r.readVarint()
-                r.readVarint()
+                out += StreamDataBlockedFrame(r.readVarint(), r.readVarint())
             }
 
             type == FrameType.STREAMS_BLOCKED_BIDI || type == FrameType.STREAMS_BLOCKED_UNI -> {
-                r.readVarint()
+                out += StreamsBlockedFrame(type == FrameType.STREAMS_BLOCKED_BIDI, r.readVarint())
             }
 
             type == FrameType.NEW_CONNECTION_ID -> {
@@ -585,6 +652,14 @@ fun decodeFrames(data: ByteArray): List<Frame> {
 
             type == FrameType.HANDSHAKE_DONE -> {
                 out += HandshakeDoneFrame()
+            }
+
+            type == FrameType.ACK_FREQUENCY -> {
+                out += AckFrequencyFrame(r.readVarint(), r.readVarint(), r.readVarint(), r.readVarint())
+            }
+
+            type == FrameType.IMMEDIATE_ACK -> {
+                out += ImmediateAckFrame()
             }
 
             type == FrameType.DATAGRAM -> {

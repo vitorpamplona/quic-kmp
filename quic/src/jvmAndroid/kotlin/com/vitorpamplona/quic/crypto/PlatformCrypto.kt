@@ -80,6 +80,8 @@ actual val PlatformChaCha20Block: ChaCha20BlockEncrypt =
 
 actual fun bestAes128GcmAead(key: ByteArray): Aead = JcaAesGcmAead(key)
 
+actual fun bestAes256GcmAead(key: ByteArray): Aead = JcaAesGcmAead(key)
+
 /**
  * Try the JCA `ChaCha20-Poly1305` cipher first (Java 11+ /
  * Android API 28+) — gives us range-overload + offset-based doFinal,

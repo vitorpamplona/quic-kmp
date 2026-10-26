@@ -24,13 +24,10 @@ import com.vitorpamplona.crypto.kdf.Hkdf
 import com.vitorpamplona.crypto.sha2.sha256
 
 /**
- * The single HKDF-SHA256 instance used everywhere in the QUIC + TLS 1.3 stack.
- * SHA-256 covers both QUIC-mandatory cipher suites we care about
- * (TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256).
- *
- * TLS_AES_256_GCM_SHA384 is the only mandatory suite we omit — its SHA-384
- * primitive isn't yet in Quartz and nests / mainstream HTTP/3 servers all
- * accept the SHA-256 suites by default.
+ * HKDF-SHA256: the Initial secrets (RFC 9001 §5.2) and the SHA-256 suites.
+ * The TLS key schedule picks its suite's hash through
+ * [com.vitorpamplona.quic.tls.TlsHash], which also covers
+ * TLS_AES_256_GCM_SHA384.
  */
 val HKDF: Hkdf = Hkdf("HmacSHA256")
 

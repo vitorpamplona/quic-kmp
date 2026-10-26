@@ -22,20 +22,22 @@ package com.vitorpamplona.quic.transport
 
 // Placeholder actual for the -PquicNativeCheck target; see ../Synchronized.kt.
 
-actual class UdpSocket {
-    actual suspend fun send(payload: ByteArray): Int = throw NotImplementedError("native check stub")
+actual class UdpSocket : QuicDatagramSocket {
+    actual override suspend fun send(payload: ByteArray): Int = throw NotImplementedError("native check stub")
 
-    actual suspend fun receive(): ByteArray? = throw NotImplementedError("native check stub")
+    actual override suspend fun receive(): ByteArray? = throw NotImplementedError("native check stub")
 
-    actual fun close(): Unit = throw NotImplementedError("native check stub")
+    actual override fun close(): Unit = throw NotImplementedError("native check stub")
 
     actual val localPort: Int get() = throw NotImplementedError("native check stub")
 
-    actual val receivedDatagramCount: Long get() = throw NotImplementedError("native check stub")
+    actual override val receivedDatagramCount: Long get() = throw NotImplementedError("native check stub")
 
-    actual val receivedByteCount: Long get() = throw NotImplementedError("native check stub")
+    actual override val receivedByteCount: Long get() = throw NotImplementedError("native check stub")
 
-    actual val receiveBufferSizeBytes: Int get() = throw NotImplementedError("native check stub")
+    actual override val receiveBufferSizeBytes: Int get() = throw NotImplementedError("native check stub")
+
+    actual override val remoteIsIpv6: Boolean get() = throw NotImplementedError("native check stub")
 
     actual companion object {
         actual suspend fun connect(

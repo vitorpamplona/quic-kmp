@@ -44,6 +44,26 @@ data class TlsServerHello(
             return r.readUint16()
         }
 
+    /** The group of the server's key_share (RFC 8446 §4.2.8). */
+    val keyShareGroup: Int
+        get() {
+            val ext =
+                extensions.firstOrNull { it.type == TlsConstants.EXT_KEY_SHARE }
+                    ?: throw QuicCodecException("server hello missing key_share extension")
+            return QuicReader(ext.data).readUint16()
+        }
+
+    /** The server's public key from key_share, for [keyShareGroup]. */
+    val keyShareKey: ByteArray
+        get() {
+            val ext =
+                extensions.firstOrNull { it.type == TlsConstants.EXT_KEY_SHARE }
+                    ?: throw QuicCodecException("server hello missing key_share extension")
+            val r = QuicReader(ext.data)
+            r.readUint16()
+            return r.readTlsOpaque2()
+        }
+
     /** The peer's X25519 public key, extracted from key_share. */
     val serverKeyShareX25519: ByteArray
         get() {
@@ -75,7 +95,7 @@ data class TlsServerHello(
                 throw QuicCodecException("ServerHello legacy_session_id_echo non-empty (${sessionId.size} bytes)")
             }
             val cipherSuite = r.readUint16()
-            r.readByte() // legacy_compression_method = 0
+            if (r.readByte() != 0) throw QuicCodecException("ServerHello legacy_compression_method != 0")
             val extensions = TlsExtension.decodeList(r)
             // RFC 8446 §4.1.3: ServerHello body ends with the extensions
             // block. Any trailing bytes are a malformed handshake message.

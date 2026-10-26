@@ -92,7 +92,7 @@ fun QuicConnection.drainPeerInitiatedUniStreamsIntoBlackHole(scope: CoroutineSco
             // log + ignore. If the application ALSO cares about peer
             // bidi streams, it should NOT use this helper and instead
             // implement its own routing dispatcher.
-            if (StreamId.kindOf(stream.streamId) != StreamId.Kind.SERVER_UNI) {
+            if (!StreamId.isUnidirectional(stream.streamId)) {
                 // Drain the bidi too — silently dropping bytes is bad
                 // policy, but tearing down the connection because the
                 // server opened an unexpected bidi is worse. The uni

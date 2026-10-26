@@ -26,7 +26,7 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * AES-128-GCM AEAD with the JCA `Cipher` and `SecretKeySpec` cached per
+ * AES-GCM AEAD (128- or 256-bit [key]) with the JCA `Cipher` and `SecretKeySpec` cached per
  * direction. Audits 1 + 3 flagged that going through Quartz's AESGCM (which
  * internally calls `Cipher.getInstance("AES/GCM/NoPadding")` per call) is
  * the dominant per-packet cost on the steady-state path. This wrapper
@@ -50,11 +50,11 @@ import javax.crypto.spec.SecretKeySpec
 class JcaAesGcmAead(
     key: ByteArray,
 ) : Aead() {
-    override val keyLength = 16
+    override val keyLength = key.size
     override val nonceLength = 12
     override val tagLength = 16
 
-    // RFC 9001 §B.1 limits — same as commonMain `Aes128Gcm`.
+    // RFC 9001 §B.1 limits — same as commonMain `Aes128Gcm`, and the same for AES-256-GCM.
     override val confidentialityLimit: Long = 1L shl 23
     override val integrityLimit: Long = 1L shl 52
 

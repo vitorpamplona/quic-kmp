@@ -59,7 +59,7 @@ import java.util.concurrent.atomic.AtomicLong
 actual class UdpSocket private constructor(
     private val channel: DatagramChannel,
     private val remote: InetSocketAddress,
-) {
+) : QuicDatagramSocket {
     private val closed = AtomicBoolean(false)
 
     // Dedicated single-thread executors so the blocking socket calls never
@@ -96,47 +96,68 @@ actual class UdpSocket private constructor(
     actual val localPort: Int
         get() = (channel.localAddress as InetSocketAddress).port
 
-    actual val receivedDatagramCount: Long
+    actual override val receivedDatagramCount: Long
         get() = receivedDatagrams.get()
 
-    actual val receivedByteCount: Long
+    actual override val receivedByteCount: Long
         get() = receivedBytes.get()
 
-    actual val receiveBufferSizeBytes: Int
+    actual override val receiveBufferSizeBytes: Int
         get() = channel.getOption(StandardSocketOptions.SO_RCVBUF)
 
-    actual suspend fun send(payload: ByteArray): Int {
+    actual override val remoteIsIpv6: Boolean
+        get() = remote.address is java.net.Inet6Address
+
+    actual override suspend fun send(payload: ByteArray): Int {
         // Fail fast without dispatching onto a possibly shut-down executor.
         if (closed.get()) throw ClosedChannelException()
         return withContext(sendDispatcher) {
             if (closed.get()) throw ClosedChannelException()
             val buf = ByteBuffer.wrap(payload)
-            channel.send(buf, remote)
-        }
-    }
-
-    actual suspend fun receive(): ByteArray? {
-        if (closed.get()) return null
-        return withContext(recvDispatcher) {
-            if (closed.get()) return@withContext null
             try {
-                // No synchronized — only the read loop touches readBuf, by
-                // contract. The previous synchronized block was pointless.
-                readBuf.clear()
-                channel.receive(readBuf) ?: return@withContext null
-                readBuf.flip()
-                val out = ByteArray(readBuf.remaining())
-                readBuf.get(out)
-                receivedDatagrams.incrementAndGet()
-                receivedBytes.addAndGet(out.size.toLong())
-                out
-            } catch (_: ClosedChannelException) {
-                null
+                channel.send(buf, remote)
+            } catch (_: java.net.PortUnreachableException) {
+                // A connected socket reports an earlier ICMP port unreachable on
+                // whichever call comes next, a send included. Like receive(), treat
+                // it as a lost datagram: a forged ICMP must not end the connection.
+                0
+            } catch (e: java.io.IOException) {
+                // EMSGSIZE: the datagram is larger than the path MTU the kernel
+                // knows (a PMTU probe, or the path shrank). Drop it like the
+                // network would; loss recovery and PMTU discovery react.
+                if (e !is ClosedChannelException && e.message?.contains("too long", ignoreCase = true) == true) 0 else throw e
             }
         }
     }
 
-    actual fun close() {
+    actual override suspend fun receive(): ByteArray? {
+        if (closed.get()) return null
+        return withContext(recvDispatcher) {
+            while (!closed.get()) {
+                try {
+                    // No synchronized — only the read loop touches readBuf, by
+                    // contract. The previous synchronized block was pointless.
+                    readBuf.clear()
+                    channel.receive(readBuf) ?: return@withContext null
+                    readBuf.flip()
+                    val out = ByteArray(readBuf.remaining())
+                    readBuf.get(out)
+                    receivedDatagrams.incrementAndGet()
+                    receivedBytes.addAndGet(out.size.toLong())
+                    return@withContext out
+                } catch (_: ClosedChannelException) {
+                    return@withContext null
+                } catch (_: java.net.PortUnreachableException) {
+                    // An ICMP error on the connected socket. Anyone on the path
+                    // can forge one, so it ends nothing: the idle timeout or
+                    // the peer's CONNECTION_CLOSE does (RFC 9000 §10).
+                }
+            }
+            null
+        }
+    }
+
+    actual override fun close() {
         if (closed.compareAndSet(false, true)) {
             try {
                 channel.close()
@@ -206,6 +227,18 @@ actual class UdpSocket private constructor(
                 // packets and ACK_ECN frames in both directions.
                 runCatching {
                     channel.setOption(StandardSocketOptions.IP_TOS, ECT0_TOS_BITS)
+                }
+                // RFC 9000 §14: don't let IP fragment datagrams, so PMTU probes
+                // tell the truth. jdk.net.ExtendedSocketOptions.IP_DONTFRAGMENT
+                // exists from JDK 19, not on Android: looked up reflectively.
+                runCatching {
+                    val option =
+                        Class
+                            .forName("jdk.net.ExtendedSocketOptions")
+                            .getField("IP_DONTFRAGMENT")
+                            .get(null)
+                    @Suppress("UNCHECKED_CAST")
+                    channel.setOption(option as java.net.SocketOption<Boolean>, true)
                 }
                 channel.bind(InetSocketAddress(0)) // ephemeral
                 // RFC 9000 §9 / defence-in-depth: connect() asks the kernel

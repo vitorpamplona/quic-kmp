@@ -20,15 +20,10 @@
  */
 package com.vitorpamplona.quic.tls
 
-import com.vitorpamplona.crypto.mac.MacInstance
-import com.vitorpamplona.quic.crypto.EMPTY_SHA256
-import com.vitorpamplona.quic.crypto.HKDF
-import com.vitorpamplona.quic.crypto.deriveSecret
-import com.vitorpamplona.quic.crypto.expandLabel
-
 /**
- * The TLS 1.3 SHA-256 key schedule per RFC 8446 §7.1, plus the QUIC-flavour
- * key/iv/hp expand labels per RFC 9001 §5.
+ * The TLS 1.3 key schedule per RFC 8446 §7.1, plus the QUIC-flavour
+ * key/iv/hp expand labels per RFC 9001 §5. It runs on [hash], the cipher
+ * suite's: SHA-256, or SHA-384 for TLS_AES_256_GCM_SHA384.
  *
  *   Early Secret           = HKDF-Extract(0, PSK)
  *   Derived "derived"      = Derive-Secret(Early, "derived", "")
@@ -43,6 +38,13 @@ import com.vitorpamplona.quic.crypto.expandLabel
 class TlsKeySchedule(
     val transcript: TlsTranscriptHash,
 ) {
+    /**
+     * The negotiated suite's hash. Set it before deriving: a client that
+     * offers a ticket derives the early secret under the ticket's hash, and
+     * switches to the ServerHello's if the server turns the ticket down.
+     */
+    var hash: TlsHash = TlsHash.SHA256
+
     var earlySecret: ByteArray? = null
         private set
     var handshakeSecret: ByteArray? = null
@@ -85,8 +87,8 @@ class TlsKeySchedule(
 
     /** Step 1: derive the Early Secret. PSK is all-zeros for non-resumption. */
     fun deriveEarly() {
-        val zeros = ByteArray(32)
-        earlySecret = HKDF.extract(zeros, zeros)
+        val zeros = ByteArray(hash.length)
+        earlySecret = hash.hkdf.extract(zeros, zeros)
     }
 
     /**
@@ -96,7 +98,7 @@ class TlsKeySchedule(
      * For non-resumption [deriveEarly] is the equivalent zero-keyed call.
      *
      * RFC 8446 §7.1: `Early Secret = HKDF-Extract(0, PSK)` — salt is
-     * zeros, IKM is the PSK. [HKDF.extract]'s signature is
+     * zeros, IKM is the PSK. `Hkdf.extract`'s signature is
      * `extract(IKM, salt)` (despite the misleading first-parameter name
      * in the Quartz Hkdf class — the IMPLEMENTATION uses the second
      * arg as the MAC key per RFC 5869), so the call is
@@ -104,8 +106,8 @@ class TlsKeySchedule(
      * both so the order didn't matter there.
      */
     fun deriveEarlyFromPsk(psk: ByteArray) {
-        val zeros = ByteArray(32)
-        earlySecret = HKDF.extract(psk, zeros)
+        val zeros = ByteArray(hash.length)
+        earlySecret = hash.hkdf.extract(psk, zeros)
     }
 
     /**
@@ -121,37 +123,37 @@ class TlsKeySchedule(
      */
     fun deriveEarlyTraffic(transcriptAfterClientHello: ByteArray) {
         val es = earlySecret ?: error("call deriveEarlyFromPsk first")
-        clientEarlyTrafficSecret = deriveSecret(es, "c e traffic", transcriptAfterClientHello)
+        clientEarlyTrafficSecret = hash.deriveSecret(es, "c e traffic", transcriptAfterClientHello)
     }
 
     /** Step 2: derive Handshake Secret using ECDHE shared secret. */
     fun deriveHandshake(ecdheSharedSecret: ByteArray) {
         val early = earlySecret ?: error("call deriveEarly first")
-        val derived = deriveSecret(early, "derived", EMPTY_SHA256)
-        handshakeSecret = HKDF.extract(ecdheSharedSecret, derived)
+        val derived = hash.deriveSecret(early, "derived", hash.emptyHash)
+        handshakeSecret = hash.hkdf.extract(ecdheSharedSecret, derived)
     }
 
     /** Step 3: derive client + server handshake traffic secrets given a transcript ending after ServerHello. */
     fun deriveHandshakeTraffic() {
         val hs = handshakeSecret ?: error("call deriveHandshake first")
         val transcriptHash = transcript.snapshot()
-        clientHandshakeSecret = deriveSecret(hs, "c hs traffic", transcriptHash)
-        serverHandshakeSecret = deriveSecret(hs, "s hs traffic", transcriptHash)
+        clientHandshakeSecret = hash.deriveSecret(hs, "c hs traffic", transcriptHash)
+        serverHandshakeSecret = hash.deriveSecret(hs, "s hs traffic", transcriptHash)
     }
 
     /** Step 4: derive the Master Secret. */
     fun deriveMaster() {
         val hs = handshakeSecret ?: error("call deriveHandshake first")
-        val derived = deriveSecret(hs, "derived", EMPTY_SHA256)
-        masterSecret = HKDF.extract(ByteArray(32), derived)
+        val derived = hash.deriveSecret(hs, "derived", hash.emptyHash)
+        masterSecret = hash.hkdf.extract(ByteArray(hash.length), derived)
     }
 
     /** Step 5: derive client + server application traffic secrets after the server Finished. */
     fun deriveApplicationTraffic() {
         val ms = masterSecret ?: error("call deriveMaster first")
         val transcriptHash = transcript.snapshot()
-        clientApplicationSecret = deriveSecret(ms, "c ap traffic", transcriptHash)
-        serverApplicationSecret = deriveSecret(ms, "s ap traffic", transcriptHash)
+        clientApplicationSecret = hash.deriveSecret(ms, "c ap traffic", transcriptHash)
+        serverApplicationSecret = hash.deriveSecret(ms, "s ap traffic", transcriptHash)
     }
 
     /**
@@ -170,7 +172,7 @@ class TlsKeySchedule(
      */
     fun deriveResumption(transcriptAfterClientFinished: ByteArray) {
         val ms = masterSecret ?: error("call deriveMaster first")
-        resumptionMasterSecret = deriveSecret(ms, "res master", transcriptAfterClientFinished)
+        resumptionMasterSecret = hash.deriveSecret(ms, "res master", transcriptAfterClientFinished)
     }
 }
 
@@ -183,13 +185,15 @@ class TlsKeySchedule(
  *   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption",
  *                           ticket_nonce, Hash.length)
  *
- * Hash.length is 32 for SHA-256 — the only hash the QUIC v1 cipher
- * suites use.
+ * Hash.length (32 for SHA-256, 48 for SHA-384) is the secret's own length.
  */
 fun resumptionPsk(
     resumptionMasterSecret: ByteArray,
     ticketNonce: ByteArray,
-): ByteArray = HKDF.expandLabel(resumptionMasterSecret, "resumption", ticketNonce, 32)
+): ByteArray {
+    val hash = TlsHash.forSecret(resumptionMasterSecret)
+    return hash.hkdf.expandLabel(resumptionMasterSecret, "resumption", ticketNonce, hash.length)
+}
 
 /**
  * RFC 8446 §4.2.11.2 — the binder finished_key, derived from the early
@@ -197,11 +201,12 @@ fun resumptionPsk(
  * transcript_hash_up_to_partial_CH).
  *
  *     binder_key   = Derive-Secret(early_secret, "res binder", H(""))
- *     finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
+ *     finished_key = HKDF-Expand-Label(binder_key, "finished", "", Hash.length)
  */
 fun pskBinderFinishedKey(earlySecret: ByteArray): ByteArray {
-    val binderKey = deriveSecret(earlySecret, "res binder", EMPTY_SHA256)
-    return expandLabel(binderKey, "finished", 32)
+    val hash = TlsHash.forSecret(earlySecret)
+    val binderKey = hash.deriveSecret(earlySecret, "res binder", hash.emptyHash)
+    return hash.expandLabel(binderKey, "finished", hash.length)
 }
 
 /**
@@ -209,7 +214,8 @@ fun pskBinderFinishedKey(earlySecret: ByteArray): ByteArray {
  * via the QUIC-specific labels in RFC 9001 §5.1.
  *
  * For TLS_AES_128_GCM_SHA256 keyLen=16, ivLen=12, hpLen=16.
- * For TLS_CHACHA20_POLY1305_SHA256 keyLen=32, ivLen=12, hpLen=32.
+ * For TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256 keyLen=32,
+ * ivLen=12, hpLen=32. The expansion runs on the hash the secret came from.
  */
 class QuicProtectionKeys(
     val key: ByteArray,
@@ -222,12 +228,18 @@ fun deriveQuicKeys(
     keyLen: Int,
     ivLen: Int,
     hpLen: Int,
-): QuicProtectionKeys =
-    QuicProtectionKeys(
-        key = expandLabel(secret, "quic key", keyLen),
-        iv = expandLabel(secret, "quic iv", ivLen),
-        hp = expandLabel(secret, "quic hp", hpLen),
+    version: Int = com.vitorpamplona.quic.packet.QuicVersion.V1,
+): QuicProtectionKeys {
+    val label =
+        com.vitorpamplona.quic.packet.QuicVersion
+            .labelPrefix(version)
+    val hash = TlsHash.forSecret(secret)
+    return QuicProtectionKeys(
+        key = hash.expandLabel(secret, "$label key", keyLen),
+        iv = hash.expandLabel(secret, "$label iv", ivLen),
+        hp = hash.expandLabel(secret, "$label hp", hpLen),
     )
+}
 
 /**
  * Compute the Finished MAC per RFC 8446 §4.4.4:
@@ -239,8 +251,6 @@ fun finishedVerifyData(
     baseKey: ByteArray,
     transcriptHash: ByteArray,
 ): ByteArray {
-    val finishedKey = expandLabel(baseKey, "finished", 32)
-    val mac = MacInstance("HmacSHA256", finishedKey)
-    mac.update(transcriptHash)
-    return mac.doFinal()
+    val hash = TlsHash.forSecret(baseKey)
+    return hash.hmac(hash.expandLabel(baseKey, "finished", hash.length), transcriptHash)
 }
