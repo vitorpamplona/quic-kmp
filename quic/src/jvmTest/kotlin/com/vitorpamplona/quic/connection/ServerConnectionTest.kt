@@ -379,7 +379,11 @@ class ServerConnectionTest {
             var offset = 0
             while (offset < probe.size) {
                 assertTrue(probe[offset].toInt() and 0x80 != 0, "only long-header packets, no 1-RTT one at $offset")
-                offset += assertNotNull(com.vitorpamplona.quic.packet.LongHeaderPacket.peekHeader(probe, offset)).totalLength
+                offset +=
+                    assertNotNull(
+                        com.vitorpamplona.quic.packet.LongHeaderPacket
+                            .peekHeader(probe, offset),
+                    ).totalLength
             }
         }
 }
