@@ -77,6 +77,28 @@ class ResetStopSendingEmitTest {
         }
 
     @Test
+    fun `a reset stream sends no more STREAM data`() =
+        runBlocking {
+            val client = handshakedClient()
+            val stream = client.openUniStream()
+            stream.send.enqueue("never-sent".encodeToByteArray())
+            stream.resetStream(errorCode = 3L)
+
+            val sizeBefore = client.application.sentPackets.size
+            runCatching { drainOutbound(client, nowMillis = 1L) }
+            val tokens =
+                client.application.sentPackets.entries
+                    .sortedBy { it.key }
+                    .drop(sizeBefore)
+                    .flatMap { it.value.tokens }
+            assertTrue(tokens.any { it is RecoveryToken.ResetStream }, "the reset goes out")
+            assertTrue(
+                tokens.none { it is RecoveryToken.Stream && it.streamId == stream.streamId },
+                "RFC 9000 3.3: no STREAM frames after RESET_STREAM",
+            )
+        }
+
+    @Test
     fun resetStream_retransmittedOnLoss() =
         runBlocking {
             val client = handshakedClient()

@@ -70,35 +70,25 @@ class QuicStreamIncomingChannelTest {
     }
 
     @Test
-    fun deliver_incoming_drops_chunks_past_channel_capacity_without_blocking() {
-        // The producer side uses trySend; once the channel is full and there
-        // is no consumer, additional chunks are silently dropped. The producer
-        // MUST NOT block — the parser is on the connection lock and a blocked
-        // producer would deadlock the whole connection.
+    fun deliver_incoming_never_blocks_or_drops_and_consumption_is_counted() {
+        // The producer runs on the connection lock, so it must never block.
+        // The channel doesn't bound what it holds — flow control does, by
+        // only crediting what the collector consumed — so nothing is dropped.
         runBlocking {
             val stream = QuicStream(streamId = 0L, direction = QuicStream.Direction.BIDIRECTIONAL)
-            // Fill well past capacity (64). Each call must return immediately.
-            // Wrap in a withTimeoutOrNull guard: if the producer EVER blocks,
-            // this assertion fires.
             val ok =
                 withTimeoutOrNull(2_000L) {
-                    repeat(1024) { i -> stream.deliverIncoming(byteArrayOf(i.toByte())) }
+                    repeat(1024) { i -> assertTrue(stream.deliverIncoming(byteArrayOf(i.toByte(), 0))) }
                     true
                 }
-            assertEquals(
-                true,
-                ok,
-                "deliverIncoming must not block once the channel is saturated " +
-                    "— a blocked producer would deadlock the parser on the connection lock",
-            )
-
-            // We don't try to assert the exact dropped count — Channel's
-            // internal queue + buffer transitions make that brittle. We DO
-            // assert that AT MOST the channel capacity (64) chunks landed.
+            assertEquals(true, ok, "deliverIncoming must not block — a blocked producer would deadlock the parser")
+            assertEquals(0L, stream.consumedBytes)
             stream.closeIncoming()
             val collected = mutableListOf<ByteArray>()
             stream.incoming.collect { collected += it }
-            assertTrue(collected.size <= 64, "channel surfaced ${collected.size} chunks; cap is 64")
+            assertEquals(1024, collected.size)
+            assertEquals(2048L, stream.consumedBytes)
+            assertTrue(!stream.overflowed)
         }
     }
 

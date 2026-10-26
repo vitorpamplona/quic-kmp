@@ -43,6 +43,8 @@ data class ShortHeaderPlaintextPacket(
     val packetNumber: Long,
     val payload: ByteArray,
     val keyPhase: Boolean = false,
+    /** RFC 9000 §17.4 latency spin bit. */
+    val spin: Boolean = false,
 )
 
 object ShortHeaderPacket {
@@ -72,6 +74,7 @@ object ShortHeaderPacket {
         val firstByteOffset = w.size
         var firstByte = 0x40 or (pnLen - 1) // 01..0..PP
         if (plain.keyPhase) firstByte = firstByte or 0x04
+        if (plain.spin) firstByte = firstByte or 0x20
         w.writeByte(firstByte)
         w.writeBytes(plain.dcid.bytes)
         val pnOffset = w.size
@@ -222,18 +225,6 @@ object ShortHeaderPacket {
         val firstByteMask = 0x1F
         packet[0] = (first xor (mask[0].toInt() and firstByteMask)).toByte()
         val unmaskedFirst = packet[0].toInt() and 0xFF
-        // RFC 9000 §17.3.1: short header layout is `0|1|S|R|R|K|P|P` —
-        // the two reserved bits at 0x18 MUST be zero after HP unmasking.
-        // A peer that sets either bit is in protocol violation. Pre-fix
-        // we silently accepted the packet and let the AEAD pass; an
-        // off-spec server (or a fuzzer) could then push us to interop
-        // bugs that don't reproduce against well-behaved peers.
-        if ((unmaskedFirst and 0x18) != 0) {
-            throw com.vitorpamplona.quic.QuicProtocolViolationException(
-                "PROTOCOL_VIOLATION: short-header reserved bits set " +
-                    "(0x${unmaskedFirst.toString(16)})",
-            )
-        }
         val pnLen = (unmaskedFirst and 0x03) + 1
         for (i in 0 until pnLen) {
             packet[localPnOffset + i] = (packet[localPnOffset + i].toInt() xor mask[1 + i].toInt()).toByte()
@@ -266,6 +257,17 @@ object ShortHeaderPacket {
                 ciphertextOffset = aadEnd,
                 ciphertextLength = packet.size - aadEnd,
             ) ?: return null
+        // RFC 9000 §17.3.1: short header layout is `0|1|S|R|R|K|P|P`; the two
+        // reserved bits at 0x18 MUST be zero once packet and header
+        // protection are removed. Checked only after the AEAD opened: with
+        // the wrong keys (the next key phase being tried, or a forgery) the
+        // unmasked bits are noise, and such a packet is dropped, not fatal.
+        if ((unmaskedFirst and 0x18) != 0) {
+            throw com.vitorpamplona.quic.QuicProtocolViolationException(
+                "PROTOCOL_VIOLATION: short-header reserved bits set " +
+                    "(0x${unmaskedFirst.toString(16)})",
+            )
+        }
         return ParseResult(
             packet =
                 ShortHeaderPlaintextPacket(

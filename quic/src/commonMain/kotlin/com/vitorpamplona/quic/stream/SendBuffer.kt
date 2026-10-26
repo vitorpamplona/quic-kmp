@@ -174,10 +174,46 @@ class SendBuffer(
     @Volatile
     private var _finAcked: Boolean = false
 
+    /** Best-effort: the FIN was lost and won't be resent, so nothing more will go out. */
+    private var finAbandoned: Boolean = false
+
+    /**
+     * Keep ACK'd bytes instead of releasing them, so [resendAllSent] can
+     * send them again. Only for a few hundred bytes of handshake data: the
+     * server's Initial flight.
+     */
+    internal var retainAcked: Boolean = false
+
     val nextOffset: Long get() = _nextOffset
     val finPending: Boolean get() = _finPending
     val finSent: Boolean get() = _finSent
     val finAcked: Boolean get() = _finAcked
+
+    /** A lost range waits to be resent; it needs no new flow-control credit. */
+    val hasRetransmit: Boolean
+        get() = _hasRetransmit
+
+    /**
+     * The FIN and every byte before it were acknowledged. The FIN can be ACK'd
+     * while an earlier range is still lost and waiting for its retransmit, so
+     * [finAcked] alone doesn't mean the peer has the whole stream.
+     */
+    val fullyAcked: Boolean
+        get() = _fullyAcked
+
+    // [hasRetransmit] and [fullyAcked] are read for every stream on every
+    // packet the writer builds: kept as volatile flags, refreshed under the
+    // lock by every method that can change them.
+    @Volatile
+    private var _hasRetransmit: Boolean = false
+
+    @Volatile
+    private var _fullyAcked: Boolean = false
+
+    private fun refreshFlags() {
+        _hasRetransmit = retransmit.isNotEmpty()
+        _fullyAcked = (_finAcked || finAbandoned) && inFlight.isEmpty() && retransmit.isEmpty() && nextSendOffset == _nextOffset
+    }
 
     /**
      * Bytes the writer would emit on the next [takeChunk] before any
@@ -204,6 +240,9 @@ class SendBuffer(
      */
     val sentOffset: Long get() = nextSendOffset
 
+    /** Told when [enqueue] or [finish] gave the writer something to send, so the connection can wake it. */
+    internal var onQueued: (() -> Unit)? = null
+
     fun enqueue(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         synchronized(lock) {
@@ -211,12 +250,18 @@ class SendBuffer(
             bytes.copyInto(data, dataLen)
             dataLen += bytes.size
             _nextOffset += bytes.size
+            refreshFlags()
         }
+        onQueued?.invoke()
     }
 
     /** Mark the write side as closing; the next [takeChunk] sets FIN once empty. */
     fun finish() {
-        synchronized(lock) { _finPending = true }
+        synchronized(lock) {
+            _finPending = true
+            refreshFlags()
+        }
+        onQueued?.invoke()
     }
 
     /**
@@ -231,14 +276,16 @@ class SendBuffer(
      *
      * Returns null if there's nothing to send.
      */
-    fun takeChunk(maxBytes: Int): Chunk? =
-        synchronized(lock) {
+    fun takeChunk(maxBytes: Int): Chunk? = synchronized(lock) { takeChunkLocked(maxBytes).also { refreshFlags() } }
+
+    private fun takeChunkLocked(maxBytes: Int): Chunk? =
+        run {
             val cap = maxBytes.coerceAtLeast(0)
 
             // 1. Retransmit queue first.
             val retransmitHead = retransmit.firstOrNull()
             if (retransmitHead != null) {
-                if (cap == 0 && retransmitHead.length > 0L) return@synchronized null
+                if (cap == 0 && retransmitHead.length > 0L) return@run null
                 val take = minOf(retransmitHead.length, cap.toLong())
                 val payload = sliceAt(retransmitHead.offset, take.toInt())
                 retransmit.removeFirst()
@@ -257,13 +304,13 @@ class SendBuffer(
                 }
                 addToInFlight(Range(retransmitHead.offset, take, fin))
                 if (fin) _finSent = true
-                return@synchronized Chunk(retransmitHead.offset, payload, fin, isRetransmit = true)
+                return@run Chunk(retransmitHead.offset, payload, fin, isRetransmit = true)
             }
 
             // 2. Fresh bytes.
             val freshAvailable = _nextOffset - nextSendOffset
             if (freshAvailable > 0L) {
-                if (cap == 0) return@synchronized null
+                if (cap == 0) return@run null
                 val take = minOf(freshAvailable, cap.toLong())
                 val offset = nextSendOffset
                 val payload = sliceAt(offset, take.toInt())
@@ -271,14 +318,14 @@ class SendBuffer(
                 val finForThis = _finPending && !_finSent && nextSendOffset == _nextOffset
                 addToInFlight(Range(offset, take, finForThis))
                 if (finForThis) _finSent = true
-                return@synchronized Chunk(offset, payload, finForThis, isRetransmit = false)
+                return@run Chunk(offset, payload, finForThis, isRetransmit = false)
             }
 
             // 3. FIN-only.
             if (_finPending && !_finSent) {
                 _finSent = true
                 addToInFlight(Range(nextSendOffset, 0L, true))
-                return@synchronized Chunk(nextSendOffset, ByteArray(0), true, isRetransmit = false)
+                return@run Chunk(nextSendOffset, ByteArray(0), true, isRetransmit = false)
             }
             null
         }
@@ -299,8 +346,12 @@ class SendBuffer(
         length: Long,
     ) {
         synchronized(lock) {
-            removeOverlap(inFlight, offset, length, OverlapAction.ACK)
-            advanceFlushedFloorIfPossible()
+            try {
+                removeOverlap(inFlight, offset, length, OverlapAction.ACK)
+                advanceFlushedFloorIfPossible()
+            } finally {
+                refreshFlags()
+            }
         }
     }
 
@@ -323,28 +374,44 @@ class SendBuffer(
         fin: Boolean,
     ) {
         synchronized(lock) {
-            // Bytes already released (below flushedFloor) are gone for
-            // good — by definition they were ACK'd, so there's nothing
-            // to retransmit. Clamp the requested range to the retained
-            // window to keep the operation idempotent.
-            if (offset + length <= flushedFloor) {
-                if (fin && !_finAcked && !bestEffort) _finSent = false
-                return
-            }
-            val clampedOffset = maxOf(offset, flushedFloor)
-            val clampedLength = (offset + length) - clampedOffset
-            if (bestEffort) {
-                // Drop without retransmit (see class kdoc). Bytes vanish
-                // from inFlight and the data buffer can compact, the
-                // same way an ACK would. The FIN flag intentionally
-                // stays as `_finSent = true` — best-effort means we
-                // don't try to re-emit FIN either; the peer either saw
-                // it on the original wire or it's lost forever.
-                removeOverlap(inFlight, clampedOffset, clampedLength, OverlapAction.DROP)
-                advanceFlushedFloorIfPossible()
-            } else {
-                removeOverlap(inFlight, clampedOffset, clampedLength, OverlapAction.RETRANSMIT)
-                if (fin && !_finAcked) _finSent = false
+            try {
+                // Bytes already released (below flushedFloor) are gone for
+                // good — by definition they were ACK'd, so there's nothing
+                // to retransmit. Clamp the requested range to the retained
+                // window to keep the operation idempotent.
+                if (length == 0L) {
+                    // A FIN-only range sits at the floor once the data before it is ACK'd.
+                    if (_finAcked) return
+                    if (bestEffort) {
+                        removeOverlap(inFlight, offset, 0L, OverlapAction.DROP)
+                        advanceFlushedFloorIfPossible()
+                    } else {
+                        removeOverlap(inFlight, offset, 0L, OverlapAction.RETRANSMIT)
+                        if (fin) _finSent = false
+                    }
+                    return
+                }
+                if (offset + length <= flushedFloor) {
+                    if (fin && !_finAcked && !bestEffort) _finSent = false
+                    return
+                }
+                val clampedOffset = maxOf(offset, flushedFloor)
+                val clampedLength = (offset + length) - clampedOffset
+                if (bestEffort) {
+                    // Drop without retransmit (see class kdoc). Bytes vanish
+                    // from inFlight and the data buffer can compact, the
+                    // same way an ACK would. The FIN flag intentionally
+                    // stays as `_finSent = true` — best-effort means we
+                    // don't try to re-emit FIN either; the peer either saw
+                    // it on the original wire or it's lost forever.
+                    removeOverlap(inFlight, clampedOffset, clampedLength, OverlapAction.DROP)
+                    advanceFlushedFloorIfPossible()
+                } else {
+                    removeOverlap(inFlight, clampedOffset, clampedLength, OverlapAction.RETRANSMIT)
+                    if (fin && !_finAcked) _finSent = false
+                }
+            } finally {
+                refreshFlags()
             }
         }
     }
@@ -377,39 +444,60 @@ class SendBuffer(
      */
     fun requeueAllInflight() {
         synchronized(lock) {
-            if (inFlight.isEmpty()) return
-            if (bestEffort) {
-                inFlight.clear()
-                advanceFlushedFloorIfPossible()
-                return
-            }
-            // Move every inflight range to the retransmit queue,
-            // preserving offset order (inFlight is sorted by offset
-            // ascending). Coalesce adjacent ranges on insert: if the
-            // previous tail entry's `offset + length` equals the
-            // current's `offset`, merge them into a single range. The
-            // PTO probe path otherwise emits one tiny STREAM frame per
-            // original-packet boundary instead of replaying the
-            // contiguous bytes as a single chunk, fragmenting the
-            // probe across N small frames + N AEAD seals + N writes
-            // when one frame would do. Coalescing across the FIN bit
-            // is gated — only merge when the previous tail had no
-            // FIN, otherwise the FIN's implicit final-size invariant
-            // could shift.
-            for (r in inFlight) {
-                if (r.fin && !_finAcked) _finSent = false
-                val tail = retransmit.lastOrNull()
-                if (tail != null && !tail.fin && tail.offset + tail.length == r.offset) {
-                    // Merge: extend the tail to cover [tail.offset, r.endOffset).
-                    val merged = Range(tail.offset, tail.length + r.length, r.fin)
-                    retransmit.removeLast()
-                    retransmit.addLast(merged)
-                } else {
-                    retransmit.addLast(r)
+            try {
+                if (inFlight.isEmpty()) return
+                if (bestEffort) {
+                    if (inFlight.any { it.fin }) finAbandoned = true
+                    inFlight.clear()
+                    advanceFlushedFloorIfPossible()
+                    return
                 }
-                retransmitTotalBytes += r.length
+                // Move every inflight range to the retransmit queue,
+                // preserving offset order (inFlight is sorted by offset
+                // ascending). Coalesce adjacent ranges on insert: if the
+                // previous tail entry's `offset + length` equals the
+                // current's `offset`, merge them into a single range. The
+                // PTO probe path otherwise emits one tiny STREAM frame per
+                // original-packet boundary instead of replaying the
+                // contiguous bytes as a single chunk, fragmenting the
+                // probe across N small frames + N AEAD seals + N writes
+                // when one frame would do. Coalescing across the FIN bit
+                // is gated — only merge when the previous tail had no
+                // FIN, otherwise the FIN's implicit final-size invariant
+                // could shift.
+                for (r in inFlight) {
+                    if (r.fin && !_finAcked) _finSent = false
+                    val tail = retransmit.lastOrNull()
+                    if (tail != null && !tail.fin && tail.offset + tail.length == r.offset) {
+                        // Merge: extend the tail to cover [tail.offset, r.endOffset).
+                        val merged = Range(tail.offset, tail.length + r.length, r.fin)
+                        retransmit.removeLast()
+                        retransmit.addLast(merged)
+                    } else {
+                        retransmit.addLast(r)
+                    }
+                    retransmitTotalBytes += r.length
+                }
+                inFlight.clear()
+            } finally {
+                refreshFlags()
             }
-            inFlight.clear()
+        }
+    }
+
+    /** Everything sent so far goes out again, ACK'd or not (needs [retainAcked]). */
+    internal fun resendAllSent() {
+        synchronized(lock) {
+            try {
+                check(retainAcked) { "resendAllSent needs retainAcked" }
+                if (nextSendOffset == 0L) return
+                inFlight.clear()
+                retransmit.clear()
+                retransmit.addLast(Range(0L, nextSendOffset, false))
+                retransmitTotalBytes = nextSendOffset
+            } finally {
+                refreshFlags()
+            }
         }
     }
 
@@ -443,22 +531,28 @@ class SendBuffer(
             // offset. Multiple zero-length ranges at the same offset are
             // disallowed by [addToInFlight]'s sort invariant — at most
             // one FIN-only range exists per buffer.
-            val startIndex = firstOverlapIndex(list, offset)
-            if (startIndex < list.size) {
-                val r = list[startIndex]
-                if (r.offset == offset && r.length == 0L) {
-                    list.removeAt(startIndex)
-                    when (action) {
-                        OverlapAction.ACK -> {
-                            if (r.fin) _finAcked = true
-                        }
+            // Search by start offset: firstOverlapIndex looks for an end
+            // past the offset, which a zero-length range never has.
+            var i = firstStartingAtOrAfter(list, offset)
+            while (i < list.size && list[i].offset == offset) {
+                val r = list[i]
+                if (r.length != 0L) {
+                    i += 1
+                    continue
+                }
+                list.removeAt(i)
+                when (action) {
+                    OverlapAction.ACK -> {
+                        if (r.fin) _finAcked = true
+                    }
 
-                        OverlapAction.RETRANSMIT -> {
-                            retransmit.addLast(r)
-                            retransmitTotalBytes += r.length
-                        }
+                    OverlapAction.RETRANSMIT -> {
+                        retransmit.addLast(r)
+                        retransmitTotalBytes += r.length
+                    }
 
-                        OverlapAction.DROP -> {} // discard
+                    OverlapAction.DROP -> {
+                        if (r.fin) finAbandoned = true
                     }
                 }
             }
@@ -536,7 +630,9 @@ class SendBuffer(
                         retransmitTotalBytes += coveredLen
                     }
 
-                    OverlapAction.DROP -> {} // discard the covered piece
+                    OverlapAction.DROP -> {
+                        if (coveredFin) finAbandoned = true
+                    }
                 }
             }
             endIndex += 1
@@ -561,6 +657,20 @@ class SendBuffer(
         // left-piece sits below the next overlap's left-piece). So no
         // explicit sort needed.
         for (r in replacements) addToInFlight(r)
+    }
+
+    /** Binary-search [list] (sorted by start offset) for the first entry starting at or after [targetOffset]. */
+    private fun firstStartingAtOrAfter(
+        list: ArrayDeque<Range>,
+        targetOffset: Long,
+    ): Int {
+        var lo = 0
+        var hi = list.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (list[mid].offset >= targetOffset) hi = mid else lo = mid + 1
+        }
+        return lo
     }
 
     /**
@@ -626,6 +736,7 @@ class SendBuffer(
      * amount.
      */
     private fun advanceFlushedFloorIfPossible() {
+        if (retainAcked) return
         val lowestInFlight = inFlight.firstOrNull()?.offset ?: _nextOffset
         val lowestRetransmit = retransmit.minOfOrNull { it.offset } ?: _nextOffset
         val lowest = minOf(lowestInFlight, lowestRetransmit, nextSendOffset)

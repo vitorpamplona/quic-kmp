@@ -20,6 +20,8 @@
  */
 package com.vitorpamplona.quic.crypto
 
+import com.vitorpamplona.quic.packet.QuicVersion
+
 /**
  * Initial-packet protection secrets per RFC 9001 §5.2.
  *
@@ -34,7 +36,8 @@ package com.vitorpamplona.quic.crypto
  *
  * Initial packets always use the AES-128-GCM AEAD with AES-128 header
  * protection — those parameters are fixed for the QUIC v1 long-header
- * protection epoch.
+ * protection epoch. QUIC v2 (RFC 9369 §3.3) changes only the salt and the
+ * `quicv2 key` / `quicv2 iv` / `quicv2 hp` labels.
  */
 object InitialSecrets {
     /**
@@ -68,22 +71,31 @@ object InitialSecrets {
             0x0a.toByte(),
         )
 
+    /** RFC 9369 §3.3.1 Initial salt for QUIC v2. */
+    private val V2_INITIAL_SALT: ByteArray =
+        ByteArray(20) { i -> "0dede3def700a6db819381be6e269dcbf9bd2ed9".substring(2 * i, 2 * i + 2).toInt(16).toByte() }
+
     /**
      * Derive both directions' Initial protection material from the original
      * destination connection id (the random CID the client put in its first
-     * Initial).
+     * Initial), under [version]'s salt and labels.
      */
-    fun derive(clientDstConnectionId: ByteArray): InitialProtection {
-        val initialSecret = HKDF.extract(clientDstConnectionId, V1_INITIAL_SALT)
+    fun derive(
+        clientDstConnectionId: ByteArray,
+        version: Int = QuicVersion.V1,
+    ): InitialProtection {
+        val salt = if (version == QuicVersion.V2) V2_INITIAL_SALT else V1_INITIAL_SALT
+        val label = QuicVersion.labelPrefix(version)
+        val initialSecret = HKDF.extract(clientDstConnectionId, salt)
         val clientSecret = HKDF.expandLabel(initialSecret, "client in", ByteArray(0), 32)
         val serverSecret = HKDF.expandLabel(initialSecret, "server in", ByteArray(0), 32)
         return InitialProtection(
-            clientKey = HKDF.expandLabel(clientSecret, "quic key", ByteArray(0), 16),
-            clientIv = HKDF.expandLabel(clientSecret, "quic iv", ByteArray(0), 12),
-            clientHp = HKDF.expandLabel(clientSecret, "quic hp", ByteArray(0), 16),
-            serverKey = HKDF.expandLabel(serverSecret, "quic key", ByteArray(0), 16),
-            serverIv = HKDF.expandLabel(serverSecret, "quic iv", ByteArray(0), 12),
-            serverHp = HKDF.expandLabel(serverSecret, "quic hp", ByteArray(0), 16),
+            clientKey = HKDF.expandLabel(clientSecret, "$label key", ByteArray(0), 16),
+            clientIv = HKDF.expandLabel(clientSecret, "$label iv", ByteArray(0), 12),
+            clientHp = HKDF.expandLabel(clientSecret, "$label hp", ByteArray(0), 16),
+            serverKey = HKDF.expandLabel(serverSecret, "$label key", ByteArray(0), 16),
+            serverIv = HKDF.expandLabel(serverSecret, "$label iv", ByteArray(0), 12),
+            serverHp = HKDF.expandLabel(serverSecret, "$label hp", ByteArray(0), 16),
         )
     }
 }

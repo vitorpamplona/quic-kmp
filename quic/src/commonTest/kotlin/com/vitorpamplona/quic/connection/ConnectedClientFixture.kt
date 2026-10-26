@@ -61,6 +61,10 @@ fun newConnectedClient(
      * [QuicConnection.handshakeConfirmed] = false.
      */
     deliverHandshakeDone: Boolean = true,
+    /** Server `preferred_address` transport parameter (RFC 9000 §9.6). */
+    preferredAddress: PreferredAddress? = null,
+    migrateToPreferredAddress: Boolean = true,
+    onNewToken: ((ByteArray) -> Unit)? = null,
 ): Pair<QuicConnection, InMemoryQuicPipe> =
     runBlocking {
         val client =
@@ -74,8 +78,10 @@ fun newConnectedClient(
                         initialMaxStreamDataBidiLocal = maxStreamData,
                         initialMaxStreamDataBidiRemote = maxStreamData,
                         initialMaxStreamDataUni = maxStreamData,
+                        migrateToPreferredAddress = migrateToPreferredAddress,
                     ),
                 tlsCertificateValidator = PermissiveCertificateValidator(),
+                onNewToken = onNewToken,
             )
         val serverScid = ConnectionId.random(8)
         val tlsServer =
@@ -90,6 +96,7 @@ fun newConnectedClient(
                         initialMaxStreamsUni = maxStreamsUni,
                         initialSourceConnectionId = serverScid.bytes,
                         originalDestinationConnectionId = client.destinationConnectionId.bytes,
+                        preferredAddress = preferredAddress,
                     ).encode(),
             )
         val pipe =
@@ -108,7 +115,7 @@ fun newConnectedClient(
             // key-update gates both fired off `handshakeComplete`,
             // which flips at TLS-Finished. After the
             // `handshakeConfirmed` split (driven by the keyupdate-
-            // vs-quinn bug, see `quic/plans/2026-05-08-keyupdate-vs-quinn.md`),
+            // vs-quinn bug, see `plans/2026-05-08-keyupdate-vs-quinn.md`),
             // both gates require HANDSHAKE_DONE — so the default
             // fixture now matches the production "handshake
             // confirmed" state.

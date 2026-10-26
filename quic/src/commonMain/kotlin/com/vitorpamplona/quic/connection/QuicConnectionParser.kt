@@ -100,9 +100,11 @@ fun feedDatagram(
     conn: QuicConnection,
     datagram: ByteArray,
     nowMillis: Long,
+    path: NetworkPath = NetworkPath.ACTIVE,
 ) {
     try {
-        feedDatagramInner(conn, datagram, nowMillis)
+        feedDatagramInner(conn, datagram, nowMillis, path)
+        if (conn.isServer && conn.handshakeComplete && conn.earlyShortHeaderPackets.isNotEmpty()) feedEarlyShortHeaderPackets(conn, nowMillis)
     } catch (e: com.vitorpamplona.quic.QuicProtocolViolationException) {
         // RFC 9000 §17.2 / §17.3.1: peer set reserved bits in the
         // header after HP unmask (or a similar invariant violation
@@ -147,6 +149,7 @@ private fun feedDatagramInner(
     conn: QuicConnection,
     datagram: ByteArray,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
     // RFC 9000 §10.2.2: while in the DRAINING state, late inbound
     // packets MUST be discarded silently. Same goes for CLOSED.
@@ -170,6 +173,9 @@ private fun feedDatagramInner(
         conn.markClosedExternally("stateless reset received from peer")
         return
     }
+    // RFC 9000 §8.1: what a server may send before the client's address is
+    // validated is bounded by what it received.
+    conn.onDatagramReceived(datagram.size)
     var offset = 0
     while (offset < datagram.size) {
         val first = datagram[offset].toInt() and 0xFF
@@ -185,7 +191,8 @@ private fun feedDatagramInner(
                         ((datagram[offset + 3].toInt() and 0xFF) shl 8) or
                         (datagram[offset + 4].toInt() and 0xFF)
                 if (version == QuicVersion.VERSION_NEGOTIATION) {
-                    feedVersionNegotiationPacket(conn, datagram, offset)
+                    // Only servers send Version Negotiation (RFC 9000 §17.2.1).
+                    if (!conn.isServer) feedVersionNegotiationPacket(conn, datagram, offset)
                     // VN packets MUST be the only packet in their datagram
                     // (RFC 9000 §17.2.1: no length field, body is rest of
                     // datagram). Stop walking.
@@ -198,11 +205,11 @@ private fun feedDatagramInner(
             // that's totally unparseable (then we don't know where the next
             // packet starts).
             val peeked = LongHeaderPacket.peekHeader(datagram, offset) ?: break
-            val consumed = feedLongHeaderPacket(conn, datagram, offset, nowMillis)
+            val consumed = feedLongHeaderPacket(conn, datagram, offset, nowMillis, path)
             offset += consumed ?: peeked.totalLength
         } else {
             // Short-header — consumes the rest of the datagram.
-            feedShortHeaderPacket(conn, datagram, offset, nowMillis)
+            feedShortHeaderPacket(conn, datagram, offset, nowMillis, path)
             return
         }
     }
@@ -273,13 +280,40 @@ private fun feedLongHeaderPacket(
     datagram: ByteArray,
     offset: Int,
     nowMillis: Long,
+    path: NetworkPath,
 ): Int? {
     val peeked = LongHeaderPacket.peekHeader(datagram, offset) ?: return null
     // RFC 9000 §17.2.5 + RFC 9001 §5.8: Retry has no PN space, no AEAD
     // payload protection, and cannot be coalesced with anything else
     // (it consumes the rest of the datagram via peekHeader.totalLength).
     // Branch out before the standard parse-and-decrypt path.
+    // RFC 9369 §4.1: once the version is settled, packets in any other
+    // version are dropped — except the server's original-version Initials
+    // that can trail a compatible switch.
+    var candidate: PacketProtection? = null
+    var originalVersionInitial = false
+    if (peeked.version != conn.currentVersion) {
+        if (conn.compatibleVersionSwitched &&
+            peeked.version == conn.initialVersion &&
+            peeked.type == LongHeaderType.INITIAL &&
+            conn.originalVersionInitialReceive != null &&
+            !conn.initial.keysDiscarded
+        ) {
+            originalVersionInitial = true
+        } else if (peeked.type == LongHeaderType.INITIAL) {
+            candidate = conn.compatibleVersionCandidate(peeked.version)
+        }
+        if (!originalVersionInitial && candidate == null) {
+            conn.qlogObserver.onPacketDropped(
+                "long header in version ${QuicVersion.name(peeked.version)}, connection runs ${QuicVersion.name(conn.currentVersion)}",
+                peeked.totalLength,
+            )
+            return null
+        }
+    }
     if (peeked.type == LongHeaderType.RETRY) {
+        // Only servers send Retry (RFC 9000 §17.2.5).
+        if (conn.isServer) return peeked.totalLength
         val retryBytes = datagram.copyOfRange(offset, offset + peeked.totalLength)
         val retryPacket = RetryPacket.parse(retryBytes)
         if (retryPacket != null) {
@@ -299,9 +333,21 @@ private fun feedLongHeaderPacket(
                 EncryptionLevel.HANDSHAKE
             }
 
-            LongHeaderType.ZERO_RTT, LongHeaderType.RETRY -> {
-                // Not supported by client; surface as a drop so qvis can
-                // see we ignored a packet rather than silently moving on.
+            LongHeaderType.ZERO_RTT -> {
+                // A server reads the client's early data when it accepted
+                // 0-RTT; 0-RTT shares the application packet number space
+                // (RFC 9000 §12.3). A client never receives 0-RTT.
+                if (conn.isServer && conn.zeroRttReceiveProtection != null) {
+                    EncryptionLevel.APPLICATION
+                } else {
+                    conn.qlogObserver.onPacketDropped("0-RTT packet without 0-RTT keys", peeked.totalLength)
+                    return null
+                }
+            }
+
+            LongHeaderType.RETRY -> {
+                // Surface as a drop so qvis can see we ignored a packet
+                // rather than silently moving on.
                 conn.qlogObserver.onPacketDropped(
                     "unsupported long-header type ${peeked.type}",
                     peeked.totalLength,
@@ -310,7 +356,14 @@ private fun feedLongHeaderPacket(
             }
         }
     val state = conn.levelState(level)
-    val proto = state.receiveProtection
+    val zeroRtt = peeked.type == LongHeaderType.ZERO_RTT
+    val proto =
+        when {
+            candidate != null -> candidate
+            originalVersionInitial -> conn.originalVersionInitialReceive
+            zeroRtt -> conn.zeroRttReceiveProtection
+            else -> state.receiveProtection
+        }
     if (proto == null) {
         conn.qlogObserver.onPacketDropped(
             "no receive keys at level $level",
@@ -340,20 +393,64 @@ private fun feedLongHeaderPacket(
         return null
     }
 
+    // The server answered in a compatible version and the packet
+    // authenticated under that version's keys: switch (RFC 9368 §2.3).
+    if (candidate != null) conn.commitCompatibleVersion(peeked.version, candidate)
+
+    // RFC 9000 §12.3: a packet number seen before is a duplicate (or a
+    // replay): drop it before it moves anything.
+    if (state.ackTracker.hasReceived(parsed.packet.packetNumber)) {
+        conn.qlogObserver.onPacketDropped("duplicate packet number ${parsed.packet.packetNumber}", parsed.consumed)
+        return parsed.consumed
+    }
+    if (conn.isServer) conn.notePeerAddressDuringHandshakeLocked(level, parsed.packet.packetNumber > state.pnSpace.largestReceived)
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
     // resets the idle timer.
-    conn.lastActivityMs = nowMillis
+    conn.noteReceived(nowMillis)
 
-    // The server's source CID becomes our destination CID for subsequent packets.
-    if (level == EncryptionLevel.INITIAL) {
-        conn.destinationConnectionId = parsed.packet.scid
+    // RFC 9000 §8.1: a Handshake packet proves the client got our Initial,
+    // which validates its address; and RFC 9001 §4.9.1: a server discards
+    // its Initial keys when it first processes one.
+    if (conn.isServer && level == EncryptionLevel.HANDSHAKE) {
+        conn.addressValidated = true
+        if (!conn.initial.keysDiscarded) conn.initial.discardKeys()
+    }
+
+    // RFC 9000 §7.2: the SCID of the server's first Initial becomes our DCID;
+    // later long-header packets with a different SCID belong to something
+    // else and are dropped.
+    val adoptedScid = conn.serverInitialScid
+    if (adoptedScid == null) {
+        if (level == EncryptionLevel.INITIAL) {
+            conn.serverInitialScid = parsed.packet.scid
+            conn.destinationConnectionId = parsed.packet.scid
+        }
+    } else if (parsed.packet.scid != adoptedScid) {
+        conn.qlogObserver.onPacketDropped("long header SCID ${parsed.packet.scid} != server's $adoptedScid", parsed.consumed)
+        return parsed.consumed
     }
 
     // Round-5 #P3: decode the frame list ONCE — qlog (when attached) and
     // dispatch both need the same decoded view. Pre-fix the parser walked
     // the payload twice per inbound packet.
     val decodedFrames = decodeFramesOrClose(conn, parsed.packet.payload) ?: return parsed.consumed
+    if (zeroRtt) {
+        // RFC 9000 §12.4: these never travel in 0-RTT.
+        val illegal =
+            decodedFrames.firstOrNull {
+                it is AckFrame || it is CryptoFrame || it is HandshakeDoneFrame || it is NewTokenFrame ||
+                    it is com.vitorpamplona.quic.frame.PathResponseFrame ||
+                    it is com.vitorpamplona.quic.frame.RetireConnectionIdFrame
+            }
+        if (illegal != null) {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: ${illegal::class.simpleName} in a 0-RTT packet",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return parsed.consumed
+        }
+    }
     if (conn.qlogObserver !== com.vitorpamplona.quic.observability.QlogObserver.NoOp) {
         conn.qlogObserver.onPacketReceived(
             level = level,
@@ -362,16 +459,52 @@ private fun feedLongHeaderPacket(
             frames = frameNamesFor(decodedFrames),
         )
     }
-    dispatchFrames(conn, level, decodedFrames, parsed.packet.packetNumber, nowMillis)
+    dispatchFrames(conn, level, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
     return parsed.consumed
 }
+
+/** Server: the 1-RTT packets kept while the handshake was completing, read now that it has. */
+private fun feedEarlyShortHeaderPackets(
+    conn: QuicConnection,
+    nowMillis: Long,
+) {
+    val packets = conn.earlyShortHeaderPackets.toList()
+    conn.earlyShortHeaderPackets.clear()
+    conn.earlyShortHeaderBytes = 0
+    // Read as if they came on the path the handshake completed on: an old
+    // address they came from must not start a migration back to it.
+    for (p in packets) {
+        if (conn.status == QuicConnection.Status.DRAINING || conn.status == QuicConnection.Status.CLOSED) break
+        feedShortHeaderPacket(conn, p.bytes, 0, nowMillis, p.path)
+    }
+}
+
+/** How many 1-RTT packets, and bytes, a server keeps while its handshake completes. */
+private const val MAX_EARLY_SHORT_HEADER_PACKETS = 32
+private const val MAX_EARLY_SHORT_HEADER_BYTES = 16 * 1024
 
 private fun feedShortHeaderPacket(
     conn: QuicConnection,
     datagram: ByteArray,
     offset: Int,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
+    // RFC 9001 §5.7: a server must not process 1-RTT packets before the
+    // handshake completes. Once it has, 0-RTT keys can go (§4.9.3).
+    if (conn.isServer) {
+        if (!conn.handshakeComplete) {
+            val size = datagram.size - offset
+            if (conn.earlyShortHeaderPackets.size < MAX_EARLY_SHORT_HEADER_PACKETS && conn.earlyShortHeaderBytes + size <= MAX_EARLY_SHORT_HEADER_BYTES) {
+                conn.earlyShortHeaderPackets += QuicConnection.EarlyShortHeaderPacket(datagram.copyOfRange(offset, datagram.size), path)
+                conn.earlyShortHeaderBytes += size
+            } else {
+                conn.qlogObserver.onPacketDropped("1-RTT before the handshake completed", datagram.size - offset)
+            }
+            return
+        }
+        conn.zeroRttReceiveProtection = null
+    }
     val state = conn.levelState(EncryptionLevel.APPLICATION)
     val live = state.receiveProtection
     if (live == null) {
@@ -542,8 +675,14 @@ private fun feedShortHeaderPacket(
         if (conn.aeadDecryptFailureCount >= limit) {
             conn.markClosedExternally(
                 "AEAD_LIMIT_REACHED: 1-RTT decrypt-failure count ${conn.aeadDecryptFailureCount} >= integrity limit $limit",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.AEAD_LIMIT_REACHED,
             )
         }
+        return
+    }
+    // RFC 9000 §12.3: drop a duplicate (or replayed) packet number.
+    if (state.ackTracker.hasReceived(parsed.packet.packetNumber)) {
+        conn.qlogObserver.onPacketDropped("duplicate packet number ${parsed.packet.packetNumber}", datagram.size - offset)
         return
     }
     // AEAD succeeded with the candidate next-phase keys → commit the
@@ -563,6 +702,14 @@ private fun feedShortHeaderPacket(
     if (rotateOnSuccess != null && parsed.packet.packetNumber > state.pnSpace.largestReceived) {
         conn.commitKeyUpdate(rotateOnSuccess)
     }
+    // Whether this packet raises the highest packet number seen — judged
+    // before recording it, so a replayed duplicate of the latest doesn't count.
+    val raisesLargest = parsed.packet.packetNumber > state.pnSpace.largestReceived
+    // RFC 9000 §17.4: the spin bit isn't header-protected; it follows the
+    // packet that raises the highest packet number.
+    if (raisesLargest) {
+        conn.onSpinBitReceived((datagram[offset].toInt() and 0x20) != 0)
+    }
     // RFC 9001 §6.4: clear the in-flight-rotation gate once an inbound
     // packet decrypts under the live (post-rotation) keys. That confirms
     // the peer has rolled forward in lockstep, so it's safe to permit
@@ -576,7 +723,7 @@ private fun feedShortHeaderPacket(
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
     // resets the idle timer.
-    conn.lastActivityMs = nowMillis
+    conn.noteReceived(nowMillis)
     // Round-5 #P3: single decode of the application-level payload feeds
     // both qlog and dispatch.
     val decodedFrames = decodeFramesOrClose(conn, parsed.packet.payload) ?: return
@@ -588,7 +735,8 @@ private fun feedShortHeaderPacket(
             frames = frameNamesFor(decodedFrames),
         )
     }
-    dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis)
+    dispatchFrames(conn, EncryptionLevel.APPLICATION, decodedFrames, parsed.packet.packetNumber, nowMillis, path)
+    if (conn.isServer) conn.notePeerAddressLocked(decodedFrames, raisesLargest, nowMillis, datagram.size)
 }
 
 /**
@@ -620,7 +768,7 @@ private fun decodeFramesOrClose(
     try {
         decodeFrames(payload)
     } catch (e: QuicCodecException) {
-        conn.markClosedExternally("frame decode failed: ${e.message}")
+        conn.markClosedExternally("frame decode failed: ${e.message}", errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FRAME_ENCODING_ERROR)
         null
     }
 
@@ -630,12 +778,39 @@ private fun dispatchFrames(
     frames: List<com.vitorpamplona.quic.frame.Frame>,
     packetNumber: Long,
     nowMillis: Long,
+    path: NetworkPath,
 ) {
     val state = conn.levelState(level)
+    // RFC 9000 §19.7 / §19.20: only a server sends these.
+    if (conn.isServer) {
+        frames.firstOrNull { it is HandshakeDoneFrame || it is NewTokenFrame }?.let {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: client sent ${it::class.simpleName}",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+    }
+    // RFC 9000 §12.4: Initial and Handshake packets carry only PADDING, PING,
+    // ACK, CRYPTO and the transport form of CONNECTION_CLOSE.
+    if (level != EncryptionLevel.APPLICATION) {
+        val illegal =
+            frames.firstOrNull {
+                !(it is AckFrame || it is CryptoFrame || it is PingFrame || it is ConnectionCloseFrame && it.frameType != null)
+            }
+        if (illegal != null) {
+            conn.markClosedExternally(
+                "PROTOCOL_VIOLATION: ${illegal::class.simpleName} in a $level packet",
+                errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+            )
+            return
+        }
+    }
     var ackEliciting = false
     for (frame in frames) {
         when (frame) {
             is AckFrame -> {
+                if (frame.ecnCounts != null && level == EncryptionLevel.APPLICATION) conn.peerSendsAckEcn = true
                 // The peer's `frame.largestAcknowledged` is in OUR
                 // outbound PN space — the inbound `state.ackTracker`
                 // tracks PNs WE RECEIVED from the peer. The previous
@@ -648,7 +823,7 @@ private fun dispatchFrames(
                 // packet that carried our outbound ACK frame, we
                 // know the peer received our ACK and we can drop
                 // the corresponding inbound PNs from the tracker.
-                // Step 5 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+                // Step 5 of `plans/2026-05-04-control-frame-retransmit.md`:
                 // (a) snapshot the send time of the largest-acked PN
                 // BEFORE drain so we can update RTT, (b) drain ACK'd
                 // packets, (c) if the ACK advanced largestAckedPn AND
@@ -707,6 +882,13 @@ private fun dispatchFrames(
                     // exponential backoff resets.
                     conn.consecutivePtoCount = 0
                 }
+                // RFC 9002 §B.5 / §B.7: release the acknowledged bytes,
+                // grow the window, and treat a rising CE count as congestion.
+                conn.onPacketsAckedLocked(state, drained)
+                val ecn = frame.ecnCounts
+                if (ecn != null && level == EncryptionLevel.APPLICATION) {
+                    conn.onPeerEcnCountsLocked(ecn, advancedLargest, state.pnSpace.nextPacketNumber, largestSentTime, nowMillis)
+                }
                 state.largestAckedPn?.let { largestAckedPn ->
                     val result =
                         conn.lossDetection.detectAndRemoveLost(
@@ -720,6 +902,7 @@ private fun dispatchFrames(
                     for (lostPacket in result.lost) {
                         conn.onTokensLost(lostPacket.tokens)
                     }
+                    conn.onPacketsLostLocked(state, result.lost, nowMillis)
                     if (result.lost.isNotEmpty()) {
                         conn.qlogObserver.onLossDetected(level, result.lost.map { it.packetNumber })
                     }
@@ -751,6 +934,10 @@ private fun dispatchFrames(
                     )
                     return
                 }
+                // Server: the ClientHello again from the start, all of it already read.
+                if (level == EncryptionLevel.INITIAL && frame.offset == 0L && frame.data.isNotEmpty() && frameEnd <= state.cryptoReceive.readOffset) {
+                    conn.onRepeatedClientHelloLocked()
+                }
                 state.cryptoReceive.insert(frame.offset, frame.data)
                 val contiguous = state.cryptoReceive.readContiguous()
                 if (contiguous.isNotEmpty()) {
@@ -760,7 +947,7 @@ private fun dispatchFrames(
                             EncryptionLevel.HANDSHAKE -> TlsClient.Level.HANDSHAKE
                             EncryptionLevel.APPLICATION -> TlsClient.Level.APPLICATION
                         }
-                    conn.tls.pushHandshakeBytes(tlsLevel, contiguous)
+                    conn.handshakeTls.pushHandshakeBytes(tlsLevel, contiguous)
                     // Pull any new outbound CRYPTO bytes out of TLS into our
                     // send queue at the matching encryption level.
                     drainTlsOutbound(conn)
@@ -783,12 +970,13 @@ private fun dispatchFrames(
                 // the close fires on the parallel `transfer` interop test
                 // (3 GETs on streams 0/4/8) and truncates whichever stream
                 // is still mid-receive when the close lands.
-                if (StreamId.isClientInitiated(frame.streamId) &&
+                if (conn.isLocalStream(frame.streamId) &&
                     conn.streamByIdLocked(frame.streamId) == null &&
                     !conn.isStreamIdRetiredLocked(frame.streamId)
                 ) {
                     conn.markClosedExternally(
-                        "peer opened stream ${frame.streamId} on client-initiated id space (STREAM_STATE_ERROR)",
+                        "peer opened stream ${frame.streamId} on our id space (STREAM_STATE_ERROR)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -810,6 +998,18 @@ private fun dispatchFrames(
                 ) {
                     continue
                 }
+                // RFC 9000 §4.6: a peer opening past the stream limit we
+                // advertised is a STREAM_LIMIT_ERROR.
+                if (!conn.isLocalStream(frame.streamId) && conn.streamByIdLocked(frame.streamId) == null) {
+                    val limit = if (StreamId.isBidirectional(frame.streamId)) conn.advertisedMaxStreamsBidi else conn.advertisedMaxStreamsUni
+                    if ((frame.streamId ushr 2) >= limit) {
+                        conn.markClosedExternally(
+                            "STREAM_LIMIT_ERROR: peer opened stream ${frame.streamId} past our limit of $limit",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_LIMIT_ERROR,
+                        )
+                        return
+                    }
+                }
                 val stream = conn.getOrCreatePeerStreamLocked(frame.streamId)
                 // RFC 9000 §3.2: once the peer has sent RESET_STREAM the
                 // receive side is in the "Reset Recvd" terminal state.
@@ -821,6 +1021,7 @@ private fun dispatchFrames(
                 if (stream.peerResetReceived) {
                     conn.markClosedExternally(
                         "STREAM_STATE_ERROR: stream ${frame.streamId} STREAM after RESET_STREAM",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -831,6 +1032,7 @@ private fun dispatchFrames(
                 if (frameEnd > stream.receiveLimit) {
                     conn.markClosedExternally(
                         "peer exceeded stream ${frame.streamId} receive limit ($frameEnd > ${stream.receiveLimit})",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                     )
                     return
                 }
@@ -849,6 +1051,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FLOW_CONTROL_ERROR: peer exceeded connection MAX_DATA " +
                                 "(${conn.connectionInboundOffsetSum} > ${conn.advertisedMaxData})",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                         )
                         return
                     }
@@ -866,6 +1069,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} frame ends at " +
                                 "${frame.offset + frame.data.size} past final size ${stream.receive.finOffset}",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -874,6 +1078,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} second FIN at " +
                                 "${frame.offset + frame.data.size} disagrees with prior final size ${stream.receive.finOffset}",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -895,6 +1100,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "INTERNAL_ERROR: stream ${frame.streamId} consumer overflowed " +
                                 "incoming channel (slow consumer)",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.INTERNAL_ERROR,
                         )
                         return
                     }
@@ -958,6 +1164,7 @@ private fun dispatchFrames(
                 if (frame.maxStreams > MAX_STREAMS_LIMIT) {
                     conn.markClosedExternally(
                         "STREAM_LIMIT_ERROR: peer MAX_STREAMS=${frame.maxStreams} exceeds RFC 9000 §19.11 cap of 2^60",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_LIMIT_ERROR,
                     )
                     return
                 }
@@ -980,9 +1187,10 @@ private fun dispatchFrames(
                 // (CLIENT_UNI = id%4==2) is STREAM_STATE_ERROR — they don't
                 // have a send side to abort.
                 ackEliciting = true
-                if (StreamId.kindOf(frame.streamId) == StreamId.Kind.CLIENT_UNI) {
+                if (StreamId.isUnidirectional(frame.streamId) && conn.isLocalStream(frame.streamId)) {
                     conn.markClosedExternally(
-                        "STREAM_STATE_ERROR: peer RESET_STREAM on client-uni id ${frame.streamId} (peer has no send side)",
+                        "STREAM_STATE_ERROR: peer RESET_STREAM on our uni id ${frame.streamId} (peer has no send side)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.STREAM_STATE_ERROR,
                     )
                     return
                 }
@@ -997,6 +1205,7 @@ private fun dispatchFrames(
                     conn.markClosedExternally(
                         "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                             "${frame.finalSize} outside [0, 2^62-1]",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                     )
                     return
                 }
@@ -1008,6 +1217,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                                 "${frame.finalSize} disagrees with prior FIN size $priorFin",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -1015,6 +1225,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FINAL_SIZE_ERROR: stream ${frame.streamId} RESET_STREAM finalSize " +
                                 "${frame.finalSize} below already-observed offset $highestSeen",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FINAL_SIZE_ERROR,
                         )
                         return
                     }
@@ -1034,6 +1245,7 @@ private fun dispatchFrames(
                         conn.markClosedExternally(
                             "FLOW_CONTROL_ERROR: peer RESET_STREAM finalSize pushed connection past MAX_DATA " +
                                 "(${conn.connectionInboundOffsetSum} > ${conn.advertisedMaxData})",
+                            errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FLOW_CONTROL_ERROR,
                         )
                         return
                     }
@@ -1064,11 +1276,7 @@ private fun dispatchFrames(
                 // here) has none, so the call is a defensive no-op.
                 ackEliciting = true
                 conn.streamByIdLocked(frame.streamId)?.let { stream ->
-                    val kind = StreamId.kindOf(frame.streamId)
-                    val hasLocalSend =
-                        kind == StreamId.Kind.CLIENT_BIDI ||
-                            kind == StreamId.Kind.SERVER_BIDI ||
-                            kind == StreamId.Kind.CLIENT_UNI
+                    val hasLocalSend = StreamId.isBidirectional(frame.streamId) || conn.isLocalStream(frame.streamId)
                     if (hasLocalSend) {
                         stream.resetStream(frame.applicationErrorCode)
                     }
@@ -1076,8 +1284,17 @@ private fun dispatchFrames(
             }
 
             is NewTokenFrame -> {
-                // Round-4 #2: 0-RTT/resumption token. Out-of-scope; drop.
+                // RFC 9000 §19.7: an address-validation token for a future
+                // connection. An empty one is a FRAME_ENCODING_ERROR.
                 ackEliciting = true
+                if (frame.token.isEmpty()) {
+                    conn.markClosedExternally(
+                        "FRAME_ENCODING_ERROR: empty NEW_TOKEN",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.FRAME_ENCODING_ERROR,
+                    )
+                    return
+                }
+                conn.onNewToken?.invoke(frame.token)
             }
 
             is NewConnectionIdFrame -> {
@@ -1119,7 +1336,7 @@ private fun dispatchFrames(
                 // The PATH_RESPONSE we queue here is itself
                 // ack-eliciting; the regular ACK path covers both.
                 ackEliciting = true
-                conn.queuePathResponseLocked(frame.data)
+                conn.queuePathResponseLocked(frame.data, path)
             }
 
             is PathResponseFrame -> {
@@ -1132,7 +1349,20 @@ private fun dispatchFrames(
                 // (no outstanding challenge OR an attacker echoing
                 // random bytes) are silently ignored after the ACK.
                 ackEliciting = true
-                conn.applyPeerPathResponseLocked(frame.data)
+                // A response to a preferred-address probe completes that
+                // migration (RFC 9000 §9.6.1); any path may carry it.
+                val probe = conn.pathProbe
+                val migration = conn.peerMigration
+                if (migration != null && migration.challenge.contentEquals(frame.data)) {
+                    // The client's new address answered: it's validated (RFC 9000 §8.2.3).
+                    conn.peerMigration = null
+                } else if (probe != null && probe.matches(frame.data)) {
+                    conn.completePreferredAddressMigrationLocked()
+                } else if (conn.isServer && conn.onServerPathResponseLocked(frame.data, nowMillis)) {
+                    // A path the client probed is validated; nothing moves yet.
+                } else {
+                    conn.applyPeerPathResponseLocked(frame.data)
+                }
             }
 
             is RetireConnectionIdFrame -> {
@@ -1167,6 +1397,7 @@ private fun dispatchFrames(
                 if (level != EncryptionLevel.APPLICATION) {
                     conn.markClosedExternally(
                         "HANDSHAKE_DONE at $level (PROTOCOL_VIOLATION; allowed only at APPLICATION)",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
                     )
                     return
                 }
@@ -1198,9 +1429,37 @@ private fun dispatchFrames(
                 ackEliciting = true
             }
 
+            is com.vitorpamplona.quic.frame.AckFrequencyFrame -> {
+                ackEliciting = true
+                conn.applyAckFrequencyLocked(frame)
+            }
+
+            is com.vitorpamplona.quic.frame.ImmediateAckFrame -> {
+                ackEliciting = true
+                // Only a peer that saw our min_ack_delay may send it.
+                if (!conn.config.ackFrequency) {
+                    conn.markClosedExternally(
+                        "PROTOCOL_VIOLATION: IMMEDIATE_ACK without min_ack_delay",
+                        errorCode = com.vitorpamplona.quic.frame.QuicTransportError.PROTOCOL_VIOLATION,
+                    )
+                    return
+                }
+                state.ackTracker.requestImmediateAck()
+            }
+
+            is com.vitorpamplona.quic.frame.DataBlockedFrame,
+            is com.vitorpamplona.quic.frame.StreamDataBlockedFrame,
+            is com.vitorpamplona.quic.frame.StreamsBlockedFrame,
+            -> {
+                // RFC 9000 §19.12-§19.14: informational (the peer is blocked
+                // on a limit we set; our credit updates already track what the
+                // application reads), but ack-eliciting like any frame other
+                // than ACK, PADDING and CONNECTION_CLOSE.
+                ackEliciting = true
+            }
+
             else -> {
-                // PADDING + DATA_BLOCKED + STREAM_DATA_BLOCKED + STREAMS_BLOCKED
-                // are non-eliciting / cleared during decode.
+                // PADDING is cleared during decode.
             }
         }
     }
@@ -1213,7 +1472,7 @@ private fun dispatchFrames(
 private fun drainTlsOutbound(conn: QuicConnection) {
     for (lvl in TlsClient.Level.entries) {
         while (true) {
-            val bytes = conn.tls.pollOutbound(lvl) ?: break
+            val bytes = conn.handshakeTls.pollOutbound(lvl) ?: break
             val state =
                 when (lvl) {
                     TlsClient.Level.INITIAL -> conn.initial

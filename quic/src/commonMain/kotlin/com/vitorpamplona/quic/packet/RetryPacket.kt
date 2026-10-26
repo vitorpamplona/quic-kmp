@@ -31,7 +31,7 @@ import com.vitorpamplona.quic.crypto.Aes128Gcm
  * Wire layout (no header protection, no AEAD on the payload — Retry uses
  * only an integrity tag):
  *
- *   first_byte           = 1|1|11|unused(4)
+ *   first_byte           = 1|1|11|unused(4)   (type bits 00 in QUIC v2)
  *   version              (4 bytes)
  *   dcid_len + dcid
  *   scid_len + scid
@@ -56,10 +56,11 @@ data class RetryPacket(
             val first = bytes[0].toInt() and 0xFF
             if ((first and 0xC0) != 0xC0) return null // not a long header
             val typeBits = (first ushr 4) and 0x03
-            if (typeBits != LongHeaderType.RETRY.code) return null
 
             val r = QuicReader(bytes, 1)
             val version = r.readUint32().toInt()
+            // RFC 9369 §3.2: v2 moves Retry to type bits 0b00.
+            if (typeBits != LongHeaderType.RETRY.wireBits(version)) return null
             val dcidLen = r.readByte()
             if (dcidLen !in 0..20) return null // RFC 9000 §17.2 caps CID at 20
             val dcid = ConnectionId(r.readBytes(dcidLen))
@@ -94,18 +95,28 @@ data class RetryPacket(
         fun computeIntegrityTag(
             retryPacketWithoutTag: ByteArray,
             originalDestinationConnectionId: ByteArray,
+            version: Int = QuicVersion.V1,
         ): ByteArray {
             val aad = QuicWriter()
             aad.writeByte(originalDestinationConnectionId.size)
             aad.writeBytes(originalDestinationConnectionId)
             aad.writeBytes(retryPacketWithoutTag)
+            val v2 = version == QuicVersion.V2
             return Aes128Gcm.seal(
-                key = V1_RETRY_KEY,
-                nonce = V1_RETRY_NONCE,
+                key = if (v2) V2_RETRY_KEY else V1_RETRY_KEY,
+                nonce = if (v2) V2_RETRY_NONCE else V1_RETRY_NONCE,
                 aad = aad.toByteArray(),
                 plaintext = ByteArray(0),
             )
         }
+
+        /** RFC 9369 §3.3.3 — retry-integrity AES-128-GCM key for QUIC v2. */
+        private val V2_RETRY_KEY: ByteArray = hex("8fb4b01b56ac48e260fbcbcead7ccc92")
+
+        /** RFC 9369 §3.3.3 — retry-integrity AES-128-GCM nonce for QUIC v2. */
+        private val V2_RETRY_NONCE: ByteArray = hex("d86969bc2d7c6d9990efb04a")
+
+        private fun hex(s: String): ByteArray = ByteArray(s.length / 2) { i -> s.substring(2 * i, 2 * i + 2).toInt(16).toByte() }
 
         /**
          * RFC 9001 §5.8 — fixed retry-integrity AES-128-GCM key for QUIC v1.
@@ -166,7 +177,7 @@ data class RetryPacket(
     ): Boolean {
         if (originalPacketBytes.size < 16) return false
         val withoutTag = originalPacketBytes.copyOfRange(0, originalPacketBytes.size - 16)
-        val expected = computeIntegrityTag(withoutTag, originalDestinationConnectionId)
+        val expected = computeIntegrityTag(withoutTag, originalDestinationConnectionId, version)
         return constantTimeEquals(expected, retryIntegrityTag)
     }
 }

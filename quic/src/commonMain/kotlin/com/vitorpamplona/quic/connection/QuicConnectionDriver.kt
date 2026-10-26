@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.connection
 
+import com.vitorpamplona.quic.transport.QuicDatagramSocket
 import com.vitorpamplona.quic.transport.UdpSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,9 +55,34 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 @OptIn(ExperimentalAtomicApi::class)
 class QuicConnectionDriver(
     val connection: QuicConnection,
-    private val socket: UdpSocket,
+    socket: QuicDatagramSocket,
     private val parentScope: CoroutineScope,
+    /**
+     * Opens the extra socket a preferred-address migration (RFC 9000 §9.6)
+     * needs toward the server's new address. Tests substitute their own.
+     */
+    private val socketFactory: suspend (host: String, port: Int) -> QuicDatagramSocket = { host, port -> UdpSocket.connect(host, port) },
 ) {
+    /** A client connection over a connected [UdpSocket]. */
+    constructor(
+        connection: QuicConnection,
+        socket: UdpSocket,
+        parentScope: CoroutineScope,
+        socketFactory: suspend (host: String, port: Int) -> UdpSocket = { host, port -> UdpSocket.connect(host, port) },
+    ) : this(connection, socket as QuicDatagramSocket, parentScope, socketFactory)
+
+    /** The socket the connection sends on. Swapped to [probeSocket] when a preferred-address probe validates. */
+    @kotlin.concurrent.Volatile
+    private var activeSocket: QuicDatagramSocket = socket
+
+    /** Socket toward the preferred address while its path is being validated. */
+    @kotlin.concurrent.Volatile
+    private var probeSocket: QuicDatagramSocket? = null
+
+    /** Sockets of paths we left; still read for stragglers, closed with the driver. */
+    private val retiredSockets = ArrayList<QuicDatagramSocket>()
+    private var probeSocketRequested = false
+
     /**
      * Single time source: defer to the connection's [QuicConnection.nowMillis]
      * (monotonic by default). Pre-fix the driver had its own
@@ -114,19 +140,23 @@ class QuicConnectionDriver(
     private val closeJob: AtomicReference<Job?> = AtomicReference(null)
 
     fun start() {
+        connection.sendWakeup = ::wakeup
         connection.start()
         // Wire the diagnostic UDP-stats supplier so
         // QuicConnection.flowControlSnapshot can surface
         // kernel-delivered datagram counters alongside the QUIC
         // flow-control fields.
         connection.udpStatsSupplier = {
+            val socket = activeSocket
             UdpSocketStats(
                 receivedDatagrams = socket.receivedDatagramCount,
                 receivedBytes = socket.receivedByteCount,
                 receiveBufferSizeBytes = socket.receiveBufferSizeBytes,
             )
         }
-        readJob = scope.launch { readLoop() }
+        connection.activePathIsIpv6 = runCatching { activeSocket.remoteIsIpv6 }.getOrDefault(false)
+        val initialSocket = activeSocket
+        readJob = scope.launch { readLoop(initialSocket) }
         sendJob = scope.launch { sendLoop() }
         // Initial nudge so the ClientHello goes out immediately.
         sendWakeup.trySend(Unit)
@@ -137,14 +167,22 @@ class QuicConnectionDriver(
         sendWakeup.trySend(Unit)
     }
 
-    private suspend fun readLoop() {
+    /** Which path [socket] currently carries. */
+    private fun pathOf(socket: QuicDatagramSocket): NetworkPath =
+        when {
+            socket === activeSocket -> NetworkPath.ACTIVE
+            socket === probeSocket -> NetworkPath.PROBE
+            else -> NetworkPath.RETIRED
+        }
+
+    private suspend fun readLoop(socket: QuicDatagramSocket) {
         try {
             while (connection.status != QuicConnection.Status.CLOSED) {
                 val datagram = socket.receive() ?: break
                 // Phase 1 of the lock-split refactor: parser holds
                 // streamsLock for a single datagram-feed pass.
                 connection.streamsLock.withLock {
-                    feedDatagram(connection, datagram, nowMillis())
+                    feedDatagram(connection, datagram, nowMillis(), pathOf(socket))
                 }
                 // Inbound data may have produced new outbound (acks, crypto, etc.).
                 wakeup()
@@ -152,10 +190,86 @@ class QuicConnectionDriver(
         } finally {
             // If the read loop exits while the handshake is still pending,
             // unblock anyone awaiting the handshake — otherwise awaitHandshake()
-            // suspends forever.
-            connection.markClosedExternally("read loop exited (socket closed or peer closed)")
+            // suspends forever. Only the active path's socket closing ends the
+            // connection; a probe or retired socket going away doesn't.
+            if (socket === activeSocket) {
+                connection.markClosedExternally("read loop exited (socket closed or peer closed)")
+            }
             wakeup() // let the send loop notice CLOSED and exit
         }
+    }
+
+    /**
+     * Drive the preferred-address probe (RFC 9000 §9.6) from the send loop:
+     * open its socket when the connection asks for one, swap to it once the
+     * path validated, drop it if validation failed, and flush its datagrams.
+     */
+    private suspend fun servicePathProbe() {
+        if (connection.isServer) {
+            val send = connection.sendOnServerPath ?: return
+            while (true) {
+                val (path, datagram) = connection.streamsLock.withLock { drainServerProbeResponse(connection, nowMillis()) } ?: break
+                runCatching { send(path, datagram) }
+            }
+            return
+        }
+        val probe = connection.pathProbe ?: return
+        when (probe.state) {
+            PathProbe.State.AWAITING_SOCKET -> {
+                if (probeSocketRequested) return
+                probeSocketRequested = true
+                scope.launch {
+                    val opened =
+                        try {
+                            socketFactory(probe.host, probe.port)
+                        } catch (t: Throwable) {
+                            connection.streamsLock.withLock {
+                                connection.failPathProbeLocked("socket: ${t.message ?: t::class.simpleName}")
+                            }
+                            return@launch
+                        }
+                    probeSocket = opened
+                    launch { readLoop(opened) }
+                    connection.streamsLock.withLock { probe.onSocketReady() }
+                    wakeup()
+                }
+            }
+
+            PathProbe.State.PROBING -> {
+                val socket = probeSocket ?: return
+                while (true) {
+                    val out = connection.streamsLock.withLock { drainProbe(connection, nowMillis()) } ?: break
+                    // A send failure on the probe path just means the probe fails by timeout.
+                    runCatching { socket.send(out) }
+                }
+            }
+
+            PathProbe.State.VALIDATED -> {
+                connection.streamsLock.withLock { adoptValidatedProbeSocketLocked() }
+            }
+
+            PathProbe.State.FAILED -> {
+                probeSocket?.let {
+                    probeSocket = null
+                    it.close()
+                }
+            }
+        }
+    }
+
+    /**
+     * Once the probe validated, make its socket the one we send on. Called
+     * under [QuicConnection.streamsLock] right before each datagram is built,
+     * so a packet built after validation (the new connection ID, PATH_RESPONSEs
+     * owed on the new path) never goes out on the old socket.
+     */
+    private fun adoptValidatedProbeSocketLocked() {
+        if (connection.pathProbe?.state != PathProbe.State.VALIDATED) return
+        val socket = probeSocket ?: return
+        retiredSockets += activeSocket
+        activeSocket = socket
+        probeSocket = null
+        connection.activePathIsIpv6 = runCatching { socket.remoteIsIpv6 }.getOrDefault(false)
     }
 
     private suspend fun sendLoop() {
@@ -194,14 +308,32 @@ class QuicConnectionDriver(
     }
 
     private suspend fun sendLoopBody() {
+        try {
+            sendLoopUntilClosed()
+        } finally {
+            // A locally detected error closed the connection: tell the peer.
+            connection.takeFinalCloseDatagram()?.let { runCatching { activeSocket.send(it) } }
+        }
+    }
+
+    private suspend fun sendLoopUntilClosed() {
+        // When the last keep-alive PING was queued. The idle clock only moves on
+        // the first send after a receive, so keep-alive keeps its own.
+        var lastKeepAliveMs = Long.MIN_VALUE
         while (connection.status != QuicConnection.Status.CLOSED) {
+            // Swap paths before building: once a probe validates, the next
+            // packets must already go to the preferred address.
+            servicePathProbe()
             // Phase 1 of the lock-split refactor: the writer holds
             // streamsLock for the build, releases it for the actual
             // socket.send() so a slow socket doesn't stall app
             // coroutines (open/close streams, queue datagrams).
             while (true) {
+                var socket = activeSocket
                 val out =
                     connection.streamsLock.withLock {
+                        adoptValidatedProbeSocketLocked()
+                        socket = activeSocket
                         drainOutbound(connection, nowMillis())
                     } ?: break
                 socket.send(out)
@@ -253,28 +385,11 @@ class QuicConnectionDriver(
             // when no level has send keys), zero it out so the next
             // wakeup-driven drain doesn't accidentally re-requeue.
             connection.pendingProbePackets = 0
-            // Use the loss-detection's PTO calculation in BOTH the pre- and
-            // post-first-RTT-sample regimes. Pre-sample, smoothed_rtt =
-            // INITIAL_RTT_MS so ptoBaseMs returns
-            // INITIAL_RTT_MS * 3 + max_ack_delay (~300 ms with the 100 ms
-            // initial). max_ack_delay only applies to APPLICATION space per
-            // RFC 9002 §6.2.1; pre-handshake we pass 0. Earlier shape
-            // hardcoded 1000 ms here as a "handshake-timeout safety floor"
-            // — the cost was four PTO retransmits in ~30 s of loss
-            // recovery instead of the eight that 300 ms initial gives,
-            // pinching multiconnect handshake-loss tests at the tail.
-            val maxAckDelayMs =
-                if (connection.application.sendProtection != null) {
-                    connection.peerTransportParameters?.maxAckDelay ?: 0L
-                } else {
-                    0L
-                }
-            val ptoBaseMs =
-                connection.lossDetection
-                    .ptoBaseMs(maxAckDelayMs)
-                    .coerceAtLeast(1L)
-            val backoff = (1L shl connection.consecutivePtoCount.coerceAtMost(6))
-            val ptoMillis = (ptoBaseMs * backoff).coerceAtMost(60_000L)
+            // RFC 9002 §6.2.1: the PTO period counts from the latest
+            // ack-eliciting send (QuicConnection.ptoDelayMillis), not from
+            // this wakeup, so wakeups that send nothing don't postpone it.
+            val ptoArmed = connection.ptoArmed()
+            val ptoMillis = connection.ptoDelayMillis(nowMillis())
             // RFC 9002 §6.1.2 timer-driven loss detection: take the
             // earliest of (PTO deadline, next-loss-time across levels).
             // Without this, tail loss waits for the PTO instead of the
@@ -306,12 +421,60 @@ class QuicConnectionDriver(
                 connection.drainingDeadlineMs?.let {
                     (it - nowForLossTimer).coerceAtLeast(0L)
                 }
+            // A probe re-sends its challenge on its own timer and gives up at its deadline.
+            servicePathProbe()
+            val probeDelta =
+                connection.pathProbe?.let { probe ->
+                    val now = nowMillis()
+                    when (probe.state) {
+                        PathProbe.State.PROBING -> {
+                            minOf(
+                                probe.millisUntilNextChallenge(now, connection.pathProbeRetransmitMillis()) ?: Long.MAX_VALUE,
+                                (probe.startedAtMillis + probe.timeoutMillis - now).coerceAtLeast(0L),
+                            )
+                        }
+
+                        PathProbe.State.AWAITING_SOCKET -> {
+                            (probe.startedAtMillis + probe.timeoutMillis - now).coerceAtLeast(0L)
+                        }
+
+                        else -> {
+                            null
+                        }
+                    }
+                }
+            // RFC 9002 §7.7: the pacer held payload back; come back when it
+            // releases the next datagram. (Window-blocked sends wait for an ACK,
+            // which wakes us, or the PTO.)
+            val pacingDelta =
+                connection.pacingDelayMillis(nowForLossTimer).takeIf { it > 0L && !connection.congestionBlocked() }
+            // Keep-alive: a PING once the connection has been quiet this long.
+            val keepAliveMs = connection.config.keepAliveIntervalMillis
+            val keepAliveDelta =
+                if (keepAliveMs > 0L && connection.handshakeConfirmed && connection.status == QuicConnection.Status.CONNECTED) {
+                    (maxOf(connection.lastActivityMs, lastKeepAliveMs) + keepAliveMs - nowForLossTimer).coerceAtLeast(0L)
+                } else {
+                    null
+                }
+            // RFC 9000 §13.2.1: a delayed application ACK falls due at max_ack_delay.
+            val ackDelta =
+                connection.application.ackTracker
+                    .ackDeadlineMillis(connection.localMaxAckDelayMillis)
+                    ?.let { (it - nowForLossTimer).coerceAtLeast(0L) }
+                    // Only while a drain could send it: not when draining, nor
+                    // while an amplification limit holds everything back
+                    // (else an overdue ACK spins this loop).
+                    ?.takeIf { connection.application.sendProtection != null && connection.canSendAck() }
             val sleepMillis =
                 minOf(
                     ptoMillis,
                     nextLossDelta ?: Long.MAX_VALUE,
                     idleDelta ?: Long.MAX_VALUE,
                     drainingDelta ?: Long.MAX_VALUE,
+                    probeDelta ?: Long.MAX_VALUE,
+                    pacingDelta ?: Long.MAX_VALUE,
+                    ackDelta ?: Long.MAX_VALUE,
+                    keepAliveDelta ?: Long.MAX_VALUE,
                 )
             // Suspend until either: a wakeup arrives, or the timer expires.
             val woke =
@@ -342,10 +505,27 @@ class QuicConnectionDriver(
                     )
                     continue
                 }
+                if (keepAliveDelta != null && keepAliveDelta < ptoMillis && (nextLossDelta == null || keepAliveDelta < nextLossDelta) &&
+                    nowMillis() - maxOf(connection.lastActivityMs, lastKeepAliveMs) >= keepAliveMs
+                ) {
+                    lastKeepAliveMs = nowMillis()
+                    connection.pendingPing = true
+                    continue
+                }
+                // The pacer's or the ACK timer woke us: just drain again.
+                val softDelta = minOf(pacingDelta ?: Long.MAX_VALUE, ackDelta ?: Long.MAX_VALUE)
+                if (softDelta < ptoMillis && (nextLossDelta == null || softDelta < nextLossDelta)) {
+                    continue
+                }
+                // The probe timer woke us: its work happens at the top of the loop.
+                if (probeDelta != null && probeDelta < ptoMillis && (nextLossDelta == null || probeDelta < nextLossDelta)) {
+                    connection.streamsLock.withLock { connection.checkPathProbeTimeoutLocked(nowMillis()) }
+                    continue
+                }
                 val pickedLossTimer = nextLossDelta != null && nextLossDelta < ptoMillis
                 if (pickedLossTimer) {
                     handleLossTimerFired(connection)
-                } else {
+                } else if (ptoArmed) {
                     handlePtoFired(connection)
                 }
             }
@@ -383,6 +563,7 @@ class QuicConnectionDriver(
         for (lostPacket in result.lost) {
             conn.onTokensLost(lostPacket.tokens)
         }
+        conn.onPacketsLostLocked(state, result.lost, nowMs)
         if (result.lost.isNotEmpty()) {
             conn.qlogObserver.onLossDetected(level, result.lost.map { it.packetNumber })
         }
@@ -441,9 +622,11 @@ class QuicConnectionDriver(
                     listOfNotNull(readJob, send).joinAll()
                 }
                 // Final teardown — cancel guarantees both jobs are done
-                // before we close the socket.
+                // before we close the sockets.
                 scope.cancel()
-                socket.close()
+                activeSocket.close()
+                probeSocket?.close()
+                retiredSockets.forEach { it.close() }
             }
         if (closeJob.compareAndSet(null, teardown)) {
             teardown.start()
@@ -531,6 +714,14 @@ internal suspend fun handlePtoFired(conn: QuicConnection) {
     // constant's natural reading: "after N consecutive PTOs with no
     // progress, trigger migration on the Nth PTO firing".
     conn.consecutivePtoCount = (conn.consecutivePtoCount + 1).coerceAtMost(6)
+    // The next period counts from now even if no probe can go out (an
+    // amplification limit), so the loop doesn't spin on an expired deadline.
+    conn.ptoReferenceMs = conn.nowMillis()
+    // Nothing in flight (the quiet after an ACK-only packet): one PING is
+    // enough, not the usual two probes.
+    val nothingInFlight = conn.initial.bytesInFlight == 0L && conn.handshake.bytesInFlight == 0L && conn.application.bytesInFlight == 0L
+    // Repeated PTOs after growing the packet size: suspect a PMTU black hole.
+    if (conn.consecutivePtoCount >= PMTU_BLACK_HOLE_PTO_COUNT) conn.pmtud.onBlackHoleSuspected(conn.nowMillis())
     conn.pendingPing = true
     requeueInflightForProbe(conn)
     // RFC 9002 §6.2.4: the spec allows up to 2 ack-eliciting packets
@@ -540,7 +731,7 @@ internal suspend fun handlePtoFired(conn: QuicConnection) {
     // a concurrent reader of the field doesn't see "budget set,
     // nothing requeued yet" — the requeue is what makes the budget
     // meaningful.
-    conn.pendingProbePackets = 2
+    conn.pendingProbePackets = if (nothingInFlight) 1 else 2
 }
 
 /**
@@ -584,7 +775,13 @@ internal suspend fun requeueInflightForProbe(conn: QuicConnection) {
     // requires streamsLock — `openBidiStream` and friends mutate it under
     // the same lock, so unlocked iteration races with stream creation.
     if (conn.application.sendProtection != null) {
+        // RFC 9002 §6.2.4: a probe carries data in flight. HANDSHAKE_DONE
+        // gates the client's handshake confirmation: until it arrives
+        // ngtcp2's client probes only with Handshake packets, which a
+        // server that has dropped its Handshake keys can't read, and never
+        // resends its request.
         conn.streamsLock.withLock {
+            if (conn.isServer && conn.handshakeConfirmed && !conn.handshakeDoneAcked) conn.pendingHandshakeDone = true
             conn.requeueAllInflightStreamData()
             conn.requeueAllInflightCrypto(EncryptionLevel.APPLICATION)
             // RFC 9000 §9 client-initiated path validation. After
@@ -642,3 +839,6 @@ internal suspend fun requeueInflightForProbe(conn: QuicConnection) {
  * flight is a no-op.
  */
 internal const val PATH_PROBE_PTO_THRESHOLD: Int = 2
+
+/** Consecutive PTOs after which full-size packets are presumed to vanish (RFC 8899 §4.3). */
+internal const val PMTU_BLACK_HOLE_PTO_COUNT: Int = 3

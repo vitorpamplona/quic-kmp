@@ -75,12 +75,12 @@ class QuicStream(
     /**
      * Bytes received and confirmed contiguous, exposed as a flow to the consumer.
      *
-     * Bounded buffer (64 chunks). The producer (parser) uses [trySend] and
-     * surfaces saturation by setting [overflowed]; the parser checks this flag
-     * after each delivery and tears the connection down with INTERNAL_ERROR
-     * rather than silently dropping bytes. Pre-audit-4 the failed `trySend`
-     * was discarded, leaving a hole in the stream that the application could
-     * never know about.
+     * Back-pressure is flow control: the channel itself is unbounded, and
+     * the stream's receive window only advances past [consumedBytes], so the
+     * peer can never get more than one window ahead of the application.
+     * (Before, a 64-chunk channel overflowed under a fast sender — anything
+     * past a few hundred KB in flight on loopback — and the connection was
+     * closed with INTERNAL_ERROR.)
      *
      * **Resilience to collector cancellation.** Pre-fix this exposed
      * [incomingChannel] via `consumeAsFlow()`, which cancels the
@@ -97,11 +97,8 @@ class QuicStream(
      * collector picks up at `channel.receive()` — i.e. from the
      * current head, not the start).
      *
-     * Producer back-pressure unchanged: the channel buffer is still
-     * 64 chunks, [trySend] still sets [overflowed] on saturation,
-     * and the parser still closes the connection if the application
-     * fails to drain. The looser contract just permits the previously-
-     * disallowed pattern of "stop reading temporarily, then resume".
+     * A reader that stops for a while just stops the peer's sending on
+     * this stream once the window is used up; it resumes when reading does.
      *
      * Concurrent collectors are still NOT supported — two simultaneous
      * collects would race the channel iterator and each chunk goes to
@@ -109,8 +106,41 @@ class QuicStream(
      * (one finishes / cancels, then another starts) are the new
      * supported pattern.
      */
-    private val incomingChannel = Channel<ByteArray>(capacity = 64)
-    val incoming: Flow<ByteArray> = flow { for (chunk in incomingChannel) emit(chunk) }
+    private val incomingChannel = Channel<ByteArray>(Channel.UNLIMITED)
+    val incoming: Flow<ByteArray> =
+        flow {
+            for (chunk in incomingChannel) {
+                onConsumed(chunk.size)
+                emit(chunk)
+            }
+        }
+
+    /**
+     * Bytes the application has taken from [incoming]. The receive window
+     * (MAX_STREAM_DATA, and MAX_DATA across streams) only moves past bytes
+     * consumed here, so a slow reader slows the peer down instead of
+     * queuing without bound: what sits in the channel is capped by the
+     * window the peer must stay inside (RFC 9000 §4.1).
+     */
+    @Volatile
+    internal var consumedBytes: Long = 0L
+        private set
+
+    /** Told when the application consumed bytes, so the connection can extend credit. */
+    internal var consumptionListener: (() -> Unit)? = null
+
+    /** Told when the application gave the writer something to send: data, a FIN, a reset or a STOP_SENDING. */
+    internal var sendListener: (() -> Unit)? = null
+        set(value) {
+            field = value
+            send.onQueued = value
+        }
+
+    private fun onConsumed(size: Int) {
+        consumedBytes += size
+        receiveDirtyForFlowControl = true
+        consumptionListener?.invoke()
+    }
 
     /**
      * True once a [deliverIncoming] call failed because the channel was
@@ -124,6 +154,12 @@ class QuicStream(
     /** Per-stream send credit (peer's MAX_STREAM_DATA value). */
     var sendCredit: Long = 0L
         internal set
+
+    /**
+     * The [sendCredit] value a STREAM_DATA_BLOCKED was last sent for, so the
+     * writer reports each limit once (RFC 9000 §4.1). -1 before any.
+     */
+    internal var blockedReportedAt: Long = -1L
 
     /** Per-stream receive credit (the value we advertised). */
     var receiveLimit: Long = 0L
@@ -181,6 +217,18 @@ class QuicStream(
     val isClosed: Boolean
         get() = send.finSent && receive.finReceived
 
+    /** Everything up to and including the FIN went out once and nothing lost waits to be resent. */
+    internal val sendDrained: Boolean
+        get() = send.finSent && !send.hasRetransmit
+
+    /**
+     * Whether the writer may still put STREAM frames for this stream on the
+     * wire: not once drained, and never after RESET_STREAM (RFC 9000 §3.3),
+     * whose final size later bytes would exceed.
+     */
+    internal val sendsStreamData: Boolean
+        get() = !sendDrained && resetState.load() == null
+
     /**
      * True once both directions are *fully* settled and the stream may be
      * removed from the connection's tracking lists (see
@@ -191,7 +239,9 @@ class QuicStream(
      * receive bytes (receive side).
      *
      * Lifetime contract:
-     *  - SEND side done: peer has ACK'd our FIN ([SendBuffer.finAcked]) OR
+     *  - SEND side done: peer has ACK'd our FIN and every byte before it
+     *    ([SendBuffer.fullyAcked]; a lost range can still be awaiting its
+     *    retransmit after the FIN is ACK'd) OR
      *    we ABORTed the stream and the peer ACK'd our RESET_STREAM
      *    ([resetAcked]). For [Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL]
      *    there is no send side, so this leg is trivially done.
@@ -225,19 +275,29 @@ class QuicStream(
 
                     Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE,
                     Direction.BIDIRECTIONAL,
-                    -> send.finAcked || resetAcked
+                    -> send.fullyAcked || resetAcked
                 }
             if (!sendSettled) return false
             val recvSettled =
                 when (direction) {
                     Direction.UNIDIRECTIONAL_LOCAL_TO_REMOTE -> true
 
+                    // Done once the application consumed it all (or the peer
+                    // reset it): until then its bytes still hold receive credit.
                     Direction.UNIDIRECTIONAL_REMOTE_TO_LOCAL,
                     Direction.BIDIRECTIONAL,
-                    -> receive.finReceived && receive.isFullyRead()
+                    -> peerResetReceived || receive.finReceived && receive.isFullyRead() && consumedBytes >= receive.contiguousEnd()
                 }
             return recvSettled
         }
+
+    /**
+     * The receive bytes this stream gives back as credit: what the
+     * application consumed, or the whole final size once the peer reset it
+     * (RFC 9000 §4.5 — those bytes will never be read).
+     */
+    internal val creditedReceiveBytes: Long
+        get() = if (peerResetReceived) maxOf(receiveHighestOffset, consumedBytes) else consumedBytes
 
     /**
      * Pushes [data] toward the consumer. Returns false if the bounded channel
@@ -311,6 +371,7 @@ class QuicStream(
             )
         if (resetState.compareAndSet(null, newState)) {
             resetEmitPending = true
+            sendListener?.invoke()
         }
     }
 
@@ -332,6 +393,7 @@ class QuicStream(
         // Same lock-free first-call-wins rationale as [resetStream].
         if (stopSendingState.compareAndSet(null, StopSendingState(errorCode = errorCode))) {
             stopSendingEmitPending = true
+            sendListener?.invoke()
         }
     }
 

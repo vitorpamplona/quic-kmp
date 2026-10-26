@@ -58,8 +58,10 @@ import kotlin.test.assertNotEquals
  *
  * The test pair below pins both halves of the contract:
  *
- *   - [pre_fix_no_consumer_overflows_and_tears_down_connection] — without
- *     a consumer the connection MUST close with the documented reason.
+ *   - [no_consumer_holds_back_credit_instead_of_closing] — without a
+ *     consumer the connection stays up; the stream's window just stops
+ *     moving, since credit follows consumed bytes. (It used to close with
+ *     INTERNAL_ERROR once a 64-chunk channel overflowed.)
  *   - [drainPeerInitiatedUniStreamsIntoBlackHole_keeps_connection_alive] —
  *     with [drainPeerInitiatedUniStreamsIntoBlackHole] running the
  *     connection MUST stay CONNECTED and absorb the same byte volume.
@@ -73,7 +75,7 @@ import kotlin.test.assertNotEquals
  */
 class PeerUniStreamDrainTest {
     @Test
-    fun pre_fix_no_consumer_overflows_and_tears_down_connection() {
+    fun no_consumer_holds_back_credit_instead_of_closing() {
         runBlocking {
             val client = buildClient()
             val pipe = buildPipe(client)
@@ -81,16 +83,8 @@ class PeerUniStreamDrainTest {
             pipe.drive(maxRounds = 16)
             assertEquals(QuicConnection.Status.CONNECTED, client.status)
 
-            // Push 65 chunks on a server-initiated uni stream — one more
-            // than the per-stream incomingChannel capacity (64). The
-            // first 64 land; the 65th overflows trySend, sets
-            // QuicStream.overflowed, and the parser maps that to
-            // markClosedExternally with the documented reason.
-            //
-            // Each chunk fits comfortably under the per-stream receive
-            // limit (initialMaxStreamDataUni = 1 MiB) so the prior
-            // receive-limit guard does NOT fire — this test is about
-            // the *channel* overflow specifically, not flow control.
+            // Push 65 chunks on a server-initiated uni stream nobody reads,
+            // well inside the per-stream receive limit.
             val streamId = StreamId.build(StreamId.Kind.SERVER_UNI, 0)
             var offset = 0L
             for (i in 0 until 65) {
@@ -102,13 +96,12 @@ class PeerUniStreamDrainTest {
                 feedDatagram(client, packet!!, nowMillis = 0L)
             }
 
-            // The 65th chunk must have torn the connection down.
-            assertEquals(
-                QuicConnection.Status.CLOSED,
-                client.status,
-                "without a peer-uni-stream consumer the audit-4 #3 escape " +
-                    "hatch must fire on the 65th chunk",
-            )
+            assertEquals(QuicConnection.Status.CONNECTED, client.status)
+            val stream = client.streamByIdLocked(streamId)!!
+            val limit = stream.receiveLimit
+            while (drainOutbound(client, nowMillis = 0L) != null) Unit
+            assertEquals(limit, stream.receiveLimit, "no credit for bytes nobody consumed")
+            assertEquals(0L, stream.consumedBytes)
         }
     }
 

@@ -34,7 +34,7 @@ package com.vitorpamplona.quic.connection.recovery
  *
  * Mirrors Firefox neqo's `StreamRecoveryToken` enum at
  * `neqo-transport/src/recovery/token.rs:21`. Scope (per
- * `quic/plans/2026-05-04-control-frame-retransmit.md`) is the
+ * `plans/2026-05-04-control-frame-retransmit.md`) is the
  * receive-side flow-control extensions that today silently wedge the
  * connection on packet loss against moq-rs:
  *
@@ -211,6 +211,14 @@ sealed class RecoveryToken {
      */
     data class RetireConnectionId(
         val sequenceNumber: Long,
+    ) : RecoveryToken()
+
+    /** `HANDSHAKE_DONE` a server sent (RFC 9000 §19.20); resent until acknowledged. */
+    data object HandshakeDone : RecoveryToken()
+
+    /** `NEW_TOKEN` a server sent (RFC 9000 §19.7); resent on loss. */
+    class NewToken(
+        val token: ByteArray,
     ) : RecoveryToken()
 
     /**

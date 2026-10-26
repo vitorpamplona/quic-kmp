@@ -30,10 +30,16 @@ import com.vitorpamplona.quic.http3.Http3Frame
 import com.vitorpamplona.quic.http3.Http3FrameReader
 import com.vitorpamplona.quic.http3.Http3StreamType
 import com.vitorpamplona.quic.http3.buildClientWebTransportSettings
+import com.vitorpamplona.quic.packet.QuicVersion
 import com.vitorpamplona.quic.qpack.QpackDecoder
+import com.vitorpamplona.quic.server.QuicServer
+import com.vitorpamplona.quic.server.QuicServerConfig
+import com.vitorpamplona.quic.tls.JcaCertificateSigner
 import com.vitorpamplona.quic.tls.JdkCertificateValidator
 import com.vitorpamplona.quic.tls.PinnedCertificateValidator
 import com.vitorpamplona.quic.tls.TlsResumptionState
+import com.vitorpamplona.quic.tls.TlsSessionTicketKeys
+import com.vitorpamplona.quic.transport.UdpServerSocket
 import com.vitorpamplona.quic.transport.UdpSocket
 import com.vitorpamplona.quic.webtransport.QuicWebTransportSessionState
 import com.vitorpamplona.quic.webtransport.buildExtendedConnectHeaders
@@ -156,4 +162,33 @@ suspend fun webTransport(
 
     session.close(errorCode = 0, reason = "bye")
     return QuicWebTransportSessionState(connection, driver, request.streamId)
+}
+
+suspend fun server(
+    scope: CoroutineScope,
+    certPem: String,
+    keyPem: String,
+) {
+    val server =
+        QuicServer(
+            QuicServerConfig(
+                signer = JcaCertificateSigner.fromPem(certPem, keyPem),
+                alpnSelector = { offered -> offered.firstOrNull { it.contentEquals("h3".encodeToByteArray()) } },
+                supportedVersions = listOf(QuicVersion.V1, QuicVersion.V2),
+                ticketKeys = TlsSessionTicketKeys(), // resumption; add maxEarlyDataSize = 0xffffffff for 0-RTT
+            ),
+            UdpServerSocket.bind(host = null, port = 443),
+            scope,
+        )
+    server.start()
+    while (true) {
+        val accepted = server.accept() ?: break
+        scope.launch {
+            accepted.connection.awaitHandshake()
+            while (true) {
+                val stream = accepted.connection.awaitIncomingPeerStream() ?: break
+                // read stream.incoming, answer on stream.send, then accepted.driver.wakeup()
+            }
+        }
+    }
 }

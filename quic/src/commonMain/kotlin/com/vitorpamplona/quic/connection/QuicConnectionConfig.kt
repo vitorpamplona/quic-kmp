@@ -51,7 +51,7 @@ data class QuicConnectionConfig(
      * lifetime stream-id allocation per connection.
      *
      * The true fix landed in
-     * `quic/plans/2026-05-04-control-frame-retransmit.md`:
+     * `plans/2026-05-04-control-frame-retransmit.md`:
      * RFC 9002 §6 loss detection + retransmit. With control-frame
      * retransmit working, a single dropped MAX_STREAMS_UNI is
      * recovered automatically — no need for the high-cap
@@ -66,4 +66,47 @@ data class QuicConnectionConfig(
     val maxDatagramFrameSize: Long = 1200L,
     val ackDelayExponent: Long = 3L,
     val maxAckDelay: Long = 25L,
+    /**
+     * RFC 9368 compatible version negotiation: the versions the first flight
+     * may be upgraded to, most preferred first. The first Initial always goes
+     * out in [QuicConnection.initialVersion]; listing
+     * [com.vitorpamplona.quic.packet.QuicVersion.V2] here lets a server that
+     * prefers QUIC v2 switch the connection to it without a round trip.
+     * Advertised in the `version_information` transport parameter.
+     */
+    val compatibleVersions: List<Int> = listOf(com.vitorpamplona.quic.packet.QuicVersion.V1),
+    /**
+     * RFC 9000 §9.6: once the handshake is confirmed, validate and move to the
+     * server's `preferred_address` when it sends one. Needs a
+     * [QuicConnectionDriver], which opens the socket toward the new address.
+     */
+    val migrateToPreferredAddress: Boolean = true,
+    /**
+     * Send a PING after this much quiet time, so NAT bindings and the idle
+     * timeout (RFC 9000 §10.1.2) don't end a connection the application
+     * wants to keep. 0 disables it. Pick something below both the idle
+     * timeout and typical NAT expiry (~30 s for UDP).
+     */
+    val keepAliveIntervalMillis: Long = 0L,
+    /**
+     * RFC 9000 §18.1: add one reserved transport parameter (id 31*N+27, random
+     * value) to exercise peers' handling of unknown parameters, as other
+     * stacks do to keep the extension point from ossifying.
+     */
+    val greaseTransportParameters: Boolean = true,
+    /**
+     * RFC 9000 §17.4 latency spin bit, which lets on-path observers measure
+     * RTT. Even when on, a random one in 16 connections leaves it off, as the
+     * RFC requires; off, it carries a random value per connection.
+     */
+    val spinBit: Boolean = true,
+    /**
+     * draft-ietf-quic-ack-frequency: advertise `min_ack_delay`, so the peer may
+     * tune how often we acknowledge (ACK_FREQUENCY) or ask for an ACK now
+     * (IMMEDIATE_ACK).
+     */
+    val ackFrequency: Boolean = true,
+    /** RFC 9002 / RFC 9438: how the congestion window grows and shrinks. */
+    val congestionControl: com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm =
+        com.vitorpamplona.quic.connection.recovery.CongestionAlgorithm.CUBIC,
 )

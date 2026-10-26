@@ -30,7 +30,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Step 4 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 4 of `plans/2026-05-04-control-frame-retransmit.md`:
  * the writer drains `QuicConnection.pendingMax*` fields ahead of the
  * normal threshold check, re-emitting a fresh frame + token for each
  * pending entry and clearing it.

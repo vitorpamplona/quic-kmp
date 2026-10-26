@@ -22,10 +22,35 @@ package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.crypto.curve25519.X25519
 import com.vitorpamplona.crypto.curve25519.X25519KeyPair
+import com.vitorpamplona.crypto.ec.P256
+import com.vitorpamplona.crypto.ec.P256KeyPair
 import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 import kotlin.time.Clock
+
+/**
+ * What the QUIC layer needs from either side of a TLS 1.3 handshake: CRYPTO
+ * bytes in and out per encryption level, and what was negotiated.
+ * Implemented by [TlsClient] and [TlsServer].
+ */
+interface TlsHandshake {
+    fun pushHandshakeBytes(
+        level: TlsClient.Level,
+        bytes: ByteArray,
+    )
+
+    fun pollOutbound(level: TlsClient.Level): ByteArray?
+
+    /** The negotiated application protocol, once known. */
+    val negotiatedAlpn: ByteArray?
+
+    /** The peer's encoded QUIC transport parameters, once received. */
+    val peerTransportParameters: ByteArray?
+
+    /** True when 0-RTT was accepted (by the server). */
+    val earlyDataAccepted: Boolean
+}
 
 /**
  * TLS 1.3 client driven by QUIC's encryption-level CRYPTO stream payloads.
@@ -48,6 +73,12 @@ import kotlin.time.Clock
  * validator parameter is non-null — passing `null` was a silent-MITM
  * hazard and was removed in round-4 of the audit. We also compute and
  * verify the server Finished MAC ourselves.
+ *
+ * The ClientHello carries an X25519 share and lists X25519 and secp256r1; a
+ * server that wants P-256 (or a cookie) answers with a HelloRetryRequest and
+ * gets a second ClientHello (RFC 8446 §4.1.4). The transcript and key
+ * schedule run on the negotiated suite's hash, SHA-384 for
+ * TLS_AES_256_GCM_SHA384.
  */
 class TlsClient(
     val serverName: String,
@@ -73,13 +104,14 @@ class TlsClient(
     val fixedRandom: ByteArray? = null,
     /**
      * Cipher suites offered in the ClientHello, in preference order. The
-     * default offers AES-128-GCM first then ChaCha20-Poly1305. Override to
+     * default offers AES-128-GCM, AES-256-GCM, then ChaCha20-Poly1305. Override to
      * force a specific negotiation (e.g. `chacha20`-only for the matching
      * quic-interop-runner testcase).
      */
     val cipherSuites: IntArray =
         intArrayOf(
             TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
     /**
@@ -108,7 +140,7 @@ class TlsClient(
      * suite this client offers.
      */
     val resumption: TlsResumptionState? = null,
-) {
+) : TlsHandshake {
     enum class State {
         INITIAL,
         WAITING_SERVER_HELLO,
@@ -125,10 +157,10 @@ class TlsClient(
     var state: State = State.INITIAL
         private set
 
-    var negotiatedAlpn: ByteArray? = null
+    override var negotiatedAlpn: ByteArray? = null
         private set
 
-    var peerTransportParameters: ByteArray? = null
+    override var peerTransportParameters: ByteArray? = null
         private set
 
     /** The handshake message bytes we still owe to the QUIC layer, per encryption level. */
@@ -154,9 +186,27 @@ class TlsClient(
     private val keySchedule = TlsKeySchedule(transcript)
 
     private var keyPair: X25519KeyPair? = null
+
+    /** Our P-256 key, generated when a HelloRetryRequest asks for that group. */
+    private var p256KeyPair: P256KeyPair? = null
+
+    /** The group of the key share in our latest ClientHello. */
+    private var keyShareGroup: Int = TlsConstants.GROUP_X25519
     private var serverKeyShare: ByteArray? = null
     private var sharedSecret: ByteArray? = null
     private var negotiatedCipherSuite: Int = -1
+
+    /** The hash of the ticket we offer, which the PSK binder and early secret run on. */
+    private val pskHash: TlsHash? = resumption?.let { TlsHash.forCipherSuite(it.cipherSuite) }
+
+    /** Whether our latest ClientHello offers the ticket: dropped after a retry to a suite of another hash. */
+    private var offeringPsk: Boolean = resumption != null
+
+    /** The cipher suite of the HelloRetryRequest we answered, if any; the ServerHello must repeat it. */
+    private var retryCipherSuite: Int = -1
+
+    /** Whether our latest ClientHello offered early data (a second one, after a retry, never does). */
+    private var offeredEarlyData: Boolean = false
 
     /**
      * True after ServerHello carries a `pre_shared_key` extension with the
@@ -181,7 +231,7 @@ class TlsClient(
      * Only meaningful on resumption + 0-RTT connections; non-0-RTT
      * connections leave it at false and never check it.
      */
-    var earlyDataAccepted: Boolean = false
+    override var earlyDataAccepted: Boolean = false
         private set
 
     /** The 32-byte ClientHello random, available after [start]. Exposed so
@@ -194,6 +244,7 @@ class TlsClient(
     fun start() {
         check(state == State.INITIAL) { "TlsClient already started" }
         keyPair = fixedKeyPair ?: X25519.generateKeyPair()
+        keySchedule.hash = pskHash ?: TlsHash.SHA256
 
         // Seed the early secret. Resumption path uses the cached PSK as
         // IKM (RFC 8446 §7.1) so the binder for the pre_shared_key
@@ -210,57 +261,13 @@ class TlsClient(
                 .bytes(32)
         clientRandom = random
 
+        offeredEarlyData = resumption != null && resumption.maxEarlyDataSize > 0
         val chBytes =
-            if (resumption != null) {
-                // Resumption ClientHello carries pre_shared_key (last
-                // extension per spec) with binder bound to the partial CH
-                // hash. obfuscated_ticket_age = (current_age + ticket_age_add)
-                // mod 2^32. We use the local clock — server's de-obfuscation
-                // only cares about its own tracked age window.
-                val ageMillis = (nowMillisSource() - resumption.issuedAtMillis).coerceAtLeast(0L)
-                val obfuscatedAge = (ageMillis + resumption.ticketAgeAdd) and 0xFFFFFFFFL
-                val binderFinishedKey = pskBinderFinishedKey(keySchedule.earlySecret!!)
-                buildResumptionClientHelloBytes(
-                    serverName = serverName,
-                    x25519PublicKey = keyPair!!.publicKey,
-                    quicTransportParams = transportParameters,
-                    alpns = offeredAlpns,
-                    random = random,
-                    cipherSuites = cipherSuites,
-                    ticket = resumption.ticket,
-                    obfuscatedTicketAge = obfuscatedAge,
-                    binderFinishedKey = binderFinishedKey,
-                    includeEarlyData = resumption.maxEarlyDataSize > 0,
-                    transcriptHashOfPartialCh = { partial ->
-                        // Hash a one-shot copy of the running transcript
-                        // would-be-state: an empty TlsRunningSha256 fed
-                        // partial-CH-bytes is identical to running the
-                        // shared transcript "as if" we'd appended
-                        // partial-CH and snapshotted.
-                        val h = TlsRunningSha256()
-                        h.update(partial)
-                        h.snapshot()
-                    },
-                    binderHmac = { key, data ->
-                        val mac =
-                            com.vitorpamplona.crypto.mac
-                                .MacInstance("HmacSHA256", key)
-                        mac.update(data)
-                        mac.doFinal()
-                    },
-                )
-            } else {
-                val ch =
-                    buildQuicClientHello(
-                        serverName = serverName,
-                        x25519PublicKey = keyPair!!.publicKey,
-                        quicTransportParams = transportParameters,
-                        alpns = offeredAlpns,
-                        random = random,
-                        cipherSuites = cipherSuites,
-                    )
-                ch.encode()
-            }
+            buildClientHello(
+                publicKey = keyPair!!.publicKey,
+                cookie = null,
+                earlyData = offeredEarlyData,
+            )
 
         transcript.append(chBytes)
         outboundQueues[Level.INITIAL]!!.addLast(chBytes)
@@ -271,7 +278,7 @@ class TlsClient(
         // packet protection. The server applies the same derivation
         // on its side when it processes our PSK-bound ClientHello.
         if (resumption != null && resumption.maxEarlyDataSize > 0) {
-            keySchedule.deriveEarlyTraffic(transcript.snapshot())
+            keySchedule.deriveEarlyTraffic(transcript.peek(pskHash!!))
             secretsListener.onEarlyDataKeysReady(
                 cipherSuite = resumption.cipherSuite,
                 clientEarlySecret = keySchedule.clientEarlyTrafficSecret!!,
@@ -281,11 +288,141 @@ class TlsClient(
         state = State.WAITING_SERVER_HELLO
     }
 
+    /**
+     * Our ClientHello with a [keyShareGroup] share of [publicKey]. When
+     * [offeringPsk], the ticket goes last with its binder, which covers the
+     * transcript so far (message_hash and the HelloRetryRequest on a second
+     * ClientHello) and the ClientHello up to the binders list (RFC 8446 §4.2.11.2).
+     */
+    private fun buildClientHello(
+        publicKey: ByteArray,
+        cookie: ByteArray?,
+        earlyData: Boolean,
+    ): ByteArray {
+        val psk = resumption?.takeIf { offeringPsk }
+        val binderFinishedKey = psk?.let { pskBinderFinishedKey(keySchedule.earlySecret!!) }
+        val pskPlaceholder =
+            if (psk != null) {
+                // obfuscated_ticket_age = (current_age + ticket_age_add) mod 2^32.
+                // We use the local clock — server's de-obfuscation only cares
+                // about its own tracked age window.
+                val ageMillis = (nowMillisSource() - psk.issuedAtMillis).coerceAtLeast(0L)
+                val obfuscatedAge = (ageMillis + psk.ticketAgeAdd) and 0xFFFFFFFFL
+                encodePreSharedKeyPlaceholder(psk.ticket, obfuscatedAge, binderFinishedKey!!.size)
+            } else {
+                null
+            }
+        val ch =
+            TlsClientHello(
+                random = clientRandom!!,
+                cipherSuites = cipherSuites,
+                extensions =
+                    clientHelloExtensions(
+                        serverName = serverName,
+                        keyShareGroup = keyShareGroup,
+                        keySharePublic = publicKey,
+                        quicTransportParams = transportParameters,
+                        alpns = offeredAlpns,
+                        cookie = cookie,
+                        includeEarlyData = earlyData,
+                        pskPlaceholder = pskPlaceholder,
+                    ),
+            )
+        if (binderFinishedKey == null) return ch.encode()
+        val hash = pskHash!!
+        return encodeWithPskBinder(
+            ch,
+            binderFinishedKey,
+            transcriptHashOfPartialCh = { partial -> transcript.peek(hash, partial) },
+            binderHmac = { key, data -> hash.hmac(key, data) },
+        )
+    }
+
+    /**
+     * RFC 8446 §4.1.4: the server wants a share for another group, or a
+     * cookie echoed. The transcript restarts as message_hash(ClientHello1)
+     * plus the retry, under the retry's suite hash, and a second ClientHello
+     * follows on the Initial CRYPTO stream without early data.
+     */
+    private fun handleHelloRetryRequest(
+        sh: TlsServerHello,
+        msg: ByteArray,
+    ) {
+        if (retryCipherSuite != -1) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_UNEXPECTED_MESSAGE, "second HelloRetryRequest")
+        }
+        if (sh.negotiatedVersion != TlsConstants.VERSION_TLS_1_3) {
+            throw com.vitorpamplona.quic.TlsAlertException(
+                TlsConstants.ALERT_PROTOCOL_VERSION,
+                "HelloRetryRequest for version 0x${sh.negotiatedVersion.toString(16)}",
+            )
+        }
+        val suite = sh.cipherSuite
+        if (suite !in cipherSuites || suite !in SUPPORTED_CIPHER_SUITES) {
+            throw com.vitorpamplona.quic.TlsAlertException(
+                TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                "HelloRetryRequest picked cipher 0x${suite.toString(16)} we did not offer",
+            )
+        }
+        // RFC 8446 §4.1.4: only supported_versions, key_share and cookie belong in a retry.
+        sh.extensions.firstOrNull { it.type !in HELLO_RETRY_REQUEST_EXTENSIONS }?.let {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_UNSUPPORTED_EXTENSION, "HelloRetryRequest carries extension ${it.type}")
+        }
+        val groupExt = sh.extensions.firstOrNull { it.type == TlsConstants.EXT_KEY_SHARE }
+        if (groupExt != null && groupExt.data.size != 2) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_DECODE_ERROR, "HelloRetryRequest key_share of ${groupExt.data.size} bytes")
+        }
+        val group = groupExt?.let { QuicReader(it.data).readUint16() }
+        val cookie = sh.extensions.firstOrNull { it.type == TlsConstants.EXT_COOKIE }?.data
+        // opaque cookie<1..2^16-1>: its length, then at least one byte.
+        if (cookie != null && (cookie.size < 3 || QuicReader(cookie).readUint16() != cookie.size - 2)) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_DECODE_ERROR, "malformed HelloRetryRequest cookie")
+        }
+        if (group != null && (group !in CLIENT_SUPPORTED_GROUPS || group == keyShareGroup)) {
+            throw com.vitorpamplona.quic.TlsAlertException(
+                TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                "HelloRetryRequest asks for group 0x${group.toString(16)}",
+            )
+        }
+        if (group == null && cookie == null) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "HelloRetryRequest would not change the ClientHello")
+        }
+        retryCipherSuite = suite
+        val hash = TlsHash.forCipherSuite(suite)
+        transcript.replaceWithMessageHash(hash)
+        transcript.append(msg)
+        // RFC 8446 §4.1.4: a ticket whose hash doesn't match the retry's suite is dropped.
+        if (offeringPsk && pskHash !== hash) {
+            offeringPsk = false
+            keySchedule.hash = hash
+            keySchedule.deriveEarly()
+        }
+        val publicKey =
+            when (group) {
+                TlsConstants.GROUP_SECP256R1 -> {
+                    keyShareGroup = group
+                    P256.generateKeyPair().also { p256KeyPair = it }.publicKey
+                }
+
+                else -> {
+                    keyPair!!.publicKey
+                }
+            }
+        // RFC 8446 §4.2.10: no early data after a retry; whatever 0-RTT went out is lost.
+        if (offeredEarlyData) {
+            offeredEarlyData = false
+            secretsListener.onEarlyDataRejected()
+        }
+        val ch2 = buildClientHello(publicKey, cookie, earlyData = false)
+        transcript.append(ch2)
+        outboundQueues[Level.INITIAL]!!.addLast(ch2)
+    }
+
     /** Pull buffered outbound handshake bytes for [level], or null if nothing pending. */
-    fun pollOutbound(level: Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
+    override fun pollOutbound(level: Level): ByteArray? = outboundQueues[level]?.removeFirstOrNull()
 
     /** Feed inbound CRYPTO-frame bytes at [level]. */
-    fun pushHandshakeBytes(
+    override fun pushHandshakeBytes(
         level: Level,
         bytes: ByteArray,
     ) {
@@ -334,16 +471,10 @@ class TlsClient(
                 if (level != Level.INITIAL) throw QuicCodecException("ServerHello must arrive at Initial level")
                 val sh = TlsServerHello.decodeBody(bodyReader)
                 // RFC 8446 §4.1.4: HelloRetryRequest is encoded as a ServerHello
-                // with a fixed magic random. We don't implement HRR (we only
-                // offer X25519, the only group nests + most servers accept), so
-                // any HRR is a hard failure.
+                // with a fixed magic random.
                 if (sh.random.contentEquals(HELLO_RETRY_REQUEST_RANDOM)) {
-                    // RFC 8446 §4.1.4 — HRR follows the standard handshake
-                    // failure path on our side.
-                    throw com.vitorpamplona.quic.TlsAlertException(
-                        alertCode = TlsConstants.ALERT_HANDSHAKE_FAILURE,
-                        message = "HelloRetryRequest received but not supported (we offer X25519 only)",
-                    )
+                    handleHelloRetryRequest(sh, msg)
+                    return
                 }
                 if (sh.negotiatedVersion != TlsConstants.VERSION_TLS_1_3) {
                     // RFC 8446 §6.2 — wrong version is `protocol_version = 70`.
@@ -353,9 +484,7 @@ class TlsClient(
                     )
                 }
                 val cipher = sh.cipherSuite
-                if (cipher != TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256 &&
-                    cipher != TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256
-                ) {
+                if (cipher !in cipherSuites || cipher !in SUPPORTED_CIPHER_SUITES || (retryCipherSuite != -1 && cipher != retryCipherSuite)) {
                     // RFC 8446 §6.2 — server picked something we didn't offer
                     // → `illegal_parameter = 47`.
                     throw com.vitorpamplona.quic.TlsAlertException(
@@ -363,15 +492,23 @@ class TlsClient(
                         message = "server picked unsupported cipher 0x${cipher.toString(16)}",
                     )
                 }
+                if (sh.keyShareGroup != keyShareGroup) {
+                    throw com.vitorpamplona.quic.TlsAlertException(
+                        alertCode = TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                        message = "server key share for group 0x${sh.keyShareGroup.toString(16)}, we sent 0x${keyShareGroup.toString(16)}",
+                    )
+                }
                 negotiatedCipherSuite = cipher
-                serverKeyShare = sh.serverKeyShareX25519
+                serverKeyShare = sh.keyShareKey
+                val hash = TlsHash.forCipherSuite(cipher)
+                transcript.select(hash)
 
                 // RFC 8446 §4.2.11 — server signals PSK acceptance with a
                 // pre_shared_key extension carrying selected_identity (uint16).
                 // We only ever offer one identity, so anything other than 0
                 // is a protocol violation.
                 val pskExt = sh.extensions.firstOrNull { it.type == TlsConstants.EXT_PRE_SHARED_KEY }
-                if (resumption != null) {
+                if (offeringPsk) {
                     if (pskExt == null) {
                         // We offered PSK but the server picked full-
                         // handshake. RFC 8446 §4.2.11 lets the server
@@ -405,25 +542,50 @@ class TlsClient(
                         // application-level retry layer is responsible
                         // for replaying any 0-RTT-bound payload over
                         // 1-RTT. The handshake itself proceeds cleanly.
+                        keySchedule.hash = hash
                         keySchedule.deriveEarly()
                         pskAccepted = false
                     } else {
                         val r = QuicReader(pskExt.data)
                         val selectedIdentity = r.readUint16()
                         if (selectedIdentity != 0) {
-                            throw QuicCodecException(
-                                "server selected PSK identity $selectedIdentity but we only offered 0",
+                            throw com.vitorpamplona.quic.TlsAlertException(
+                                alertCode = TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                                message = "server selected PSK identity $selectedIdentity but we only offered 0",
+                            )
+                        }
+                        // RFC 8446 §4.2.11: the suite must hash like the ticket's.
+                        if (hash !== pskHash) {
+                            throw com.vitorpamplona.quic.TlsAlertException(
+                                alertCode = TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                                message = "server resumed a $pskHash ticket with a $hash cipher suite",
                             )
                         }
                         pskAccepted = true
                     }
                 } else if (pskExt != null) {
-                    throw QuicCodecException("server picked PSK we never offered")
+                    throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "server picked a PSK we did not offer")
+                } else {
+                    // No ticket on offer: the early secret starts over under the suite's hash.
+                    keySchedule.hash = hash
+                    keySchedule.deriveEarly()
                 }
                 transcript.append(msg)
 
-                val privKey = keyPair!!.privateKey
-                val shared = X25519.dh(privKey, serverKeyShare!!)
+                val shared =
+                    try {
+                        if (keyShareGroup == TlsConstants.GROUP_SECP256R1) {
+                            P256.dh(p256KeyPair!!.privateKey, serverKeyShare!!)
+                        } else {
+                            X25519.dh(keyPair!!.privateKey, serverKeyShare!!)
+                        }
+                    } catch (e: IllegalArgumentException) {
+                        throw com.vitorpamplona.quic.TlsAlertException(
+                            alertCode = TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                            message = "bad server key share: ${e.message}",
+                            cause = e,
+                        )
+                    }
                 sharedSecret = shared
                 keySchedule.deriveHandshake(shared)
                 keySchedule.deriveHandshakeTraffic()
@@ -461,7 +623,15 @@ class TlsClient(
                 // ignored / dropped any app data we already sent under
                 // early-data keys, and the QUIC layer must re-queue it
                 // for 1-RTT replay.
-                earlyDataAccepted = ee.extensions.any { it.type == TlsConstants.EXT_EARLY_DATA }
+                val eeEarlyData = ee.extensions.any { it.type == TlsConstants.EXT_EARLY_DATA }
+                // RFC 8446 §4.2: an extension we didn't send is unsupported_extension.
+                if (eeEarlyData && !offeredEarlyData) {
+                    throw com.vitorpamplona.quic.TlsAlertException(
+                        alertCode = TlsConstants.ALERT_UNSUPPORTED_EXTENSION,
+                        message = "server accepted early data we did not offer",
+                    )
+                }
+                earlyDataAccepted = eeEarlyData
                 transcript.append(msg)
                 state = State.WAITING_CERTIFICATE_OR_FINISHED
             }
@@ -703,6 +873,12 @@ interface TlsSecretsListener {
     ) = Unit
 
     /**
+     * Client: a HelloRetryRequest came, so the server will discard any 0-RTT
+     * (RFC 8446 §4.2.10); stop sending it. Default no-op.
+     */
+    fun onEarlyDataRejected() = Unit
+
+    /**
      * Server issued a NewSessionTicket. The TLS layer hands off a
      * ready-to-use [TlsResumptionState] capturing everything the next
      * connection needs for PSK-based resumption: the opaque ticket, the
@@ -884,8 +1060,20 @@ internal class ByteArrayBuilder {
     }
 }
 
+/** The extensions a HelloRetryRequest may carry (RFC 8446 §4.1.4). */
+private val HELLO_RETRY_REQUEST_EXTENSIONS: Set<Int> =
+    setOf(TlsConstants.EXT_SUPPORTED_VERSIONS, TlsConstants.EXT_KEY_SHARE, TlsConstants.EXT_COOKIE)
+
+/** The cipher suites this stack implements. */
+internal val SUPPORTED_CIPHER_SUITES: Set<Int> =
+    setOf(
+        TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+        TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
+        TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
+    )
+
 /** RFC 8446 §4.1.4 — HelloRetryRequest is a ServerHello whose Random equals SHA-256("HelloRetryRequest"). */
-private val HELLO_RETRY_REQUEST_RANDOM: ByteArray =
+internal val HELLO_RETRY_REQUEST_RANDOM: ByteArray =
     byteArrayOf(
         0xCF.toByte(),
         0x21.toByte(),

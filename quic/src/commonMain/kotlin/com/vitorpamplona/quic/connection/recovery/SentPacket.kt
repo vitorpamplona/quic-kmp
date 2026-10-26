@@ -73,4 +73,9 @@ data class SentPacket(
      * nothing retransmittable (e.g. ACK-only). Otherwise non-empty.
      */
     val tokens: List<RecoveryToken>,
+    /**
+     * Non-zero for a PMTU probe (RFC 8899): the datagram size it tests. Its
+     * loss lowers the search ceiling instead of signalling congestion.
+     */
+    val mtuProbeSize: Int = 0,
 )

@@ -28,7 +28,7 @@ import kotlin.test.assertNotEquals
  * Type-level invariants for [RecoveryToken]: equality + hashCode
  * correctness across data-class variants and the typed-token shape
  * required by the dispatcher in step 6 of
- * `quic/plans/2026-05-04-control-frame-retransmit.md`.
+ * `plans/2026-05-04-control-frame-retransmit.md`.
  *
  * No connection state is exercised here — these are unit tests on
  * the type itself.
@@ -137,6 +137,8 @@ class RecoveryTokenTest {
                     is RecoveryToken.NewConnectionId -> "ncid:${it.sequenceNumber}"
                     is RecoveryToken.PathChallenge -> "pc"
                     is RecoveryToken.RetireConnectionId -> "rcid:${it.sequenceNumber}"
+                    RecoveryToken.HandshakeDone -> "hd"
+                    is RecoveryToken.NewToken -> "nt"
                 }
             }
         assertEquals(

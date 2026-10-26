@@ -120,6 +120,15 @@ fun encodeSupportedVersionsExtensionClient(): ByteArray {
     return w.toByteArray()
 }
 
+/** Build the `supported_groups` extension with [groups], most preferred first. */
+fun encodeSupportedGroups(groups: List<Int>): ByteArray {
+    val w = QuicWriter()
+    w.withUint16Length {
+        for (g in groups) writeUint16(g)
+    }
+    return w.toByteArray()
+}
+
 /** Build the `supported_groups` extension with just X25519 listed. */
 fun encodeSupportedGroupsX25519(): ByteArray {
     val w = QuicWriter()
@@ -144,6 +153,19 @@ fun encodeSignatureAlgorithms(): ByteArray {
         writeUint16(TlsConstants.SIG_RSA_PSS_RSAE_SHA512)
         writeUint16(TlsConstants.SIG_ED25519)
         writeUint16(TlsConstants.SIG_ECDSA_SECP384R1_SHA384)
+    }
+    return w.toByteArray()
+}
+
+/** Build a single-key-share `key_share` extension carrying [publicKey] for [group]. */
+fun encodeKeyShareClient(
+    group: Int,
+    publicKey: ByteArray,
+): ByteArray {
+    val w = QuicWriter()
+    w.withUint16Length {
+        writeUint16(group)
+        writeTlsOpaque2(publicKey)
     }
     return w.toByteArray()
 }
@@ -194,6 +216,13 @@ fun encodeAlpn(protocols: List<ByteArray>): ByteArray {
 fun encodePreSharedKeyPlaceholder(
     ticket: ByteArray,
     obfuscatedTicketAge: Long,
+): ByteArray = encodePreSharedKeyPlaceholder(ticket, obfuscatedTicketAge, BINDER_BYTES)
+
+/** [encodePreSharedKeyPlaceholder] with a [binderLength]-byte binder: the PSK's Hash.length. */
+internal fun encodePreSharedKeyPlaceholder(
+    ticket: ByteArray,
+    obfuscatedTicketAge: Long,
+    binderLength: Int,
 ): ByteArray {
     val w = QuicWriter()
     w.withUint16Length {
@@ -202,8 +231,8 @@ fun encodePreSharedKeyPlaceholder(
         writeUint32(obfuscatedTicketAge.toInt())
     }
     w.withUint16Length {
-        // binders list — one PskBinderEntry of 32 zero bytes
-        writeTlsOpaque1(ByteArray(BINDER_BYTES))
+        // binders list — one PskBinderEntry of zero bytes
+        writeTlsOpaque1(ByteArray(binderLength))
     }
     return w.toByteArray()
 }
@@ -222,7 +251,7 @@ fun encodePreSharedKeyPlaceholder(
  */
 fun encodeEarlyDataEmpty(): ByteArray = ByteArray(0)
 
-/** RFC 8446 §4.2.11.2 — SHA-256 binder size for our cipher suites. */
+/** RFC 8446 §4.2.11.2 — the binder size of a SHA-256 PSK (a SHA-384 one's is 48). */
 const val BINDER_BYTES: Int = 32
 
 /**
