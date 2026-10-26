@@ -364,10 +364,11 @@ the runner is not safe to run concurrently. On a host whose kernel has no IPv6 (
 CI VMs), `quic/interop/no-ipv6/patch-runner.sh` adapts the runner checkout; the `ipv6` testcase
 and IPv6 preferred addresses can't pass there.
 
-Results from 2026-10-25, in such a sandbox, against every implementation in the runner, both as
+Results from 2026-10-26, in such a sandbox, against every implementation in the runner, both as
 client and as server: apart from `ipv6`, every testcase both sides support passes, except where
-the other implementation or the sandbox is at fault. The tables, and the reason for each failure,
-are in [`quic/plans/2026-10-25-feature-parity.md`](quic/plans/2026-10-25-feature-parity.md).
+the other implementation or the sandbox is at fault (a few loss and corruption tests fail now and
+then when a run loses every copy of a packet). The tables, and the reason for each failure, are
+in [`quic/plans/2026-10-25-feature-parity.md`](quic/plans/2026-10-25-feature-parity.md).
 
 Design notes behind the stack and the interop work live in `quic/plans/` and `quic/interop/plans/`.
 

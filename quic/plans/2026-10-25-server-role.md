@@ -91,7 +91,7 @@ DCID.
 
 ## Out of scope
 
-- Groups other than X25519. A ClientHello that offers X25519 without a share for it gets a
-  HelloRetryRequest (picoquic sends only P-256); one that doesn't offer X25519 is refused.
+- Groups other than X25519 and P-256. A ClientHello whose only share is for another group gets a
+  HelloRetryRequest for one of ours; one that lists neither is refused.
 - Client certificates.
 - Multiple listening sockets / SO_REUSEPORT load balancing.
