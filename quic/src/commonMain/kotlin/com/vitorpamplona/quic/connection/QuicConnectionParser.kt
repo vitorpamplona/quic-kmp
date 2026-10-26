@@ -104,6 +104,7 @@ fun feedDatagram(
 ) {
     try {
         feedDatagramInner(conn, datagram, nowMillis, path)
+        if (conn.isServer && conn.handshakeComplete && conn.earlyShortHeaderPackets.isNotEmpty()) feedEarlyShortHeaderPackets(conn, nowMillis)
     } catch (e: com.vitorpamplona.quic.QuicProtocolViolationException) {
         // RFC 9000 §17.2 / §17.3.1: peer set reserved bits in the
         // header after HP unmask (or a similar invariant violation
@@ -456,6 +457,25 @@ private fun feedLongHeaderPacket(
     return parsed.consumed
 }
 
+/** Server: the 1-RTT packets kept while the handshake was completing, read now that it has. */
+private fun feedEarlyShortHeaderPackets(
+    conn: QuicConnection,
+    nowMillis: Long,
+) {
+    val packets = conn.earlyShortHeaderPackets.toList()
+    conn.earlyShortHeaderPackets.clear()
+    val current = conn.datagramPath
+    for (p in packets) {
+        if (conn.status == QuicConnection.Status.DRAINING || conn.status == QuicConnection.Status.CLOSED) break
+        conn.datagramPath = p.serverPath
+        feedShortHeaderPacket(conn, p.bytes, 0, nowMillis, p.path)
+    }
+    conn.datagramPath = current
+}
+
+/** How many 1-RTT packets a server keeps while its handshake completes. */
+private const val MAX_EARLY_SHORT_HEADER_PACKETS = 8
+
 private fun feedShortHeaderPacket(
     conn: QuicConnection,
     datagram: ByteArray,
@@ -467,7 +487,11 @@ private fun feedShortHeaderPacket(
     // handshake completes. Once it has, 0-RTT keys can go (§4.9.3).
     if (conn.isServer) {
         if (!conn.handshakeComplete) {
-            conn.qlogObserver.onPacketDropped("1-RTT before the handshake completed", datagram.size - offset)
+            if (conn.earlyShortHeaderPackets.size < MAX_EARLY_SHORT_HEADER_PACKETS) {
+                conn.earlyShortHeaderPackets += QuicConnection.EarlyShortHeaderPacket(datagram.copyOfRange(offset, datagram.size), path, conn.datagramPath)
+            } else {
+                conn.qlogObserver.onPacketDropped("1-RTT before the handshake completed", datagram.size - offset)
+            }
             return
         }
         conn.zeroRttReceiveProtection = null

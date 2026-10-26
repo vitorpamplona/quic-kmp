@@ -241,6 +241,20 @@ class QuicConnection internal constructor(
     /** Server: the path of the datagram being parsed; the endpoint's socket sets it. */
     internal var datagramPath: ServerPath? = null
 
+    /**
+     * Server: 1-RTT packets that came before the handshake completed, kept
+     * (RFC 9001 §5.7 allows it) and read once it has. A client sends its
+     * request right after its Finished; with the Finished lost, dropping the
+     * request left lsquic's client waiting out its own retransmit timer.
+     */
+    internal val earlyShortHeaderPackets = ArrayList<EarlyShortHeaderPacket>()
+
+    internal class EarlyShortHeaderPacket(
+        val bytes: ByteArray,
+        val path: NetworkPath,
+        val serverPath: ServerPath?,
+    )
+
     /** Server: the client moved; we're validating its new path (RFC 9000 §9.3). */
     internal class PeerMigration(
         val path: ServerPath,

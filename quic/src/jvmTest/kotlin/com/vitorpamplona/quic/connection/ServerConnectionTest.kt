@@ -308,4 +308,32 @@ class ServerConnectionTest {
         assertTrue(client.handshakeConfirmed, "the resent flight completed the handshake")
         assertTrue(server.handshakeConfirmed)
     }
+
+    @Test
+    fun `a request that arrives before the client's Finished is read once the Finished does`() =
+        runBlocking {
+            // lsquic in handshakeloss: its Finished was lost, the request it sent
+            // right after was dropped, and its own retransmit came too late.
+            val client = client()
+            client.start()
+            val server = serverFor(client)
+            while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+            while (true) feedDatagram(client, drainOutbound(server, now) ?: break, now)
+            val finishedFlight = mutableListOf<ByteArray>()
+            while (true) finishedFlight += drainOutbound(client, now) ?: break
+            assertNotNull(client.application.sendProtection, "the client has 1-RTT keys")
+
+            val request = client.openBidiStream()
+            request.send.enqueue("GET /index.html\r\n".encodeToByteArray())
+            request.send.finish()
+            while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+            assertTrue(!server.handshakeComplete, "the server still waits for the Finished")
+            assertNull(server.pollIncomingPeerStream())
+
+            for (d in finishedFlight) feedDatagram(server, d, now)
+            assertTrue(server.handshakeComplete)
+            val accepted = assertNotNull(server.pollIncomingPeerStream(), "the kept request was read")
+            val body = withTimeout(2_000) { accepted.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
+            assertEquals("GET /index.html\r\n", body.decodeToString())
+        }
 }
