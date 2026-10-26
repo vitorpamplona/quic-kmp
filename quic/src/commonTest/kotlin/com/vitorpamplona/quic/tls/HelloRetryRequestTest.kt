@@ -20,6 +20,7 @@
  */
 package com.vitorpamplona.quic.tls
 
+import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 import com.vitorpamplona.quic.TlsAlertException
 import kotlin.test.Test
@@ -27,18 +28,14 @@ import kotlin.test.assertFailsWith
 
 /**
  * RFC 8446 §4.1.4 — HelloRetryRequest is a ServerHello whose `random` equals
- * the SHA-256 of the ASCII string "HelloRetryRequest". We don't implement
- * HRR (we offer X25519 only, the group every modern QUIC server accepts).
- * Before the round-3 fix, an HRR was treated as a regular ServerHello, then
- * X25519 was performed against the cookie/extension bytes (garbage), then
- * AEAD failed downstream with a confusing error. The current code rejects
- * cleanly with a [TlsAlertException] carrying RFC 8446 §6.2
- * `handshake_failure = 40` (mapped by the QUIC layer to error code
- * `0x100 + 40 = 0x128` per RFC 9001 §4.8).
+ * the SHA-256 of the ASCII string "HelloRetryRequest". Our ClientHello
+ * carries an X25519 share and lists X25519 and P-256; a server may ask for a
+ * P-256 share or a cookie, and gets a second ClientHello. A retry that
+ * changes nothing, or a second one, is refused (mapped by the QUIC layer to
+ * CRYPTO_ERROR `0x100 + alert` per RFC 9001 §4.8).
  */
 class HelloRetryRequestTest {
-    @Test
-    fun hello_retry_request_is_rejected_cleanly() {
+    private fun startedClient(): Pair<TlsClient, ByteArray> {
         val tls =
             TlsClient(
                 serverName = "example.test",
@@ -47,22 +44,57 @@ class HelloRetryRequestTest {
                 certificateValidator = PermissiveCertificateValidator(),
             )
         tls.start()
-        // Drain (and discard) ClientHello.
-        tls.pollOutbound(TlsClient.Level.INITIAL)
+        return tls to tls.pollOutbound(TlsClient.Level.INITIAL)!!
+    }
 
-        val hrr = buildHelloRetryRequest()
+    @Test
+    fun a_retry_for_the_group_we_already_sent_is_refused() {
+        val (tls, _) = startedClient()
         val ex =
             assertFailsWith<TlsAlertException> {
-                tls.pushHandshakeBytes(TlsClient.Level.INITIAL, hrr)
+                tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_X25519))
             }
-        kotlin.test.assertEquals(40, ex.alertCode, "RFC 8446 §6.2 handshake_failure = 40")
+        kotlin.test.assertEquals(TlsConstants.ALERT_ILLEGAL_PARAMETER, ex.alertCode)
+    }
+
+    @Test
+    fun a_retry_for_p256_gets_a_second_client_hello_with_a_p256_share() {
+        val (tls, ch1Bytes) = startedClient()
+        val ch1 = ParsedClientHello.parse(ch1Bytes)
+        kotlin.test.assertEquals(listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1), ch1.supportedGroups)
+        kotlin.test.assertNotNull(ch1.x25519KeyShare)
+
+        tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1, cookie = byteArrayOf(0, 3, 7, 7, 7)))
+        val ch2Bytes = kotlin.test.assertNotNull(tls.pollOutbound(TlsClient.Level.INITIAL))
+        val ch2 = ParsedClientHello.parse(ch2Bytes)
+        kotlin.test.assertContentEquals(ch1.random, ch2.random, "same random")
+        kotlin.test.assertNull(ch2.x25519KeyShare)
+        kotlin.test.assertEquals(65, ch2.p256KeyShare?.size)
+        kotlin.test.assertEquals(TlsClient.State.WAITING_SERVER_HELLO, tls.state)
+
+        val cookie = TlsExtension.decodeList(QuicReader(ch2Bytes, 4 + 2 + 32 + 1 + 2 + ch1.cipherSuites.size * 2 + 2, ch2Bytes.size)).single { it.type == TlsConstants.EXT_COOKIE }
+        kotlin.test.assertContentEquals(byteArrayOf(0, 3, 7, 7, 7), cookie.data, "the cookie is echoed")
+    }
+
+    @Test
+    fun a_second_retry_is_refused() {
+        val (tls, _) = startedClient()
+        tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1))
+        val ex =
+            assertFailsWith<TlsAlertException> {
+                tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1))
+            }
+        kotlin.test.assertEquals(TlsConstants.ALERT_UNEXPECTED_MESSAGE, ex.alertCode)
     }
 
     /**
      * Build a minimal HRR: handshake type 2 (ServerHello), with the magic
-     * SHA-256("HelloRetryRequest") random.
+     * SHA-256("HelloRetryRequest") random, asking for [group] and echoing [cookie].
      */
-    private fun buildHelloRetryRequest(): ByteArray {
+    private fun buildHelloRetryRequest(
+        group: Int,
+        cookie: ByteArray? = null,
+    ): ByteArray {
         val helloRetryRequestRandom =
             byteArrayOf(
                 0xCF.toByte(),
@@ -110,9 +142,12 @@ class HelloRetryRequestTest {
                 // supported_versions = TLS 1.3
                 writeUint16(TlsConstants.EXT_SUPPORTED_VERSIONS)
                 withUint16Length { writeUint16(TlsConstants.VERSION_TLS_1_3) }
-                // key_share with empty group (we don't care; HRR check fires first)
                 writeUint16(TlsConstants.EXT_KEY_SHARE)
-                withUint16Length { writeUint16(TlsConstants.GROUP_X25519) }
+                withUint16Length { writeUint16(group) }
+                if (cookie != null) {
+                    writeUint16(TlsConstants.EXT_COOKIE)
+                    writeTlsOpaque2(cookie)
+                }
             }
         }
         return w.toByteArray()

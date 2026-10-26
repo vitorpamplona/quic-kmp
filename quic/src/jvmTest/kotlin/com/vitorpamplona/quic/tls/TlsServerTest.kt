@@ -21,6 +21,7 @@
 package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.crypto.curve25519.X25519
+import com.vitorpamplona.crypto.ec.P256
 import com.vitorpamplona.quic.QuicReader
 import com.vitorpamplona.quic.QuicWriter
 import com.vitorpamplona.quic.TlsAlertException
@@ -39,6 +40,7 @@ class TlsServerTest {
         var handshake: Pair<ByteArray, ByteArray>? = null
         var application: Pair<ByteArray, ByteArray>? = null
         var early: ByteArray? = null
+        var cipherSuite = -1
         var complete = false
         val tickets = mutableListOf<TlsResumptionState>()
 
@@ -47,6 +49,7 @@ class TlsServerTest {
             clientSecret: ByteArray,
             serverSecret: ByteArray,
         ) {
+            this.cipherSuite = cipherSuite
             handshake = clientSecret to serverSecret
         }
 
@@ -83,11 +86,15 @@ class TlsServerTest {
         tickets: TlsSessionTicketKeys? = null,
         maxEarly: Long = 0L,
         alpn: (List<ByteArray>) -> ByteArray? = { offered -> offered.firstOrNull { it.contentEquals(alpnH3) } },
+        suites: IntArray = ALL_SUITES,
+        groups: List<Int> = listOf(TlsConstants.GROUP_X25519, GROUP_SECP256R1),
     ) = TlsServer(
         transportParameters = byteArrayOf(1, 2, 3),
         secretsListener = listener,
         signer = signer,
         alpnSelector = alpn,
+        cipherSuites = suites,
+        keyExchangeGroups = groups,
         ticketKeys = tickets,
         maxEarlyDataSize = maxEarly,
     )
@@ -96,12 +103,14 @@ class TlsServerTest {
         listener: Recorder,
         signer: TlsCertificateSigner = ecSigner,
         resumption: TlsResumptionState? = null,
+        suites: IntArray = ALL_SUITES,
     ) = TlsClient(
         serverName = "quic.test",
         transportParameters = byteArrayOf(9, 8, 7),
         secretsListener = listener,
         certificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
         resumption = resumption,
+        cipherSuites = suites,
     )
 
     /** Shuttle CRYPTO bytes until nothing moves. */
@@ -296,11 +305,11 @@ class TlsServerTest {
     }
 
     @Test
-    fun a_client_hello_without_an_x25519_share_gets_a_hello_retry_request() {
+    fun a_client_hello_without_a_usable_share_gets_a_hello_retry_request() {
         val sl = Recorder()
         val s = server(sl)
         val random = ByteArray(32) { it.toByte() }
-        val ch1 = clientHello(random, GROUP_SECP256R1, ByteArray(65) { 4 })
+        val ch1 = clientHello(random, GROUP_SECP384R1, ByteArray(97) { 4 }, groups = listOf(GROUP_SECP384R1, TlsConstants.GROUP_X25519))
         s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch1)
 
         val hrr = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
@@ -337,7 +346,6 @@ class TlsServerTest {
 
     @Test
     fun a_ticket_resumes_after_a_hello_retry_request() {
-        // s2n-quic's ClientHello carries only a P-256 share, so it always gets a retry.
         val tickets = TlsSessionTicketKeys()
         val cl = Recorder()
         run(client(cl), server(Recorder(), tickets = tickets))
@@ -346,7 +354,7 @@ class TlsServerTest {
         val sl = Recorder()
         val s = server(sl, tickets = tickets)
         val random = ByteArray(32) { 7 }
-        val ch1 = clientHello(random, GROUP_SECP256R1, ByteArray(65) { 4 }, resume = ticket)
+        val ch1 = clientHello(random, GROUP_SECP384R1, ByteArray(97) { 4 }, resume = ticket)
         s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch1)
         val hrr = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
         val ch1Hash = TlsRunningSha256().also { it.update(ch1) }.snapshot()
@@ -362,9 +370,9 @@ class TlsServerTest {
     }
 
     @Test
-    fun a_second_client_hello_still_without_an_x25519_share_is_refused() {
+    fun a_second_client_hello_still_without_a_usable_share_is_refused() {
         val s = server(Recorder())
-        val ch = clientHello(ByteArray(32), GROUP_SECP256R1, ByteArray(65) { 4 })
+        val ch = clientHello(ByteArray(32), GROUP_SECP384R1, ByteArray(97) { 4 })
         s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch)
         assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
         val e = assertFailsWith<TlsAlertException> { s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch) }
@@ -372,14 +380,120 @@ class TlsServerTest {
     }
 
     @Test
-    fun a_client_without_x25519_in_its_groups_is_refused() {
+    fun a_client_without_x25519_or_p256_in_its_groups_is_refused() {
         val s = server(Recorder())
-        val ch = clientHello(ByteArray(32), GROUP_SECP256R1, ByteArray(65) { 4 }, groups = listOf(GROUP_SECP256R1))
+        val ch = clientHello(ByteArray(32), GROUP_SECP384R1, ByteArray(97) { 4 }, groups = listOf(GROUP_SECP384R1))
         val e = assertFailsWith<TlsAlertException> { s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch) }
         assertEquals(TlsConstants.ALERT_HANDSHAKE_FAILURE, e.alertCode)
     }
 
+    @Test
+    fun a_p256_only_client_hello_is_answered_without_a_retry() {
+        // kwik's ClientHello lists and shares only secp256r1.
+        val sl = Recorder()
+        val s = server(sl)
+        val keyPair = P256.generateKeyPair()
+        val ch = clientHello(ByteArray(32) { 3 }, GROUP_SECP256R1, keyPair.publicKey, groups = listOf(GROUP_SECP256R1))
+        s.pushHandshakeBytes(TlsClient.Level.INITIAL, ch)
+        val shBytes = assertNotNull(s.pollOutbound(TlsClient.Level.INITIAL))
+        val sh = serverHello(shBytes)
+        assertFalse(sh.random.contentEquals(HELLO_RETRY_REQUEST_RANDOM))
+        assertEquals(GROUP_SECP256R1, sh.keyShareGroup)
+        assertEquals(65, sh.keyShareKey.size)
+
+        val transcript = TlsTranscriptHash()
+        transcript.append(ch)
+        transcript.append(shBytes)
+        val expected = TlsKeySchedule(transcript)
+        expected.deriveEarly()
+        expected.deriveHandshake(P256.dh(keyPair.privateKey, sh.keyShareKey))
+        expected.deriveHandshakeTraffic()
+        assertContentEquals(expected.clientHandshakeSecret, sl.handshake!!.first)
+        assertContentEquals(expected.serverHandshakeSecret, sl.handshake!!.second)
+    }
+
+    @Test
+    fun a_p256_share_off_the_curve_is_refused() {
+        val s = server(Recorder())
+        val notOnCurve = ByteArray(65) { 4 }
+        val e = assertFailsWith<TlsAlertException> { s.pushHandshakeBytes(TlsClient.Level.INITIAL, clientHello(ByteArray(32), GROUP_SECP256R1, notOnCurve)) }
+        assertEquals(TlsConstants.ALERT_ILLEGAL_PARAMETER, e.alertCode)
+    }
+
+    @Test
+    fun our_client_answers_a_retry_for_p256() {
+        val cl = Recorder()
+        val sl = Recorder()
+        val c = client(cl)
+        val s = server(sl, groups = listOf(GROUP_SECP256R1))
+        run(c, s)
+        assertTrue(cl.complete && sl.complete)
+        assertEquals(TlsServer.State.CONNECTED, s.state)
+        assertContentEquals(sl.application!!.first, cl.application!!.first)
+        assertContentEquals(sl.application!!.second, cl.application!!.second)
+    }
+
+    @Test
+    fun aes_256_gcm_sha384_handshake_and_resumption() {
+        val suite = TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384
+        val tickets = TlsSessionTicketKeys()
+        val cl = Recorder()
+        val sl = Recorder()
+        run(client(cl, suites = intArrayOf(suite)), server(sl, tickets = tickets, maxEarly = 0xFFFFFFFFL))
+        assertTrue(cl.complete && sl.complete)
+        assertEquals(suite, cl.cipherSuite)
+        assertEquals(suite, sl.cipherSuite)
+        assertEquals(48, cl.handshake!!.first.size, "SHA-384 secrets")
+        assertContentEquals(sl.handshake!!.first, cl.handshake!!.first)
+        assertContentEquals(sl.application!!.second, cl.application!!.second)
+        val ticket = cl.tickets.single()
+        assertEquals(suite, ticket.cipherSuite)
+        assertEquals(48, ticket.psk.size)
+
+        // Resumed with 0-RTT, then again after a retry to P-256 (still SHA-384, so the ticket stays).
+        val cl2 = Recorder()
+        val sl2 = Recorder()
+        val s2 = server(sl2, tickets = tickets, maxEarly = 0xFFFFFFFFL)
+        val c2 = client(cl2, resumption = ticket, suites = intArrayOf(suite))
+        run(c2, s2)
+        assertTrue(s2.pskAccepted && s2.earlyDataAccepted && c2.earlyDataAccepted)
+        assertEquals(suite, sl2.cipherSuite, "a ticket resumes a suite of its own hash")
+        assertContentEquals(cl2.early, sl2.early)
+        assertContentEquals(sl2.application!!.first, cl2.application!!.first)
+
+        val cl3 = Recorder()
+        val s3 = server(Recorder(), tickets = tickets, groups = listOf(GROUP_SECP256R1))
+        run(client(cl3, resumption = ticket, suites = intArrayOf(suite)), s3)
+        assertTrue(s3.pskAccepted && cl3.complete)
+        assertFalse(s3.earlyDataAccepted, "no early data after a retry")
+    }
+
+    @Test
+    fun a_ticket_of_another_hash_falls_back_to_a_full_handshake() {
+        val tickets = TlsSessionTicketKeys()
+        val cl = Recorder()
+        run(client(cl, suites = intArrayOf(TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384)), server(Recorder(), tickets = tickets))
+        val sha384Ticket = cl.tickets.single()
+
+        // A server that only does SHA-256 suites: the client offers the ticket, the server can't take it.
+        val cl2 = Recorder()
+        val sl2 = Recorder()
+        val s2 = server(sl2, tickets = tickets, suites = intArrayOf(TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256))
+        run(client(cl2, resumption = sha384Ticket), s2)
+        assertFalse(s2.pskAccepted)
+        assertTrue(cl2.complete && sl2.complete)
+        assertEquals(32, cl2.application!!.first.size)
+        assertContentEquals(sl2.application!!.first, cl2.application!!.first)
+    }
+
     private companion object {
         const val GROUP_SECP256R1 = 23
+        const val GROUP_SECP384R1 = 24
+        val ALL_SUITES =
+            intArrayOf(
+                TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+                TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
+                TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
+            )
     }
 }

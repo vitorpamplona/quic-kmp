@@ -22,6 +22,7 @@ package com.vitorpamplona.quic.tls
 
 import com.vitorpamplona.crypto.curve25519.X25519
 import com.vitorpamplona.crypto.curve25519.X25519KeyPair
+import com.vitorpamplona.crypto.ec.P256
 import com.vitorpamplona.crypto.random.RandomInstance
 import com.vitorpamplona.quic.QuicCodecException
 import com.vitorpamplona.quic.QuicReader
@@ -33,7 +34,7 @@ import kotlin.time.Clock
  * TLS 1.3 server driven by QUIC's CRYPTO streams (RFC 8446, RFC 9001), the
  * counterpart of [TlsClient].
  *
- * Handles a full handshake (X25519, AES-128-GCM or ChaCha20-Poly1305,
+ * Handles a full handshake (X25519 or P-256; AES-128-GCM, AES-256-GCM or ChaCha20-Poly1305,
  * certificate authentication through [signer]) and, when [ticketKeys] is set,
  * PSK resumption from tickets it issued, with 0-RTT if [maxEarlyDataSize] is
  * non-zero. Keys reach the QUIC layer through [secretsListener] exactly as on
@@ -42,9 +43,11 @@ import kotlin.time.Clock
  * when 0-RTT is accepted, and [TlsSecretsListener.onHandshakeComplete] once
  * the client's Finished verifies.
  *
- * A ClientHello that lists X25519 without sending a share for it gets a
+ * Of the key shares a ClientHello carries, the one for the first of
+ * [keyExchangeGroups] is used (X25519, then P-256, by default). One that
+ * lists such a group without sending a share for it gets a
  * HelloRetryRequest (resumption still works after it, 0-RTT doesn't); one
- * that doesn't list it fails with handshake_failure.
+ * that lists none fails with handshake_failure.
  * Not supported: client certificates.
  */
 class TlsServer(
@@ -61,8 +64,15 @@ class TlsServer(
     val cipherSuites: IntArray =
         intArrayOf(
             TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
+    /**
+     * Key-exchange groups we accept, most preferred first: X25519 and
+     * secp256r1 (P-256). We use the most preferred one the client sent a share for,
+     * and otherwise ask for the most preferred one it lists.
+     */
+    val keyExchangeGroups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
     /** Enables session tickets and PSK resumption. */
     val ticketKeys: TlsSessionTicketKeys? = null,
     /** Ticket lifetime advertised in NewSessionTicket (RFC 8446 caps it at 7 days). */
@@ -75,7 +85,7 @@ class TlsServer(
     /** The QUIC version tickets are bound to (RFC 9369 §5). */
     val quicVersion: () -> Int = { com.vitorpamplona.quic.packet.QuicVersion.V1 },
     val nowMillisSource: () -> Long = { Clock.System.now().toEpochMilliseconds() },
-    /** Deterministic tests only. */
+    /** Deterministic tests only: our X25519 key. */
     val fixedKeyPair: X25519KeyPair? = null,
     /**
      * Sees the client's QUIC transport parameters from the ClientHello we
@@ -136,6 +146,9 @@ class TlsServer(
 
     /** We sent a HelloRetryRequest; the next ClientHello is the client's second. */
     private var helloRetried: Boolean = false
+
+    /** The group the HelloRetryRequest asked a share for. */
+    private var retryGroup: Int = -1
 
     /** After a HelloRetryRequest: message_hash(ClientHello1) and the retry, which a PSK binder also covers. */
     private var retryTranscriptPrefix: ByteArray = ByteArray(0)
@@ -206,16 +219,27 @@ class TlsServer(
         val alpn = alpnSelector(ch.alpns) ?: throw TlsAlertException(TlsConstants.ALERT_NO_APPLICATION_PROTOCOL, "no acceptable ALPN in ${ch.alpns.map { it.decodeToString() }}")
         negotiatedAlpn = alpn
         val suite =
-            cipherSuites.firstOrNull { it in ch.cipherSuites }
+            cipherSuites.firstOrNull { it in ch.cipherSuites && it in SUPPORTED_CIPHER_SUITES }
                 ?: throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "no common cipher suite")
+        // RFC 8446 §4.1.4: the second ClientHello keeps the retry's suite.
+        if (helloRetried && suite != negotiatedCipherSuite) throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "second ClientHello changed the cipher suite")
         negotiatedCipherSuite = suite
-        val clientShare = ch.x25519KeyShare
-        if (clientShare == null) {
-            if (helloRetried) throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "second ClientHello still has no X25519 key share")
-            if (TlsConstants.GROUP_X25519 !in ch.supportedGroups) throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "client does not support X25519")
-            sendHelloRetryRequest(ch, msg, suite)
+        val hash = TlsHash.forCipherSuite(suite)
+        transcript.select(hash)
+        keySchedule.hash = hash
+        val group =
+            keyExchangeGroups.firstOrNull {
+                (it == TlsConstants.GROUP_X25519 && ch.x25519KeyShare != null) || (it == TlsConstants.GROUP_SECP256R1 && ch.p256KeyShare != null)
+            }
+        if (group == null) {
+            if (helloRetried) throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "second ClientHello still has no usable key share")
+            val wanted =
+                keyExchangeGroups.firstOrNull { it in ch.supportedGroups }
+                    ?: throw TlsAlertException(TlsConstants.ALERT_HANDSHAKE_FAILURE, "no common key-exchange group")
+            sendHelloRetryRequest(ch, msg, suite, wanted)
             return
         }
+        if (helloRetried && group != retryGroup) throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "second ClientHello has no share for the group we asked for")
         // Only for the ClientHello we answer: a compatible version switch
         // (RFC 9368) together with a HelloRetryRequest left picoquic restarting
         // its handshake in the new version without the retry.
@@ -249,10 +273,23 @@ class TlsServer(
                 0
             }
 
-        val keyPair = fixedKeyPair ?: X25519.generateKeyPair()
-        val shared = X25519.dh(keyPair.privateKey, clientShare)
+        val publicKey: ByteArray
+        val shared: ByteArray
+        try {
+            if (group == TlsConstants.GROUP_X25519) {
+                val keyPair = fixedKeyPair ?: X25519.generateKeyPair()
+                publicKey = keyPair.publicKey
+                shared = X25519.dh(keyPair.privateKey, ch.x25519KeyShare!!)
+            } else {
+                val keyPair = P256.generateKeyPair()
+                publicKey = keyPair.publicKey
+                shared = P256.dh(keyPair.privateKey, ch.p256KeyShare!!)
+            }
+        } catch (e: IllegalArgumentException) {
+            throw TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "bad key share: ${e.message}")
+        }
 
-        val sh = buildServerHello(ch.sessionId, suite, keyPair.publicKey, pskAccepted)
+        val sh = buildServerHello(ch.sessionId, suite, group, publicKey, pskAccepted)
         transcript.append(sh)
         outboundQueues[TlsClient.Level.INITIAL]!!.addLast(sh)
 
@@ -288,7 +325,7 @@ class TlsServer(
     }
 
     /**
-     * RFC 8446 §4.1.4: ask for an X25519 share. The transcript restarts as
+     * RFC 8446 §4.1.4: ask for a [group] share. The transcript restarts as
      * message_hash(ClientHello1) followed by the HelloRetryRequest; the
      * client's second ClientHello comes on the same Initial CRYPTO stream.
      */
@@ -296,11 +333,11 @@ class TlsServer(
         ch: ParsedClientHello,
         msg: ByteArray,
         suite: Int,
+        group: Int,
     ) {
         helloRetried = true
-        // Both suites we offer hash with SHA-256.
-        val ch1Hash = TlsRunningSha256().also { it.update(msg) }.snapshot()
-        val messageHash = handshakeMessage(TlsConstants.HS_MESSAGE_HASH) { writeBytes(ch1Hash) }
+        retryGroup = group
+        val messageHash = TlsTranscriptHash.messageHash(keySchedule.hash.digest(msg))
         transcript.append(messageHash)
         val hrr =
             handshakeMessage(TlsConstants.HS_SERVER_HELLO) {
@@ -313,7 +350,7 @@ class TlsServer(
                     writeUint16(TlsConstants.EXT_SUPPORTED_VERSIONS)
                     withUint16Length { writeUint16(TlsConstants.VERSION_TLS_1_3) }
                     writeUint16(TlsConstants.EXT_KEY_SHARE)
-                    withUint16Length { writeUint16(TlsConstants.GROUP_X25519) }
+                    withUint16Length { writeUint16(group) }
                 }
             }
         transcript.append(hrr)
@@ -336,24 +373,20 @@ class TlsServer(
         val ticket = keys.open(identity) ?: return null
         val now = nowMillisSource()
         if (now - ticket.issuedAtMillis > ticket.lifetimeSec * 1000L || now < ticket.issuedAtMillis) return null
-        // Both suites we support hash with SHA-256, so a ticket from either resumes either (§4.2.11).
-        if (ticket.cipherSuite !in cipherSuites) return null
+        // RFC 8446 §4.2.11: a ticket resumes any suite with the same hash.
+        val hash = TlsHash.forCipherSuite(suite)
+        if (ticket.cipherSuite !in cipherSuites || TlsHash.forCipherSuite(ticket.cipherSuite) !== hash || ticket.psk.size != hash.length) return null
         if (ticket.alpn != null && !ticket.alpn.contentEquals(alpn)) return null
         // RFC 8446 §4.2.11.2: the binder covers the ClientHello up to the binders
         // list, preceded after a HelloRetryRequest by message_hash and the retry.
-        val early = TlsKeySchedule(TlsTranscriptHash()).also { it.deriveEarlyFromPsk(ticket.psk) }
+        val early =
+            TlsKeySchedule(TlsTranscriptHash()).also {
+                it.hash = hash
+                it.deriveEarlyFromPsk(ticket.psk)
+            }
         val binderKey = pskBinderFinishedKey(early.earlySecret!!)
-        val partial =
-            TlsRunningSha256()
-                .also {
-                    it.update(retryTranscriptPrefix)
-                    it.update(msg.copyOfRange(0, ch.bindersOffset))
-                }.snapshot()
-        val mac =
-            com.vitorpamplona.crypto.mac
-                .MacInstance("HmacSHA256", binderKey)
-        mac.update(partial)
-        if (!mac.doFinal().contentEqualsConstantTime(binder)) {
+        val partial = hash.digest(retryTranscriptPrefix, msg.copyOfRange(0, ch.bindersOffset))
+        if (!hash.hmac(binderKey, partial).contentEqualsConstantTime(binder)) {
             throw TlsAlertException(TlsConstants.ALERT_DECRYPT_ERROR, "PSK binder does not verify")
         }
         return ticket
@@ -416,6 +449,7 @@ class TlsServer(
     private fun buildServerHello(
         sessionIdEcho: ByteArray,
         suite: Int,
+        group: Int,
         publicKey: ByteArray,
         psk: Boolean,
     ): ByteArray =
@@ -430,7 +464,7 @@ class TlsServer(
                 withUint16Length { writeUint16(TlsConstants.VERSION_TLS_1_3) }
                 writeUint16(TlsConstants.EXT_KEY_SHARE)
                 withUint16Length {
-                    writeUint16(TlsConstants.GROUP_X25519)
+                    writeUint16(group)
                     writeTlsOpaque2(publicKey)
                 }
                 if (psk) {
@@ -486,6 +520,8 @@ internal class ParsedClientHello(
     val cipherSuites: List<Int>,
     val supportedVersions: List<Int>,
     val x25519KeyShare: ByteArray?,
+    /** An uncompressed secp256r1 point (RFC 8446 §4.2.8.2). */
+    val p256KeyShare: ByteArray?,
     val supportedGroups: List<Int>,
     val signatureAlgorithms: List<Int>,
     val alpns: List<ByteArray>,
@@ -517,6 +553,7 @@ internal class ParsedClientHello(
                 val extEnd = r.position + extTotal
                 var versions = emptyList<Int>()
                 var share: ByteArray? = null
+                var p256Share: ByteArray? = null
                 var groups = emptyList<Int>()
                 var sigAlgs = emptyList<Int>()
                 var alpns = emptyList<ByteArray>()
@@ -544,6 +581,7 @@ internal class ParsedClientHello(
                                 val group = e.readUint16()
                                 val key = e.readTlsOpaque2()
                                 if (group == TlsConstants.GROUP_X25519 && key.size == 32 && share == null) share = key
+                                if (group == TlsConstants.GROUP_SECP256R1 && key.size == 65 && p256Share == null) p256Share = key
                             }
                         }
 
@@ -607,6 +645,7 @@ internal class ParsedClientHello(
                     suites,
                     versions,
                     share,
+                    p256Share,
                     groups,
                     sigAlgs,
                     alpns,

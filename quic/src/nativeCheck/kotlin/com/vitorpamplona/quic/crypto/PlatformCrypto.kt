@@ -30,4 +30,6 @@ actual val PlatformChaCha20Block: ChaCha20BlockEncrypt
 
 actual fun bestAes128GcmAead(key: ByteArray): Aead = throw NotImplementedError("native check stub")
 
+actual fun bestAes256GcmAead(key: ByteArray): Aead = throw NotImplementedError("native check stub")
+
 actual fun bestChaCha20Poly1305Aead(key: ByteArray): Aead = throw NotImplementedError("native check stub")

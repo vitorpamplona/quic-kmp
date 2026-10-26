@@ -40,6 +40,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -145,6 +146,7 @@ class QuicServerTest {
         requireRetry: Boolean = false,
         versions: List<Int> = listOf(QuicVersion.V1),
         maxConnections: Int = 10_000,
+        groups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
     ) = QuicServer(
         QuicServerConfig(
             signer = signer,
@@ -152,6 +154,7 @@ class QuicServerTest {
             requireRetry = requireRetry,
             supportedVersions = versions,
             maxConnections = maxConnections,
+            keyExchangeGroups = groups,
         ),
         network,
         scope,
@@ -165,12 +168,19 @@ class QuicServerTest {
         token: ByteArray? = null,
         onNewToken: ((ByteArray) -> Unit)? = null,
         config: QuicConnectionConfig = QuicConnectionConfig(compatibleVersions = compatibleVersions),
+        cipherSuites: IntArray =
+            intArrayOf(
+                TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+                TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
+                TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
+            ),
     ): QuicConnection {
         val conn =
             QuicConnection(
                 serverName = "quic.test",
                 config = config,
                 tlsCertificateValidator = PinnedCertificateValidator.ofDer(signer.certificateChain.first()),
+                cipherSuites = cipherSuites,
                 addressValidationToken = token,
                 onNewToken = onNewToken,
             )
@@ -219,6 +229,44 @@ class QuicServerTest {
             val client = client(network, 5000)
             echoOnce(server, client)
             assertEquals(1, server.connectionCount)
+            server.close()
+        }
+
+    @Test
+    fun `AES-256-GCM-SHA384 carries the connection through a key update`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network)
+            val client = client(network, 5000, cipherSuites = intArrayOf(TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384))
+            val accepted = echoOnce(server, client)
+            assertEquals(TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384, client.appCipherSuite)
+            assertEquals(TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384, accepted.connection.appCipherSuite)
+            assertTrue(client.lock.withLock { client.initiateKeyUpdate() }, "the client rotates its 1-RTT keys")
+
+            // A second exchange under the next key phase, in both directions.
+            scope.launch {
+                val stream = accepted.connection.awaitIncomingPeerStream() ?: return@launch
+                val body = stream.incoming.toList().fold(ByteArray(0)) { a, b -> a + b }
+                stream.send.enqueue("again:".encodeToByteArray() + body)
+                stream.send.finish()
+                accepted.driver.wakeup()
+            }
+            val request = client.openBidiStream()
+            request.send.enqueue("pong".encodeToByteArray())
+            request.send.finish()
+            val reply = withTimeout(5_000) { request.incoming.toList() }.fold(ByteArray(0)) { a, b -> a + b }
+            assertEquals("again:pong", reply.decodeToString())
+            assertTrue(accepted.connection.currentReceiveKeyPhase, "the server followed the key update")
+            server.close()
+        }
+
+    @Test
+    fun `a server that only does P-256 gets our client's second ClientHello`() =
+        runBlocking<Unit> {
+            val network = Network()
+            val server = server(network, groups = listOf(TlsConstants.GROUP_SECP256R1))
+            val client = client(network, 5000)
+            echoOnce(server, client)
             server.close()
         }
 

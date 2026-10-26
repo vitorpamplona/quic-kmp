@@ -120,6 +120,7 @@ class QuicConnection internal constructor(
     val cipherSuites: IntArray =
         intArrayOf(
             TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+            TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
     /**
@@ -193,6 +194,7 @@ class QuicConnection internal constructor(
         cipherSuites: IntArray =
             intArrayOf(
                 TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+                TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
                 TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
             ),
         initialVersion: Int = QuicVersion.V1,
@@ -3088,6 +3090,12 @@ class QuicConnection internal constructor(
         }
     }
 
+    /** RFC 9001 §6.1: next_secret = HKDF-Expand-Label(current, "quic ku", "", Hash.length), on the suite's hash. */
+    private fun nextKeyPhaseSecret(current: ByteArray): ByteArray =
+        com.vitorpamplona.quic.tls.TlsHash
+            .forSecret(current)
+            .expandLabel(current, QuicVersion.keyUpdateLabel(currentVersion), current.size)
+
     /**
      * RFC 9001 §6.1 key update — rotate application-level keys forward by
      * one phase. Called from [com.vitorpamplona.quic.connection.feedShortHeaderPacket]
@@ -3123,8 +3131,7 @@ class QuicConnection internal constructor(
         val cs = appCipherSuite.takeIf { it != 0 } ?: return null
         // RFC 9001 §6.1 — secret rotation label.
         val nextSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(current, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), current.size)
+            nextKeyPhaseSecret(current)
         // Reuse the existing builder; it derives key + iv + hp from a secret,
         // and the spec just discards the new HP key (we keep the old one).
         val nextProtection =
@@ -3183,8 +3190,7 @@ class QuicConnection internal constructor(
         val curRx = appReceiveSecret
         if (curRx != null && cs != 0) {
             appReceiveSecret =
-                com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curRx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curRx.size)
+                nextKeyPhaseSecret(curRx)
         }
         currentReceiveKeyPhase = !currentReceiveKeyPhase
 
@@ -3194,8 +3200,7 @@ class QuicConnection internal constructor(
         val curTx = appSendSecret
         if (curTx != null && cs != 0) {
             val nextSendSecret =
-                com.vitorpamplona.quic.crypto.HKDF
-                    .expandLabel(curTx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curTx.size)
+                nextKeyPhaseSecret(curTx)
             appSendSecret = nextSendSecret
             val freshSend =
                 com.vitorpamplona.quic.connection.packetProtectionFromSecret(
@@ -3286,11 +3291,9 @@ class QuicConnection internal constructor(
         // wasteful) and then promote them, ending up with our previous
         // receive keys orphaned in [previousReceiveProtection].
         val nextRxSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curRx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curRx.size)
+            nextKeyPhaseSecret(curRx)
         val nextTxSecret =
-            com.vitorpamplona.quic.crypto.HKDF
-                .expandLabel(curTx, QuicVersion.keyUpdateLabel(currentVersion), ByteArray(0), curTx.size)
+            nextKeyPhaseSecret(curTx)
         val freshRx = packetProtectionFromSecret(cs, nextRxSecret, currentVersion)
         val freshTx = packetProtectionFromSecret(cs, nextTxSecret, currentVersion)
 

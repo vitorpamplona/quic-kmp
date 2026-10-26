@@ -35,6 +35,9 @@ expect val PlatformChaCha20Block: ChaCha20BlockEncrypt
  */
 expect fun bestAes128GcmAead(key: ByteArray): Aead
 
+/** The AES-256-GCM counterpart of [bestAes128GcmAead], for TLS_AES_256_GCM_SHA384. */
+expect fun bestAes256GcmAead(key: ByteArray): Aead
+
 /**
  * Build the platform's preferred ChaCha20-Poly1305 AEAD for a fixed [key].
  * JVM 11+ / Android API 28+ provide a JCA `ChaCha20-Poly1305` cipher

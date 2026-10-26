@@ -15,7 +15,7 @@ audio rooms and Marmot agent streams in production.
 |---|---|
 | QUIC v1 (RFC 9000) | Client and server. Bidirectional and unidirectional streams with flow control, version negotiation, Retry, connection IDs (`NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID`), path validation, NAT rebinding, preferred addresses (the client moves to one; the server offers one), stateless reset, `NEW_TOKEN`, ECN on 1-RTT, path MTU discovery (RFC 8899), latency spin bit, keep-alive |
 | QUIC v2 (RFC 9369, RFC 9368) | Both versions, and compatible version negotiation from v1 to v2 on either side |
-| TLS 1.3 for QUIC (RFC 8446, RFC 9001) | X25519 key exchange (the server sends a HelloRetryRequest to a client that offered X25519 without a share for it); `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`; RSA-PSS, ECDSA and Ed25519 certificates (Ed25519 needs Android 13+); 1-RTT key update (both directions); session resumption and 0-RTT, as client and as server (session tickets, PSK binders, single-use 0-RTT tickets) |
+| TLS 1.3 for QUIC (RFC 8446, RFC 9001) | X25519 and P-256 (secp256r1) key exchange, with HelloRetryRequest on both sides (the client sends an X25519 share and lists both; the server asks for a share it can use); `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`; RSA-PSS, ECDSA and Ed25519 certificates (Ed25519 needs Android 13+); 1-RTT key update (both directions); session resumption and 0-RTT, as client and as server (session tickets, PSK binders, single-use 0-RTT tickets) |
 | Recovery (RFC 9002) | RTT estimation, packet- and time-threshold loss detection, PTO, per-frame retransmission, CUBIC (RFC 9438) or NewReno congestion control with pacing, persistent congestion and ECN-CE response, delayed ACKs, the ACK frequency extension (draft-ietf-quic-ack-frequency) as receiver |
 | Datagrams (RFC 9221) | Send and receive unreliable `DATAGRAM` frames |
 | HTTP/3 (RFC 9114) | Frame reader (optionally streaming DATA bodies) and writer, `SETTINGS`, control and request streams, `GOAWAY` |
@@ -29,8 +29,8 @@ server (see [Interop matrix](#interop-matrix)).
 
 ### Not supported
 
-- `TLS_AES_256_GCM_SHA384` and key shares other than X25519 (a client that offers no X25519 at
-  all is refused): both wait on SHA-384 and P-256 in [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp).
+- Key-exchange groups other than X25519 and P-256 (P-384, P-521, FFDHE, hybrid post-quantum
+  groups such as X25519MLKEM768).
 - HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
 - Client certificates on the server.
 - **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
@@ -53,7 +53,7 @@ dependencies {
 | Android | minSdk 26 |
 | Kotlin coroutines | the API is `suspend` and `Flow` based |
 
-The crypto primitives (HKDF, HMAC, SHA-256, AES-GCM, ChaCha20-Poly1305, X25519, secure random)
+The crypto primitives (HKDF, HMAC, SHA-256, SHA-384, AES-GCM, ChaCha20-Poly1305, X25519, P-256, secure random)
 come from [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp)
 (`com.vitorpamplona.crypto:crypto`), which depends on nothing but the Kotlin stdlib. Its
 `X25519KeyPair` appears in `TlsClient`'s API, so it comes along as an `api` dependency.

@@ -291,6 +291,7 @@ class QuicServer(
                         signer = config.signer,
                         alpnSelector = config.alpnSelector,
                         cipherSuites = config.cipherSuites,
+                        keyExchangeGroups = config.keyExchangeGroups,
                         ticketKeys = config.ticketKeys,
                         maxEarlyDataSize = if (config.ticketKeys != null) config.maxEarlyDataSize else 0L,
                         quicVersion = { connRef?.currentVersion ?: header.version },

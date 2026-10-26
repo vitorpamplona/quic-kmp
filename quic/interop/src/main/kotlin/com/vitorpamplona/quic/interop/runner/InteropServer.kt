@@ -139,6 +139,7 @@ fun runInteropServer(testcase: String): Int {
             cipherSuites =
                 intArrayOf(
                     TlsConstants.CIPHER_TLS_AES_128_GCM_SHA256,
+                    TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
                     TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
                 ),
             secretsListenerFactory = keyLogFile?.let { file -> { KeyLogListener(SslKeyLogger(file)) } },
