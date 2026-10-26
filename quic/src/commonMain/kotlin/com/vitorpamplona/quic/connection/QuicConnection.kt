@@ -671,7 +671,7 @@ class QuicConnection internal constructor(
      * error") when a client rolls KEY_PHASE before HANDSHAKE_DONE has
      * been delivered. The interop runner's `keyupdate` testcase against
      * quinn flushed this — see
-     * `quic/plans/2026-05-08-keyupdate-vs-quinn.md`.
+     * `plans/2026-05-08-keyupdate-vs-quinn.md`.
      *
      * Awaitable via [awaitHandshakeConfirmed].
      */
@@ -1045,7 +1045,7 @@ class QuicConnection internal constructor(
      * supersede-check from neqo's `fc.rs::frame_lost` (if a newer,
      * higher extension has since gone out, the older lost frame is
      * irrelevant). Step 6 of
-     * `quic/plans/2026-05-04-control-frame-retransmit.md` populates
+     * `plans/2026-05-04-control-frame-retransmit.md` populates
      * this field via the loss dispatcher; step 4 (this commit) wires
      * the writer to drain it before running the rolling-extension
      * threshold check.
@@ -4080,7 +4080,7 @@ class QuicConnection internal constructor(
      *    [destinationConnectionId] to the new bytes synchronously
      *    here, before the lock is released. Otherwise the next
      *    drain would stamp the just-retired CID on the wire (the
-     *    bug from `quic/plans/2026-05-08-rebind-port-bug.md` —
+     *    bug from `plans/2026-05-08-rebind-port-bug.md` —
      *    quic-go / picoquic / msquic / mvfst correctly close us
      *    with PROTOCOL_VIOLATION when they see "RETIRE(seq=N) +
      *    DCID=seq=N bytes" in the same packet).
@@ -4283,7 +4283,7 @@ class QuicConnection internal constructor(
     }
 
     /**
-     * Step 6 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+     * Step 6 of `plans/2026-05-04-control-frame-retransmit.md`:
      * dispatch the tokens of declared-lost packets to the matching
      * `pending*` field, applying the supersede check from neqo's
      * `fc.rs::frame_lost`. The supersede invariant: only re-flag for

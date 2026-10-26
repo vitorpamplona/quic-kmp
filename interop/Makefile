@@ -5,7 +5,7 @@
 #   make clean              # nuke the dist + image
 #
 # Real testing happens via the runner: clone quic-interop-runner separately
-# and drive it with `quic/interop/run-matrix.sh -s <peer> -t <tests>`.
+# and drive it with `interop/run-matrix.sh -s <peer> -t <tests>`.
 IMAGE     ?= amethyst-quic-interop:latest
 REPO_ROOT := $(shell git rev-parse --show-toplevel)
 DIST_DIR  := build/install/quic-interop
@@ -23,7 +23,7 @@ dist:
 	cd $(REPO_ROOT) && ./gradlew :quic-interop:installDist
 
 docker: dist
-	cd $(REPO_ROOT) && docker build -t $(IMAGE) --build-arg DEBUG=$(DEBUG) -f quic/interop/Dockerfile .
+	cd $(REPO_ROOT) && docker build -t $(IMAGE) --build-arg DEBUG=$(DEBUG) -f interop/Dockerfile .
 
 image-name:
 	@echo $(IMAGE)

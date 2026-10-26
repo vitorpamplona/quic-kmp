@@ -8,7 +8,7 @@ set -o pipefail
 # that have no log files (the artifact-inspection path is still
 # valid).
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNNER_LOGS="${REPO_ROOT}/../quic-interop-runner/logs"
 
 if [[ ! -d "$RUNNER_LOGS" ]]; then

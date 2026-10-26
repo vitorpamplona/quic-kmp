@@ -923,7 +923,7 @@ private fun buildApplicationPacket(
     // frame contributes a [RecoveryToken] so the [SentPacket] recorded
     // at the bottom of this function can drive RFC 9002 loss
     // detection + retransmit (steps 3–6 of
-    // `quic/plans/2026-05-04-control-frame-retransmit.md`). Frames that
+    // `plans/2026-05-04-control-frame-retransmit.md`). Frames that
     // are not retransmittable (DatagramFrame, StreamFrame for now) do
     // not contribute a token; the packet is still ack-eliciting and
     // tracked for loss-detection timing.
@@ -1373,7 +1373,7 @@ private fun isAckEliciting(frames: List<Frame>): Boolean = frames.any { it !is A
  * Each emitted frame contributes a matching [RecoveryToken] to [tokens]
  * so the [SentPacket] recorded by the caller can drive RFC 9002
  * retransmit on loss (step 6 of
- * `quic/plans/2026-05-04-control-frame-retransmit.md`).
+ * `plans/2026-05-04-control-frame-retransmit.md`).
  *
  * Caller must hold [QuicConnection.lock].
  */

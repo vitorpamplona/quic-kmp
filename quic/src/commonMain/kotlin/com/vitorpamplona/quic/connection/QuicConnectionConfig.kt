@@ -51,7 +51,7 @@ data class QuicConnectionConfig(
      * lifetime stream-id allocation per connection.
      *
      * The true fix landed in
-     * `quic/plans/2026-05-04-control-frame-retransmit.md`:
+     * `plans/2026-05-04-control-frame-retransmit.md`:
      * RFC 9002 §6 loss detection + retransmit. With control-frame
      * retransmit working, a single dropped MAX_STREAMS_UNI is
      * recovered automatically — no need for the high-cap

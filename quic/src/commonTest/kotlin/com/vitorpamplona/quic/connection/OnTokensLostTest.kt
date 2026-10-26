@@ -27,7 +27,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 /**
- * Step 6 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 6 of `plans/2026-05-04-control-frame-retransmit.md`:
  * `QuicConnection.onTokensLost` dispatches lost-packet tokens to
  * the matching `pending*` field with the supersede check (lost
  * value must equal current advertised). Mirrors neqo's

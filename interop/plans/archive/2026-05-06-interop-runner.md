@@ -17,7 +17,7 @@ reorder / migration scenarios that are awkward to reproduce in unit tests.
 ## What's in Phase 0
 
 - `:quic-interop` Gradle module (JVM-only application, registered at
-  `quic/interop/` via `settings.gradle`).
+  `interop/` via `settings.gradle`).
 - `InteropClient.kt` reads the runner's env-var contract (`ROLE`, `TESTCASE`,
   `REQUESTS`, …) and dispatches by testcase. Phase 0 implements only
   `handshake`; everything else returns `127` (runner-skip).
@@ -32,31 +32,31 @@ reorder / migration scenarios that are awkward to reproduce in unit tests.
 
 ## Local iteration loop
 
-The fast path: `quic/interop/run-matrix.sh` clones the runner alongside
+The fast path: `interop/run-matrix.sh` clones the runner alongside
 this repo, sets up a venv, merges our `implementations_quic.json` snippet,
 builds the endpoint image, and invokes `run.py`. All steps are
 idempotent so repeated invocations just iterate.
 
 ```
 # Single test against the most permissive peer:
-quic/interop/run-matrix.sh -s aioquic -t handshake
+interop/run-matrix.sh -s aioquic -t handshake
 
 # A focused triangulation:
-quic/interop/run-matrix.sh -s aioquic   -t handshake,chacha20
-quic/interop/run-matrix.sh -s quic-go   -t handshake,chacha20
-quic/interop/run-matrix.sh -s picoquic  -t handshake,chacha20
+interop/run-matrix.sh -s aioquic   -t handshake,chacha20
+interop/run-matrix.sh -s quic-go   -t handshake,chacha20
+interop/run-matrix.sh -s picoquic  -t handshake,chacha20
 
 # Tight inner loop — skip the image rebuild between test selections:
-SKIP_BUILD=1 quic/interop/run-matrix.sh -s aioquic -t transfer
+SKIP_BUILD=1 interop/run-matrix.sh -s aioquic -t transfer
 ```
 
 Manual flow (if `run-matrix.sh` doesn't fit):
 
 ```
-make -C quic/interop build
+make -C interop build
 # Then in a sibling clone of quic-interop-runner, merge our snippet:
 jq -s '.[0] * .[1]' implementations_quic.json \
-   ../amethyst/quic/interop/quic-interop-runner-snippet.json \
+   ../amethyst/interop/quic-interop-runner-snippet.json \
    > implementations_quic.json.new && mv implementations_quic.json.new implementations_quic.json
 python run.py -d -i amethyst -s aioquic -t handshake,chacha20 --log-dir ./logs
 ```
@@ -81,7 +81,7 @@ deceptively complete.
 The patch is idempotent and is re-applied on every clone of the
 runner (the fix is a working-tree edit to `../quic-interop-runner/`,
 not a fork). If you ever delete `../quic-interop-runner/` and
-re-clone manually, run `quic/interop/run-matrix.sh` once first or
+re-clone manually, run `interop/run-matrix.sh` once first or
 apply the same `sed` by hand. Upstream PR not yet filed.
 
 ## Phase ladder (excerpt — full plan in conversation)
@@ -280,7 +280,7 @@ Docker enforces those globally. Use a sequential loop:
 
 ```
 for peer in aioquic picoquic quic-go quinn; do
-    quic/interop/run-matrix.sh -s $peer -t handshake,chacha20,...
+    interop/run-matrix.sh -s $peer -t handshake,chacha20,...
 done
 ```
 

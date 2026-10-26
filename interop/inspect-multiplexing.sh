@@ -4,7 +4,7 @@
 # (../quic-interop-runner from this repo).
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNNER_LOGS="${REPO_ROOT}/../quic-interop-runner/logs"
 
 if [[ ! -d "$RUNNER_LOGS" ]]; then
@@ -41,7 +41,7 @@ echo "=============== writer-side debug traces (DEBUG=1 build only) ============
 echo
 echo "=============== boot line (verifies image has latest debug build) ==============="
 grep '\[boot\]' "$CASE_DIR/output.txt" 2>/dev/null | head -n 5 \
-    || echo "(no [boot] lines — image is older than the boot log; rebuild with: DEBUG=1 ./quic/interop/run-matrix.sh ...)"
+    || echo "(no [boot] lines — image is older than the boot log; rebuild with: DEBUG=1 ./interop/run-matrix.sh ...)"
 
 WRITER_LINES=$(grep -cE '\[(writer|batch|interop|boot)' "$CASE_DIR/output.txt" 2>/dev/null) || WRITER_LINES=0
 if [[ "$WRITER_LINES" -gt 0 ]]; then
@@ -61,7 +61,7 @@ if [[ "$WRITER_LINES" -gt 0 ]]; then
     grep -oE 'active=[0-9]+' "$CASE_DIR/output.txt" | sort | uniq -c | sort -rn || true
 else
     echo "(no diagnostic lines yet — to enable, REBUILD the image with DEBUG=1:"
-    echo "   DEBUG=1 ./quic/interop/run-matrix.sh -s aioquic -t multiplexing"
+    echo "   DEBUG=1 ./interop/run-matrix.sh -s aioquic -t multiplexing"
     echo " then re-run this script)"
 fi
 

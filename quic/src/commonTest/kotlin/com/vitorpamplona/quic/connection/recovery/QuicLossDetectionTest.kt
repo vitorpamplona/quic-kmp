@@ -27,7 +27,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Step 5 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 5 of `plans/2026-05-04-control-frame-retransmit.md`:
  * RFC 9002 §5–§6 RTT + loss detection. Mirrors the subset of
  * neqo's `recovery/mod.rs` tests that don't depend on PTO (step 7)
  * or CRYPTO/handshake-space behavior (out of scope).

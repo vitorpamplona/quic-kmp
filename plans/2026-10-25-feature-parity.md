@@ -16,7 +16,7 @@ transport features, and it could only be tested from one side of the matrix.
 |---|---|---|
 | QUIC v2 | RFC 9369 keys, labels, Retry and packet types; RFC 9368 compatible version negotiation, client and server | `packet/PacketTypes.kt`, `QuicConnection` |
 | TLS | `TLS_AES_256_GCM_SHA384` (the transcript and key schedule run on the suite's hash), P-256 key exchange beside X25519, HelloRetryRequest on the client | `tls/TlsHash.kt`, `TlsClient`, `TlsServer` |
-| Server | TLS 1.3 server (PSK, tickets, 0-RTT, HelloRetryRequest), server `QuicConnection`, `QuicServer` endpoint (VN, Retry, stateless reset, CID routing), NAT rebinding, preferred address, NEW_TOKEN, connection limit, interop server | `quic/plans/2026-10-25-server-role.md` |
+| Server | TLS 1.3 server (PSK, tickets, 0-RTT, HelloRetryRequest), server `QuicConnection`, `QuicServer` endpoint (VN, Retry, stateless reset, CID routing), NAT rebinding, preferred address, NEW_TOKEN, connection limit, interop server | `plans/2026-10-25-server-role.md` |
 | Congestion control | NewReno and CUBIC (default), pacing, persistent congestion, ECN-CE | `recovery/CongestionController.kt` |
 | Path MTU | DPLPMTUD (RFC 8899) with black-hole fallback | `PmtuDiscovery.kt` |
 | ACKs | Delayed ACKs (RFC 9000 §13.2), ACK frequency extension as receiver | `recovery/AckTracker.kt` |
@@ -94,7 +94,7 @@ Found by the sweep after adding P-256 and AES-256-GCM, server-only:
 
 ## Interop environment notes
 
-Runs here used a sandbox without kernel IPv6; `quic/interop/no-ipv6/patch-runner.sh` adapts the
+Runs here used a sandbox without kernel IPv6; `interop/no-ipv6/patch-runner.sh` adapts the
 runner. Consequences:
 
 - `ipv6` can't pass, and `connectionmigration` fails wherever the server needs an IPv6 preferred

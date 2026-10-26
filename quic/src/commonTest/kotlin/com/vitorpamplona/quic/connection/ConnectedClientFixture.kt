@@ -115,7 +115,7 @@ fun newConnectedClient(
             // key-update gates both fired off `handshakeComplete`,
             // which flips at TLS-Finished. After the
             // `handshakeConfirmed` split (driven by the keyupdate-
-            // vs-quinn bug, see `quic/plans/2026-05-08-keyupdate-vs-quinn.md`),
+            // vs-quinn bug, see `plans/2026-05-08-keyupdate-vs-quinn.md`),
             // both gates require HANDSHAKE_DONE — so the default
             // fixture now matches the production "handshake
             // confirmed" state.

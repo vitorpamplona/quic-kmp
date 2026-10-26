@@ -74,7 +74,7 @@ inline fun forEachAckedPacketNumber(
  * Drain [sentPackets] of every entry whose packet number is covered
  * by [ack]. Returns the drained packets so callers can pass their
  * tokens to congestion-control / RTT estimation layers (step 5+ of
- * `quic/plans/2026-05-04-control-frame-retransmit.md`).
+ * `plans/2026-05-04-control-frame-retransmit.md`).
  *
  * Caller must hold the connection lock.
  *

@@ -57,7 +57,7 @@ class LevelState {
      * Per-packet retention for RFC 9002 loss detection + retransmit.
      * Populated by [QuicConnectionWriter] when a packet is built;
      * drained by the ACK handler in [QuicConnectionParser] (step 3 of
-     * `quic/plans/2026-05-04-control-frame-retransmit.md`) and by
+     * `plans/2026-05-04-control-frame-retransmit.md`) and by
      * loss detection (step 5).
      *
      * Keyed by packet number. Step 2 only populates this map for

@@ -34,7 +34,7 @@ package com.vitorpamplona.quic.connection.recovery
  *
  * Mirrors Firefox neqo's `StreamRecoveryToken` enum at
  * `neqo-transport/src/recovery/token.rs:21`. Scope (per
- * `quic/plans/2026-05-04-control-frame-retransmit.md`) is the
+ * `plans/2026-05-04-control-frame-retransmit.md`) is the
  * receive-side flow-control extensions that today silently wedge the
  * connection on packet loss against moq-rs:
  *

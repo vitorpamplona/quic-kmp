@@ -2,7 +2,7 @@
 # Adapt a quic-interop-runner checkout to a host whose kernel has no IPv6
 # (/proc/sys/net/ipv6 missing), e.g. a Firecracker sandbox or a minimal CI VM.
 #
-#   quic/interop/no-ipv6/patch-runner.sh [RUNNER_DIR]
+#   interop/no-ipv6/patch-runner.sh [RUNNER_DIR]
 #
 # What it does, all idempotent:
 #   1. Strips the IPv6 subnets, addresses and host aliases from docker-compose.yml
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 RUNNER_DIR="${1:-${RUNNER_DIR:-$REPO_ROOT/../quic-interop-runner}}"
 SHIM_DIR="$RUNNER_DIR/.v6shim"
 COMPOSE="$RUNNER_DIR/docker-compose.yml"

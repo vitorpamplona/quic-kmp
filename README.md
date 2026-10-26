@@ -263,7 +263,7 @@ while (true) {
 
 `JcaCertificateSigner` loads PKCS#8, SEC1 and PKCS#1 keys for ECDSA, RSA and Ed25519
 certificates. The interop endpoint's
-[`InteropServer`](quic/interop/src/main/kotlin/com/vitorpamplona/quic/interop/runner/InteropServer.kt)
+[`InteropServer`](interop/src/main/kotlin/com/vitorpamplona/interop/runner/InteropServer.kt)
 is a complete hq-interop and HTTP/3 file server built this way.
 
 ## Configuration
@@ -287,7 +287,7 @@ long-lived connection with many streams:
 
 - **qlog.** Pass a `QlogObserver` as `qlogObserver` to get every packet, frame and recovery
   event. The interop runner's
-  [`QlogWriter`](quic/interop/src/main/kotlin/com/vitorpamplona/quic/interop/runner/QlogWriter.kt)
+  [`QlogWriter`](interop/src/main/kotlin/com/vitorpamplona/interop/runner/QlogWriter.kt)
   writes them as a `.sqlog` file that qvis opens.
 - **Wireshark.** Pass a `TlsSecretsListener` as `extraSecretsListener` and write the secrets in
   `SSLKEYLOGFILE` format to decrypt a capture.
@@ -346,31 +346,31 @@ on push):
 
 Opt-in long runs: `-PquicSoakSeconds=1800` turns on the audio-rooms soak test, and
 `./gradlew :quic:interop -PinteropHost=127.0.0.1 -PinteropPort=4433` drives a live QUIC server.
-`quic/scripts/run-picoquic.sh` starts a local picoquic to point it at.
+`scripts/run-picoquic.sh` starts a local picoquic to point it at.
 
 ## Interop matrix
 
-`quic/interop/` packages the client and server as a
+`interop/` packages the client and server as a
 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) endpoint image and runs
 it against other implementations:
 
 ```bash
-quic/interop/run-matrix.sh -s aioquic -t handshake,chacha20   # our client, aioquic's server
-quic/interop/run-matrix.sh -c quic-go -t handshake,retry      # our server, quic-go's client
+interop/run-matrix.sh -s aioquic -t handshake,chacha20   # our client, aioquic's server
+interop/run-matrix.sh -c quic-go -t handshake,retry      # our server, quic-go's client
 ```
 
 It needs Docker, and it clones the runner next to this repo on first use. Run one peer at a time:
 the runner is not safe to run concurrently. On a host whose kernel has no IPv6 (some sandboxes and
-CI VMs), `quic/interop/no-ipv6/patch-runner.sh` adapts the runner checkout; the `ipv6` testcase
+CI VMs), `interop/no-ipv6/patch-runner.sh` adapts the runner checkout; the `ipv6` testcase
 and IPv6 preferred addresses can't pass there.
 
 Results from 2026-10-26, in such a sandbox, against every implementation in the runner, both as
 client and as server: apart from `ipv6`, every testcase both sides support passes, except where
 the other implementation or the sandbox is at fault (a few loss and corruption tests fail now and
 then when a run loses every copy of a packet). The tables, and the reason for each failure, are
-in [`quic/plans/2026-10-25-feature-parity.md`](quic/plans/2026-10-25-feature-parity.md).
+in [`plans/2026-10-25-feature-parity.md`](plans/2026-10-25-feature-parity.md).
 
-Design notes behind the stack and the interop work live in `quic/plans/` and `quic/interop/plans/`.
+Design notes behind the stack and the interop work live in `plans/` and `interop/plans/`.
 
 ## Publishing
 

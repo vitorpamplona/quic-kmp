@@ -35,7 +35,7 @@ import kotlin.test.assertTrue
  * by a single connection-wide mutex. Phase 1 of the split (separate
  * `streamsLock` / `lifecycleLock` / per-level `levelLock`) targets the
  * multiplexing testcase that drove this refactor — see
- * `quic/plans/2026-05-08-lock-split-design.md`.
+ * `plans/2026-05-08-lock-split-design.md`.
  *
  * The test stands up an in-memory client (no socket I/O), opens 1000
  * client-bidi streams concurrently, enqueues a small request body + FIN

@@ -40,7 +40,7 @@ import kotlin.test.assertTrue
  * derived — well before HANDSHAKE_DONE arrives. Confirmed against
  * quinn's reference server: at ~33% of runs the interop runner's
  * `keyupdate` testcase initiated the update inside the gap and
- * tripped the violation. See `quic/plans/2026-05-08-keyupdate-vs-quinn.md`.
+ * tripped the violation. See `plans/2026-05-08-keyupdate-vs-quinn.md`.
  *
  * The fix introduces a separate [QuicConnection.handshakeConfirmed]
  * field flipped only by the parser on `HANDSHAKE_DONE` receipt;

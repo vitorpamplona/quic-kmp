@@ -7,7 +7,7 @@ real reference servers.
 
 ```bash
 # Terminal 1: run the picoquic reference server in Docker.
-quic/scripts/run-picoquic.sh -d
+scripts/run-picoquic.sh -d
 
 # Terminal 2: drive our client at it.
 ./gradlew :quic:jvmTestClasses

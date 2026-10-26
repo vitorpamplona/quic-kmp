@@ -25,7 +25,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Step 7 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 7 of `plans/2026-05-04-control-frame-retransmit.md`:
  * RFC 9002 §6.2 Probe Timeout duration calculation. Mirrors neqo's
  * PTO tests (`pto_works_basic`, `pto_state_count`, etc.) at the
  * algorithm level — the driver-loop integration is exercised by

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-testcase deep-dive diagnostic. Use after running any single
 # testcase that failed:
-#   ./quic/interop/inspect-testcase.sh longrtt
+#   ./interop/inspect-testcase.sh longrtt
 #
 # Auto-finds the most recent run dir that has the named testcase and
 # reports the runner status line + qlog summary + frame histograms
@@ -15,7 +15,7 @@ if [[ -z "$TC" ]]; then
     exit 2
 fi
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNNER_LOGS="${REPO_ROOT}/../quic-interop-runner/logs"
 
 # Most recent run dir that has the named testcase.
@@ -88,7 +88,7 @@ if [[ "$found" -eq 0 ]]; then
     echo "  - The container was killed mid-test before flushing stderr"
     echo "  - This testcase ran in a matrix and only the FIRST testcase's"
     echo "    traces were captured. Run this single testcase in isolation:"
-    echo "    DEBUG=1 ./quic/interop/run-matrix.sh -s <peer> -t $TC"
+    echo "    DEBUG=1 ./interop/run-matrix.sh -s <peer> -t $TC"
 fi
 
 echo

@@ -32,7 +32,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Step 8 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+ * Step 8 of `plans/2026-05-04-control-frame-retransmit.md`:
  * end-to-end exercise of the retransmit pipeline. Drives the full
  * chain (writer → SentPacket → loss detection → dispatch → drain)
  * by simulating packet loss directly on QuicConnection state, since

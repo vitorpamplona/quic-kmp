@@ -629,7 +629,7 @@ class PathValidator(
      * packet carries both the RETIRE frame AND the now-retired
      * CID as its destination — quic-go / picoquic / msquic /
      * mvfst correctly read that as PROTOCOL_VIOLATION (see
-     * `quic/plans/2026-05-08-rebind-port-bug.md`).
+     * `plans/2026-05-08-rebind-port-bug.md`).
      *
      * So on timeout we have two cases:
      *

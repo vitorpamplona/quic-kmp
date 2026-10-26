@@ -5,8 +5,8 @@
 # qlog traces and accepts a wide range of transport parameters.
 #
 # Usage:
-#   quic/scripts/run-picoquic.sh                  # foreground, ^C to stop
-#   quic/scripts/run-picoquic.sh -d               # detached
+#   scripts/run-picoquic.sh                  # foreground, ^C to stop
+#   scripts/run-picoquic.sh -d               # detached
 #
 # Then in another terminal, drive our client:
 #   ./gradlew :quic:jvmTest --tests '*InteropRunner*' \

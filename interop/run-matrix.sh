@@ -6,10 +6,10 @@
 # image, then invokes run.py with the user's args.
 #
 # Usage:
-#   quic/interop/run-matrix.sh                                      # full matrix vs aioquic
-#   quic/interop/run-matrix.sh -s aioquic -t handshake              # one test
-#   quic/interop/run-matrix.sh -s quic-go -t handshake,chacha20     # different peer
-#   quic/interop/run-matrix.sh -c quic-go -t handshake,retry        # our server, their client
+#   interop/run-matrix.sh                                      # full matrix vs aioquic
+#   interop/run-matrix.sh -s aioquic -t handshake              # one test
+#   interop/run-matrix.sh -s quic-go -t handshake,chacha20     # different peer
+#   interop/run-matrix.sh -c quic-go -t handshake,retry        # our server, their client
 #
 # `amethyst` is registered as both client and server, and run.py only runs
 # pairs that include it (-i), so `-s <peer>` tests our client against that
@@ -25,7 +25,7 @@
 #   so parallel invocations collide).
 #
 #   for peer in aioquic picoquic quic-go quinn; do
-#       quic/interop/run-matrix.sh -s $peer
+#       interop/run-matrix.sh -s $peer
 #   done
 #
 # Env overrides:
@@ -35,7 +35,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 RUNNER_DIR="${RUNNER_DIR:-$REPO_ROOT/../quic-interop-runner}"
 LOG_DIR="${LOG_DIR:-$RUNNER_DIR/logs}"
 
@@ -166,7 +166,7 @@ fi
 # COMPOSE_PROJECT_NAME. Two simultaneous invocations collide on
 # `docker create container "sim"`. Run sequentially:
 #   for peer in aioquic picoquic quic-go quinn; do
-#       quic/interop/run-matrix.sh -s $peer -t handshake,chacha20,...
+#       interop/run-matrix.sh -s $peer -t handshake,chacha20,...
 #   done
 #
 # Output filter: by default we drop the runner / container boilerplate

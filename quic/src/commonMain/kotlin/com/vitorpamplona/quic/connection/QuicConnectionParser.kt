@@ -809,7 +809,7 @@ private fun dispatchFrames(
                 // packet that carried our outbound ACK frame, we
                 // know the peer received our ACK and we can drop
                 // the corresponding inbound PNs from the tracker.
-                // Step 5 of `quic/plans/2026-05-04-control-frame-retransmit.md`:
+                // Step 5 of `plans/2026-05-04-control-frame-retransmit.md`:
                 // (a) snapshot the send time of the largest-acked PN
                 // BEFORE drain so we can update RTT, (b) drain ACK'd
                 // packets, (c) if the ACK advanced largestAckedPn AND
