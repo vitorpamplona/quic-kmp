@@ -896,6 +896,10 @@ private fun dispatchFrames(
                     )
                     return
                 }
+                // Server: the ClientHello again from the start, all of it already read.
+                if (level == EncryptionLevel.INITIAL && frame.offset == 0L && frameEnd <= state.cryptoReceive.readOffset) {
+                    conn.onRepeatedClientHelloLocked()
+                }
                 state.cryptoReceive.insert(frame.offset, frame.data)
                 val contiguous = state.cryptoReceive.readContiguous()
                 if (contiguous.isNotEmpty()) {

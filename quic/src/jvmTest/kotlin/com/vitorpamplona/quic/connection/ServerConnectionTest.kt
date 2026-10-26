@@ -284,4 +284,28 @@ class ServerConnectionTest {
         while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
         assertNotNull(server.handshake.largestAckedPn, "the client's probe acknowledged the server's Handshake packet")
     }
+
+    @Test
+    fun `a ClientHello sent again after our flight was acknowledged gets the whole flight again`() {
+        // picoquic in the v2 test: switched to v2 by our first Initial, it
+        // ACKed that packet but started its handshake over, sending its
+        // ClientHello again; with our ServerHello ACKed, we only ACKed back.
+        val client = client()
+        client.start()
+        val server = serverFor(client)
+        while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+        // Our flight goes out and is lost, but the client ACKs the Initial (picoquic's ACK of what it dropped).
+        while (true) drainOutbound(server, now) ?: break
+        server.initial.cryptoSend.markAcked(0L, server.initial.cryptoSend.nextOffset)
+        server.initial.clearSentPackets()
+        assertNull(drainOutbound(server, now), "nothing left to send")
+
+        // The ClientHello again, from offset 0, in a new packet.
+        now += 300
+        client.requeueAllInflightCrypto(EncryptionLevel.INITIAL)
+        while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+        pump(client, server)
+        assertTrue(client.handshakeConfirmed, "the resent flight completed the handshake")
+        assertTrue(server.handshakeConfirmed)
+    }
 }

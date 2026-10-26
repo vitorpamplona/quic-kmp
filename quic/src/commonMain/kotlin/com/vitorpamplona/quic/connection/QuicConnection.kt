@@ -361,6 +361,20 @@ class QuicConnection internal constructor(
     }
 
     /**
+     * Server: the client sent its ClientHello again from the start, after
+     * we answered it. It didn't take our flight in: picoquic, switched to
+     * a compatible version by our first Initial, starts its handshake over
+     * in that version and ignores what that packet carried, though it ACKs
+     * it. Send the whole flight again, as ngtcp2's server does.
+     */
+    internal fun onRepeatedClientHelloLocked() {
+        if (!isServer || handshakeConfirmed || initial.keysDiscarded || handshake.sendProtection == null) return
+        QuicLog.d(TAG) { "ClientHello repeated; sending our handshake flight again" }
+        initial.cryptoSend.resendAllSent()
+        if (!handshake.keysDiscarded) handshake.cryptoSend.requeueAllInflight()
+    }
+
+    /**
      * Server, before the handshake is confirmed: an Initial or Handshake packet
      * with the highest packet number came from a new address, e.g. a NAT
      * rebound while the handshake was still going. There's no migration yet
@@ -1887,6 +1901,8 @@ class QuicConnection internal constructor(
         val (send, receive) = initialProtections(initialKeysDcid, initialVersion)
         initial.sendProtection = send
         initial.receiveProtection = receive
+        // A server keeps its Initial flight to send it all again (onRepeatedClientHelloLocked).
+        initial.cryptoSend.retainAcked = isServer
 
         // Resumption + 0-RTT: pre-load flow-control limits from the
         // remembered transport parameters so streams opened BEFORE the

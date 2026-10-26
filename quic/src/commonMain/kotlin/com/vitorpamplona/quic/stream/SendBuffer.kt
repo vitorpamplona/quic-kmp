@@ -174,6 +174,13 @@ class SendBuffer(
     @Volatile
     private var _finAcked: Boolean = false
 
+    /**
+     * Keep ACK'd bytes instead of releasing them, so [resendAllSent] can
+     * send them again. Only for a few hundred bytes of handshake data: the
+     * server's Initial flight.
+     */
+    internal var retainAcked: Boolean = false
+
     val nextOffset: Long get() = _nextOffset
     val finPending: Boolean get() = _finPending
     val finSent: Boolean get() = _finSent
@@ -433,6 +440,18 @@ class SendBuffer(
         }
     }
 
+    /** Everything sent so far goes out again, ACK'd or not (needs [retainAcked]). */
+    internal fun resendAllSent() {
+        synchronized(lock) {
+            check(retainAcked) { "resendAllSent needs retainAcked" }
+            if (nextSendOffset == 0L) return
+            inFlight.clear()
+            retransmit.clear()
+            retransmit.addLast(Range(0L, nextSendOffset, false))
+            retransmitTotalBytes = nextSendOffset
+        }
+    }
+
     /**
      * Disposition for a range that overlapped a [markAcked] / [markLost]
      * range. ACK drops the range and latches `_finAcked` if the FIN
@@ -646,6 +665,7 @@ class SendBuffer(
      * amount.
      */
     private fun advanceFlushedFloorIfPossible() {
+        if (retainAcked) return
         val lowestInFlight = inFlight.firstOrNull()?.offset ?: _nextOffset
         val lowestRetransmit = retransmit.minOfOrNull { it.offset } ?: _nextOffset
         val lowest = minOf(lowestInFlight, lowestRetransmit, nextSendOffset)
