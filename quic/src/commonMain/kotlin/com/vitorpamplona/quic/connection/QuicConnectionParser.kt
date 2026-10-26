@@ -474,7 +474,7 @@ private fun feedEarlyShortHeaderPackets(
 }
 
 /** How many 1-RTT packets a server keeps while its handshake completes. */
-private const val MAX_EARLY_SHORT_HEADER_PACKETS = 8
+private const val MAX_EARLY_SHORT_HEADER_PACKETS = 32
 
 private fun feedShortHeaderPacket(
     conn: QuicConnection,

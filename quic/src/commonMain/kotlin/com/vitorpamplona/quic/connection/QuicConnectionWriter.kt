@@ -688,10 +688,13 @@ private fun collectHandshakeLevelFrames(
     if (state.sendProtection == null) return null
     val frames = mutableListOf<Frame>()
     val tokens = mutableListOf<RecoveryToken>()
+    // A server whose handshake isn't complete probes here too, not with a
+    // 1-RTT PING: the client's 1-RTT ACKs of those can't be read yet, and
+    // they filled the buffer that keeps the client's early request (lsquic).
     val probeHere =
         conn.pendingPing &&
             allowance == SendAllowance.FULL &&
-            conn.application.sendProtection == null &&
+            (conn.application.sendProtection == null || conn.isServer && !conn.handshakeComplete) &&
             level == highestPreApplicationLevel(conn)
     state.ackTracker.buildAckFrame(nowMillis, conn.config.ackDelayExponent.toInt())?.let {
         frames += it
@@ -970,7 +973,7 @@ private fun buildApplicationPacket(
     // through loss detection (steps 5–6) and surfaces any
     // outstanding losses for retransmit. The PING itself is not
     // retransmitted on loss (RFC 9002 §A.9 PROBE_TIMEOUT skipped).
-    if (conn.pendingPing && allowance == SendAllowance.FULL) {
+    if (conn.pendingPing && allowance == SendAllowance.FULL && !(conn.isServer && !conn.handshakeComplete)) {
         frames += PingFrame
         conn.pendingPing = false
     }

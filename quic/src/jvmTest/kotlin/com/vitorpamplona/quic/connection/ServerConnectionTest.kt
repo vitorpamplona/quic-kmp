@@ -358,4 +358,28 @@ class ServerConnectionTest {
             while (true) feedDatagram(client, drainOutbound(server, now) ?: break, now)
             assertTrue(client.handshakeConfirmed, "the probe carried HANDSHAKE_DONE")
         }
+
+    @Test
+    fun `a server probes in the Handshake space until its handshake completes`() =
+        runBlocking {
+            // A 1-RTT PING before then gets 1-RTT ACKs back that can't be read
+            // yet, and lsquic's filled the buffer that keeps its early request.
+            val client = client()
+            client.start()
+            val server = serverFor(client)
+            while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+            while (true) feedDatagram(client, drainOutbound(server, now) ?: break, now)
+            // The client's Finished and ACKs are lost.
+            while (true) drainOutbound(client, now) ?: break
+            assertTrue(!server.handshakeComplete)
+
+            now += 1_000
+            handlePtoFired(server)
+            val probe = assertNotNull(drainOutbound(server, now))
+            var offset = 0
+            while (offset < probe.size) {
+                assertTrue(probe[offset].toInt() and 0x80 != 0, "only long-header packets, no 1-RTT one at $offset")
+                offset += assertNotNull(com.vitorpamplona.quic.packet.LongHeaderPacket.peekHeader(probe, offset)).totalLength
+            }
+        }
 }
