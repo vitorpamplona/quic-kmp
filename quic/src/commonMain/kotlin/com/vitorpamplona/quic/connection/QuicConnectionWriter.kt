@@ -339,6 +339,7 @@ private fun buildPmtuProbe(
             hpMask = proto.hpMask,
         )
     state.recordSent(SentPacket(pn, nowMillis, ackEliciting = true, sizeBytes = built.size, tokens = emptyList(), mtuProbeSize = size))
+    conn.ptoReferenceMs = nowMillis
     conn.pmtud.onProbeSent(size)
     conn.aeadEncryptCount += 1L
     conn.noteAckElicitingSent(nowMillis)
@@ -857,7 +858,10 @@ private fun buildLongHeaderFromFrames(
     // RFC 9000 §10.1.1: an ack-eliciting outbound packet resets the
     // idle timer. (Non-ack-eliciting packets — pure ACK or PADDING-only
     // — do NOT reset.)
-    if (ackEliciting) conn.noteAckElicitingSent(nowMillis)
+    if (ackEliciting) {
+        conn.noteAckElicitingSent(nowMillis)
+        conn.ptoReferenceMs = nowMillis
+    }
     emitQlogSent(conn, level, pn, packet.size, frames)
     return packet
 }
@@ -1084,8 +1088,8 @@ private fun buildApplicationPacket(
         // hand back the same N elements. Quick `any` scan first; only
         // pay for the filter list when at least one stream is closed.
         val active =
-            if (streamsView.any { it.sendDrained }) {
-                streamsView.filter { !it.sendDrained }
+            if (streamsView.any { !it.sendsStreamData }) {
+                streamsView.filter { it.sendsStreamData }
             } else {
                 streamsView
             }
@@ -1201,7 +1205,7 @@ private fun buildApplicationPacket(
         val streamFrameCount = frames.count { it is StreamFrame }
         val totalFrames = frames.size
         val streamsViewSize = conn.streamsListLocked().size
-        val activeSize = conn.streamsListLocked().count { !it.sendDrained }
+        val activeSize = conn.streamsListLocked().count { it.sendsStreamData }
         QuicLog.d("QuicWriter") {
             "[writer.app] frames=$totalFrames stream_frames=$streamFrameCount " +
                 "streamsView=$streamsViewSize active=$activeSize " +
@@ -1282,6 +1286,7 @@ private fun buildApplicationPacket(
     // — do NOT reset.)
     if (ackEliciting) conn.noteAckElicitingSent(nowMillis)
     if (use1Rtt) conn.lastAppPacketAckOnly = !ackEliciting
+    if (ackEliciting || use1Rtt) conn.ptoReferenceMs = nowMillis
     // RFC 9001 §6.6 / §B.1 confidentiality limit. Track per-key
     // encryption count for the active 1-RTT send key. At half the
     // AEAD's confidentiality limit we soft-trigger a key update; at

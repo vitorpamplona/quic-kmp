@@ -245,11 +245,7 @@ class QuicConnectionDriver(
             }
 
             PathProbe.State.VALIDATED -> {
-                val socket = probeSocket ?: return
-                retiredSockets += activeSocket
-                activeSocket = socket
-                probeSocket = null
-                connection.activePathIsIpv6 = runCatching { socket.remoteIsIpv6 }.getOrDefault(false)
+                connection.streamsLock.withLock { adoptValidatedProbeSocketLocked() }
             }
 
             PathProbe.State.FAILED -> {
@@ -259,6 +255,21 @@ class QuicConnectionDriver(
                 }
             }
         }
+    }
+
+    /**
+     * Once the probe validated, make its socket the one we send on. Called
+     * under [QuicConnection.streamsLock] right before each datagram is built,
+     * so a packet built after validation (the new connection ID, PATH_RESPONSEs
+     * owed on the new path) never goes out on the old socket.
+     */
+    private fun adoptValidatedProbeSocketLocked() {
+        if (connection.pathProbe?.state != PathProbe.State.VALIDATED) return
+        val socket = probeSocket ?: return
+        retiredSockets += activeSocket
+        activeSocket = socket
+        probeSocket = null
+        connection.activePathIsIpv6 = runCatching { socket.remoteIsIpv6 }.getOrDefault(false)
     }
 
     private suspend fun sendLoop() {
@@ -318,11 +329,14 @@ class QuicConnectionDriver(
             // socket.send() so a slow socket doesn't stall app
             // coroutines (open/close streams, queue datagrams).
             while (true) {
+                var socket = activeSocket
                 val out =
                     connection.streamsLock.withLock {
+                        adoptValidatedProbeSocketLocked()
+                        socket = activeSocket
                         drainOutbound(connection, nowMillis())
                     } ?: break
-                activeSocket.send(out)
+                socket.send(out)
                 // RFC 9002 §6.2.4 probe budget: when the PTO timer
                 // fired we set `pendingProbePackets = 2`; consume one
                 // slot per probe-bearing datagram. If budget remains,
@@ -371,29 +385,11 @@ class QuicConnectionDriver(
             // when no level has send keys), zero it out so the next
             // wakeup-driven drain doesn't accidentally re-requeue.
             connection.pendingProbePackets = 0
-            // Use the loss-detection's PTO calculation in BOTH the pre- and
-            // post-first-RTT-sample regimes. Pre-sample, smoothed_rtt =
-            // INITIAL_RTT_MS so ptoBaseMs returns
-            // INITIAL_RTT_MS * 3 + max_ack_delay (~300 ms with the 100 ms
-            // initial). max_ack_delay only applies to APPLICATION space per
-            // RFC 9002 §6.2.1; pre-handshake we pass 0. Earlier shape
-            // hardcoded 1000 ms here as a "handshake-timeout safety floor"
-            // — the cost was four PTO retransmits in ~30 s of loss
-            // recovery instead of the eight that 300 ms initial gives,
-            // pinching multiconnect handshake-loss tests at the tail.
-            val maxAckDelayMs =
-                if (connection.application.sendProtection != null) {
-                    connection.peerTransportParameters?.maxAckDelay ?: 0L
-                } else {
-                    0L
-                }
-            val ptoBaseMs =
-                connection.lossDetection
-                    .ptoBaseMs(maxAckDelayMs)
-                    .coerceAtLeast(1L)
-            val backoff = (1L shl connection.consecutivePtoCount.coerceAtMost(6))
+            // RFC 9002 §6.2.1: the PTO period counts from the latest
+            // ack-eliciting send (QuicConnection.ptoDelayMillis), not from
+            // this wakeup, so wakeups that send nothing don't postpone it.
             val ptoArmed = connection.ptoArmed()
-            val ptoMillis = if (ptoArmed) (ptoBaseMs * backoff).coerceAtMost(60_000L) else Long.MAX_VALUE
+            val ptoMillis = connection.ptoDelayMillis(nowMillis())
             // RFC 9002 §6.1.2 timer-driven loss detection: take the
             // earliest of (PTO deadline, next-loss-time across levels).
             // Without this, tail loss waits for the PTO instead of the
@@ -718,6 +714,12 @@ internal suspend fun handlePtoFired(conn: QuicConnection) {
     // constant's natural reading: "after N consecutive PTOs with no
     // progress, trigger migration on the Nth PTO firing".
     conn.consecutivePtoCount = (conn.consecutivePtoCount + 1).coerceAtMost(6)
+    // The next period counts from now even if no probe can go out (an
+    // amplification limit), so the loop doesn't spin on an expired deadline.
+    conn.ptoReferenceMs = conn.nowMillis()
+    // Nothing in flight (the quiet after an ACK-only packet): one PING is
+    // enough, not the usual two probes.
+    val nothingInFlight = conn.initial.bytesInFlight == 0L && conn.handshake.bytesInFlight == 0L && conn.application.bytesInFlight == 0L
     // Repeated PTOs after growing the packet size: suspect a PMTU black hole.
     if (conn.consecutivePtoCount >= PMTU_BLACK_HOLE_PTO_COUNT) conn.pmtud.onBlackHoleSuspected(conn.nowMillis())
     conn.pendingPing = true
@@ -729,7 +731,7 @@ internal suspend fun handlePtoFired(conn: QuicConnection) {
     // a concurrent reader of the field doesn't see "budget set,
     // nothing requeued yet" — the requeue is what makes the budget
     // meaningful.
-    conn.pendingProbePackets = 2
+    conn.pendingProbePackets = if (nothingInFlight) 1 else 2
 }
 
 /**
@@ -778,8 +780,8 @@ internal suspend fun requeueInflightForProbe(conn: QuicConnection) {
         // ngtcp2's client probes only with Handshake packets, which a
         // server that has dropped its Handshake keys can't read, and never
         // resends its request.
-        if (conn.isServer && conn.handshakeConfirmed && !conn.handshakeDoneAcked) conn.pendingHandshakeDone = true
         conn.streamsLock.withLock {
+            if (conn.isServer && conn.handshakeConfirmed && !conn.handshakeDoneAcked) conn.pendingHandshakeDone = true
             conn.requeueAllInflightStreamData()
             conn.requeueAllInflightCrypto(EncryptionLevel.APPLICATION)
             // RFC 9000 §9 client-initiated path validation. After

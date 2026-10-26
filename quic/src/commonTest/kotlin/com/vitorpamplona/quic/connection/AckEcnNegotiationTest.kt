@@ -29,6 +29,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Our 1-RTT ACKs carry (always zero) ECN counts only once the peer's ACKs
@@ -64,6 +65,39 @@ class AckEcnNegotiationTest {
         feedDatagram(client, pipe.buildServerApplicationDatagram(listOf(peerAck))!!, nowMillis = 0L)
 
         assertNotNull(ackForTwoPings(client, pipe).ecnCounts)
+    }
+
+    @Test
+    fun `a rising CE count shrinks the window`() {
+        val (client, _) = newConnectedClient()
+        val before = client.congestion.congestionWindow
+        client.onPeerEcnCountsLocked(AckEcnCounts(ect0 = 1L, ect1 = 0L, ce = 1L), true, 10L, 1L, 2L)
+        assertTrue(client.congestion.congestionWindow < before)
+        assertEquals(false, client.ecnValidationFailed)
+    }
+
+    @Test
+    fun `an ACK that does not raise the largest acknowledged is not read for ECN`() {
+        val (client, _) = newConnectedClient()
+        val before = client.congestion.congestionWindow
+        client.onPeerEcnCountsLocked(AckEcnCounts(ect0 = 1L, ect1 = 0L, ce = 1L), false, 10L, 1L, 2L)
+        assertEquals(before, client.congestion.congestionWindow)
+    }
+
+    @Test
+    fun `counts that cannot be right turn ECN off`() {
+        for (bad in listOf(AckEcnCounts(0L, 1L, 1L), AckEcnCounts(9L, 0L, 2L))) {
+            val (client, _) = newConnectedClient()
+            val before = client.congestion.congestionWindow
+            client.onPeerEcnCountsLocked(bad, true, 10L, 1L, 2L)
+            assertTrue(client.ecnValidationFailed, "$bad")
+            client.onPeerEcnCountsLocked(AckEcnCounts(1L, 0L, 3L), true, 10L, 1L, 2L)
+            assertEquals(before, client.congestion.congestionWindow, "no congestion signal after a failed validation")
+        }
+        val (client, _) = newConnectedClient()
+        client.onPeerEcnCountsLocked(AckEcnCounts(5L, 0L, 0L), true, 10L, 1L, 2L)
+        client.onPeerEcnCountsLocked(AckEcnCounts(4L, 0L, 0L), true, 10L, 1L, 2L)
+        assertTrue(client.ecnValidationFailed, "a count went down")
     }
 
     @Test

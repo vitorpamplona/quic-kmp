@@ -200,12 +200,16 @@ private suspend fun warmUp(
                         )
                     val driver = QuicConnectionDriver(conn, UdpSocket.connect("127.0.0.1", socket.localPort), scope)
                     driver.start()
-                    conn.awaitHandshakeConfirmed()
-                    val stream = conn.openBidiStream()
-                    stream.send.enqueue("warm".encodeToByteArray())
-                    stream.send.finish()
-                    readAll(stream)
-                    driver.close()
+                    try {
+                        conn.awaitHandshakeConfirmed()
+                        val stream = conn.openBidiStream()
+                        stream.send.enqueue("warm".encodeToByteArray())
+                        stream.send.finish()
+                        readAll(stream)
+                    } finally {
+                        // A timed-out warm-up must not leave the client running.
+                        driver.close()
+                    }
                 } finally {
                     server.close()
                 }

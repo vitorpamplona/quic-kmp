@@ -84,7 +84,7 @@ class AesEcbHeaderProtection(
         sample: ByteArray,
     ): ByteArray {
         require(sample.size == 16) { "AES sample must be 16 bytes" }
-        require(hpKey.size in setOf(16, 24, 32)) { "AES-ECB key must be 16/24/32 bytes" }
+        require(hpKey.size == 16 || hpKey.size == 24 || hpKey.size == 32) { "AES-ECB key must be 16/24/32 bytes" }
         val out = aesEncryptOneBlock.encrypt(hpKey, sample)
         return out.copyOfRange(0, 5)
     }
@@ -103,7 +103,7 @@ class AesEcbHeaderProtection(
         dstMask: ByteArray,
     ): ByteArray {
         require(srcOffset >= 0 && srcOffset + 16 <= src.size) { "HP sample window out of range" }
-        require(hpKey.size in setOf(16, 24, 32)) { "AES-ECB key must be 16/24/32 bytes" }
+        require(hpKey.size == 16 || hpKey.size == 24 || hpKey.size == 32) { "AES-ECB key must be 16/24/32 bytes" }
         require(scratch16.size == 16) { "AES scratch must be 16 bytes" }
         require(dstMask.size >= 5) { "HP mask buffer must be at least 5 bytes" }
         aesEncryptOneBlock.encryptInto(hpKey, src, srcOffset, scratch16, 0)

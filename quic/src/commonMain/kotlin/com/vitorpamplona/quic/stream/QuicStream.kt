@@ -222,6 +222,14 @@ class QuicStream(
         get() = send.finSent && !send.hasRetransmit
 
     /**
+     * Whether the writer may still put STREAM frames for this stream on the
+     * wire: not once drained, and never after RESET_STREAM (RFC 9000 §3.3),
+     * whose final size later bytes would exceed.
+     */
+    internal val sendsStreamData: Boolean
+        get() = !sendDrained && resetState.load() == null
+
+    /**
      * True once both directions are *fully* settled and the stream may be
      * removed from the connection's tracking lists (see
      * `QuicConnection.retireFullyDoneStreamsLocked`). This is strictly

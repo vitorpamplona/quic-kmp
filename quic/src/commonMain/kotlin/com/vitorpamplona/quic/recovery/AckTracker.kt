@@ -181,6 +181,15 @@ class AckTracker {
 
     fun isEmpty(): Boolean = ranges.isEmpty()
 
+    /** Whether [packetNumber] lies in a range still tracked (older ranges get purged or trimmed). */
+    fun hasReceived(packetNumber: Long): Boolean {
+        for (r in ranges) {
+            if (packetNumber > r.endInclusive) return false
+            if (packetNumber >= r.start) return true
+        }
+        return false
+    }
+
     fun largestReceived(): Long = if (ranges.isEmpty()) -1L else ranges[0].endInclusive
 
     /**

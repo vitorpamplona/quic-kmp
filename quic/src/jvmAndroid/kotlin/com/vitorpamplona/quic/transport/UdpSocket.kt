@@ -116,6 +116,11 @@ actual class UdpSocket private constructor(
             val buf = ByteBuffer.wrap(payload)
             try {
                 channel.send(buf, remote)
+            } catch (_: java.net.PortUnreachableException) {
+                // A connected socket reports an earlier ICMP port unreachable on
+                // whichever call comes next, a send included. Like receive(), treat
+                // it as a lost datagram: a forged ICMP must not end the connection.
+                0
             } catch (e: java.io.IOException) {
                 // EMSGSIZE: the datagram is larger than the path MTU the kernel
                 // knows (a PMTU probe, or the path shrank). Drop it like the

@@ -398,6 +398,8 @@ class PathValidator(
         if (effectiveRetirePriorTo > retirePriorToWatermark) {
             retirePriorToWatermark = effectiveRetirePriorTo
             for (seq in unusedCids.keys.filter { it < retirePriorToWatermark }) queueRetireSequence(seq)
+            // The watermark check below now answers for these.
+            consumedSequences.removeAll { it < retirePriorToWatermark && it != activeCidSequence }
         }
 
         // Stale offer: the peer is pushing a sequence number we've

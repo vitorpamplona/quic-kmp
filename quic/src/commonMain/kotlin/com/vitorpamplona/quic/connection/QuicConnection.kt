@@ -252,8 +252,10 @@ class QuicConnection internal constructor(
     internal class EarlyShortHeaderPacket(
         val bytes: ByteArray,
         val path: NetworkPath,
-        val serverPath: ServerPath?,
     )
+
+    /** Bytes held in [earlyShortHeaderPackets]. */
+    internal var earlyShortHeaderBytes: Int = 0
 
     /** Server: the client moved; we're validating its new path (RFC 9000 §9.3). */
     internal class PeerMigration(
@@ -293,25 +295,38 @@ class QuicConnection internal constructor(
      */
     internal val serverPathChallenges = HashMap<ServerPath, ByteArray>()
 
-    /** Server: paths whose challenge was answered; a client moving to one is followed at once. */
-    internal val validatedServerPaths = HashSet<ServerPath>()
+    /**
+     * Server: paths whose challenge was answered, with when; a client moving
+     * to one within [RECENTLY_VALIDATED_MS] is followed at once (RFC 9000
+     * §9.3 skips validation only for an address seen recently).
+     */
+    internal val validatedServerPaths = HashMap<ServerPath, Long>()
+
+    private fun recentlyValidated(
+        path: ServerPath,
+        nowMillis: Long,
+    ): Boolean = validatedServerPaths[path]?.let { nowMillis - it <= RECENTLY_VALIDATED_MS } == true
 
     /** Server: the PATH_CHALLENGE to send with a probe response on [path], or null for none. */
     internal fun serverPathChallengeFor(path: ServerPath): ByteArray? {
-        if (path == sendPath || path in validatedServerPaths) return null
+        if (path == sendPath || recentlyValidated(path, nowMillis())) return null
         serverPathChallenges[path]?.let { return it }
-        if (serverPathChallenges.size >= MAX_PENDING_PATH_RESPONSES) return null
+        // Unanswered probes (a client churning NAT ports) start over rather than turn this off for good.
+        if (serverPathChallenges.size >= MAX_PENDING_PATH_RESPONSES) serverPathChallenges.clear()
         return com.vitorpamplona.crypto.random.RandomInstance
             .bytes(8)
             .also { serverPathChallenges[path] = it }
     }
 
     /** Server: a PATH_RESPONSE answering one of [serverPathChallenges]; true when it did. */
-    internal fun onServerPathResponseLocked(data: ByteArray): Boolean {
+    internal fun onServerPathResponseLocked(
+        data: ByteArray,
+        nowMillis: Long,
+    ): Boolean {
         val path = serverPathChallenges.entries.firstOrNull { it.value.contentEquals(data) }?.key ?: return false
         serverPathChallenges.remove(path)
         if (validatedServerPaths.size >= MAX_PENDING_PATH_RESPONSES) validatedServerPaths.clear()
-        validatedServerPaths += path
+        validatedServerPaths[path] = nowMillis
         return true
     }
 
@@ -346,7 +361,7 @@ class QuicConnection internal constructor(
             }
         if (probing) return
         peerPath = src
-        if (src in validatedServerPaths) {
+        if (recentlyValidated(src, nowMillis)) {
             // Its PATH_CHALLENGE was answered while the client probed it.
             peerMigration = null
             sendPath = src
@@ -382,6 +397,7 @@ class QuicConnection internal constructor(
      * it. Send the whole flight again, as ngtcp2's server does.
      */
     internal fun onRepeatedClientHelloLocked() {
+        // Packet-number duplicates (a replayed copy) are dropped before this.
         if (!isServer || handshakeConfirmed || initial.keysDiscarded || handshake.sendProtection == null) return
         QuicLog.d(TAG) { "ClientHello repeated; sending our handshake flight again" }
         initial.cryptoSend.resendAllSent()
@@ -402,12 +418,23 @@ class QuicConnection internal constructor(
         level: EncryptionLevel,
         largestReceived: Boolean,
     ) {
+        // 0-RTT can't move the server: a copy can be replayed from anywhere.
+        if (level == EncryptionLevel.APPLICATION) return
         val src = datagramPath ?: return
         if (handshakeConfirmed || !largestReceived || src == peerPath) return
+        // Only the client's address changes here; our preferred address isn't in use yet (§9.6).
+        if (src.local != peerPath?.local) return
         QuicLog.d(TAG) { "peer address changed during the handshake: $peerPath -> $src" }
         peerPath = src
         sendPath = src
-        if (level == EncryptionLevel.INITIAL) addressValidated = false
+        if (level == EncryptionLevel.INITIAL) {
+            // Anyone who saw the first Initial can forge one, so it proves
+            // nothing about the address: the amplification limit starts over,
+            // funded only by what arrives from there (RFC 9000 §8.1).
+            addressValidated = false
+            amplificationBytesReceived = lastDatagramSize.toLong()
+            amplificationBytesSent = 0L
+        }
         // What we sent so far went to the old address and is most likely
         // lost: send it again now rather than wait out a backed-off PTO.
         for (l in listOf(initial, handshake)) {
@@ -1252,6 +1279,16 @@ class QuicConnection internal constructor(
     /** Largest ECN-CE count the peer has reported in a 1-RTT ACK (RFC 9000 §13.4.2). */
     internal var peerReportedEcnCe: Long = 0L
 
+    /** Largest ECT(0) count the peer has reported in a 1-RTT ACK. */
+    private var peerReportedEcnEct0: Long = 0L
+
+    /**
+     * RFC 9000 §13.4.2.1: the peer's ECN counts failed validation, so they
+     * are no longer a congestion signal.
+     */
+    internal var ecnValidationFailed: Boolean = false
+        private set
+
     /** RFC 9002 §2: bytes in flight across all packet-number spaces. */
     fun bytesInFlight(): Long = initial.bytesInFlight + handshake.bytesInFlight + application.bytesInFlight
 
@@ -1338,14 +1375,33 @@ class QuicConnection internal constructor(
     /**
      * RFC 9002 §7.1 / §B.7: a rising ECN-CE count in a 1-RTT ACK is a
      * congestion signal about the packet that ACK's largest number names.
+     *
+     * Only an ACK that raises the largest acknowledged number is looked at,
+     * since reordered ACKs carry older counts (RFC 9000 §13.4.2.1). Counts
+     * that can't be right end ECN for the connection: we mark only ECT(0),
+     * so ECT(1) is a path or peer re-marking, a count may never go down, and
+     * no count may exceed the 1-RTT packets we have sent.
      */
     internal fun onPeerEcnCountsLocked(
-        ceCount: Long,
+        counts: com.vitorpamplona.quic.frame.AckEcnCounts,
+        advancesLargestAcked: Boolean,
+        packetsSent: Long,
         largestAckedSentAtMillis: Long?,
         nowMillis: Long,
     ) {
-        if (ceCount <= peerReportedEcnCe) return
-        peerReportedEcnCe = ceCount
+        if (ecnValidationFailed || !advancesLargestAcked) return
+        if (counts.ect1 != 0L ||
+            counts.ect0 < peerReportedEcnEct0 ||
+            counts.ce < peerReportedEcnCe ||
+            counts.ect0 > packetsSent - counts.ce
+        ) {
+            ecnValidationFailed = true
+            QuicLog.d(TAG) { "ECN validation failed: ect0=${counts.ect0} ect1=${counts.ect1} ce=${counts.ce} sent=$packetsSent" }
+            return
+        }
+        peerReportedEcnEct0 = counts.ect0
+        if (counts.ce <= peerReportedEcnCe) return
+        peerReportedEcnCe = counts.ce
         if (largestAckedSentAtMillis != null) congestion.onCongestionEvent(largestAckedSentAtMillis, nowMillis)
     }
 
@@ -1392,7 +1448,11 @@ class QuicConnection internal constructor(
     /** Bytes sent to the peer while [addressValidated] was false. */
     internal var amplificationBytesSent: Long = 0L
 
+    /** Size of the datagram being parsed. */
+    internal var lastDatagramSize: Int = 0
+
     internal fun onDatagramReceived(size: Int) {
+        lastDatagramSize = size
         if (!addressValidated) amplificationBytesReceived += size
         peerMigration?.let { if (datagramPath == it.path) it.received += size }
     }
@@ -1523,6 +1583,28 @@ class QuicConnection internal constructor(
      */
     @Volatile
     internal var lastAppPacketAckOnly: Boolean = false
+
+    /**
+     * When the PTO period starts counting (RFC 9002 §6.2.1): the latest
+     * ack-eliciting packet sent, or 1-RTT ACK-only packet (see
+     * [lastAppPacketAckOnly]), or the latest PTO expiry.
+     */
+    @Volatile
+    internal var ptoReferenceMs: Long = Long.MIN_VALUE
+
+    /**
+     * Milliseconds until the PTO fires, or [Long.MAX_VALUE] when it isn't
+     * armed. Counted from [ptoReferenceMs], so waking the send loop (a stream
+     * write, an ACK) doesn't push it back.
+     */
+    internal fun ptoDelayMillis(nowMs: Long): Long {
+        if (!ptoArmed()) return Long.MAX_VALUE
+        // max_ack_delay only applies to the application space (RFC 9002 §6.2.1).
+        val maxAckDelayMs = if (application.sendProtection != null) peerTransportParameters?.maxAckDelay ?: 0L else 0L
+        val period = (lossDetection.ptoBaseMs(maxAckDelayMs).coerceAtLeast(1L) * (1L shl consecutivePtoCount.coerceAtMost(6))).coerceAtMost(60_000L)
+        val reference = ptoReferenceMs
+        return if (reference == Long.MIN_VALUE) period else (reference + period - nowMs).coerceAtLeast(0L)
+    }
 
     /**
      * RFC 9002 §6.2.4 probe budget. Set to 2 each time the PTO timer
@@ -1671,6 +1753,12 @@ class QuicConnection internal constructor(
                 }
                 zeroRttSendProtection = packetProtectionFromSecret(cipherSuite, clientEarlySecret, currentVersion)
                 qlogObserver.onKeyUpdated("client", EncryptionLevel.APPLICATION)
+            }
+
+            override fun onEarlyDataRejected() {
+                // What already went out in 0-RTT is requeued once 1-RTT keys arrive (earlyDataAccepted is false).
+                zeroRttSendProtection = null
+                extraSecretsListener?.onEarlyDataRejected()
             }
 
             override fun onApplicationKeysReady(
@@ -3129,6 +3217,10 @@ class QuicConnection internal constructor(
             .forSecret(current)
             .expandLabel(current, QuicVersion.keyUpdateLabel(currentVersion), current.size)
 
+    /** The keys [deriveNextPhaseReceiveKeys] last built, and the receive secret they came from. */
+    private var nextPhaseReceiveCache: com.vitorpamplona.quic.connection.PacketProtection? = null
+    private var nextPhaseReceiveCacheSecret: ByteArray? = null
+
     /**
      * RFC 9001 §6.1 key update — rotate application-level keys forward by
      * one phase. Called from [com.vitorpamplona.quic.connection.feedShortHeaderPacket]
@@ -3158,10 +3250,18 @@ class QuicConnection internal constructor(
      * [newPhase] (concurrent path raced us to the rotation), this returns
      * the current keys unchanged. Should never happen given the parser is
      * single-threaded, but cheap insurance.
+     *
+     * The keys are cached until the receive secret moves on, so a run of
+     * packets with a flipped key-phase bit (a peer's update, or garbage
+     * that fails AEAD) costs one derivation, not one each.
      */
     internal fun deriveNextPhaseReceiveKeys(): com.vitorpamplona.quic.connection.PacketProtection? {
         val current = appReceiveSecret ?: return null
         val cs = appCipherSuite.takeIf { it != 0 } ?: return null
+        val live = application.receiveProtection ?: return null
+        nextPhaseReceiveCache?.let { cached ->
+            if (nextPhaseReceiveCacheSecret === current && cached.hp === live.hp) return cached
+        }
         // RFC 9001 §6.1 — secret rotation label.
         val nextSecret =
             nextKeyPhaseSecret(current)
@@ -3174,7 +3274,6 @@ class QuicConnection internal constructor(
                 version = currentVersion,
             )
         // Keep the OLD HP key — RFC 9001 §6.1 forbids rotating it.
-        val live = application.receiveProtection ?: return null
         val rebound =
             com.vitorpamplona.quic.connection.PacketProtection(
                 aead = nextProtection.aead,
@@ -3183,6 +3282,8 @@ class QuicConnection internal constructor(
                 hp = live.hp,
                 hpKey = live.hpKey,
             )
+        nextPhaseReceiveCache = rebound
+        nextPhaseReceiveCacheSecret = current
         // Rotation is committed by the caller after AEAD success — return
         // the new keys without mutating state. The caller calls
         // [commitKeyUpdate] on success.
@@ -3403,7 +3504,8 @@ class QuicConnection internal constructor(
      */
     internal fun retireFullyDoneStreamsLocked(): Int {
         val current = streamsList
-        if (current.isEmpty()) return 0
+        // Runs on every packet build: nothing to retire is the usual case, so check before allocating.
+        if (current.none { it.isFullyRetired }) return 0
         // Build the post-retire snapshot in one pass. Mutating the live
         // [streamsList] in-place would force readers (closeAllSignals,
         // diagnostic accessors) to take [streamsLock] just to iterate;
@@ -4481,6 +4583,9 @@ class QuicConnection internal constructor(
          * PTO if path validation matters to them).
          */
         const val MAX_PENDING_PATH_RESPONSES: Int = 64
+
+        /** How long a path a client probed counts as validated (RFC 9000 §9.3 "recently"). */
+        const val RECENTLY_VALIDATED_MS: Long = 30_000L
     }
 }
 

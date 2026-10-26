@@ -397,6 +397,12 @@ private fun feedLongHeaderPacket(
     // authenticated under that version's keys: switch (RFC 9368 §2.3).
     if (candidate != null) conn.commitCompatibleVersion(peeked.version, candidate)
 
+    // RFC 9000 §12.3: a packet number seen before is a duplicate (or a
+    // replay): drop it before it moves anything.
+    if (state.ackTracker.hasReceived(parsed.packet.packetNumber)) {
+        conn.qlogObserver.onPacketDropped("duplicate packet number ${parsed.packet.packetNumber}", parsed.consumed)
+        return parsed.consumed
+    }
     if (conn.isServer) conn.notePeerAddressDuringHandshakeLocked(level, parsed.packet.packetNumber > state.pnSpace.largestReceived)
     state.pnSpace.observeInbound(parsed.packet.packetNumber, nowMillis)
     // RFC 9000 §10.1.1: any successfully processed inbound packet
@@ -464,17 +470,18 @@ private fun feedEarlyShortHeaderPackets(
 ) {
     val packets = conn.earlyShortHeaderPackets.toList()
     conn.earlyShortHeaderPackets.clear()
-    val current = conn.datagramPath
+    conn.earlyShortHeaderBytes = 0
+    // Read as if they came on the path the handshake completed on: an old
+    // address they came from must not start a migration back to it.
     for (p in packets) {
         if (conn.status == QuicConnection.Status.DRAINING || conn.status == QuicConnection.Status.CLOSED) break
-        conn.datagramPath = p.serverPath
         feedShortHeaderPacket(conn, p.bytes, 0, nowMillis, p.path)
     }
-    conn.datagramPath = current
 }
 
-/** How many 1-RTT packets a server keeps while its handshake completes. */
+/** How many 1-RTT packets, and bytes, a server keeps while its handshake completes. */
 private const val MAX_EARLY_SHORT_HEADER_PACKETS = 32
+private const val MAX_EARLY_SHORT_HEADER_BYTES = 16 * 1024
 
 private fun feedShortHeaderPacket(
     conn: QuicConnection,
@@ -487,8 +494,10 @@ private fun feedShortHeaderPacket(
     // handshake completes. Once it has, 0-RTT keys can go (§4.9.3).
     if (conn.isServer) {
         if (!conn.handshakeComplete) {
-            if (conn.earlyShortHeaderPackets.size < MAX_EARLY_SHORT_HEADER_PACKETS) {
-                conn.earlyShortHeaderPackets += QuicConnection.EarlyShortHeaderPacket(datagram.copyOfRange(offset, datagram.size), path, conn.datagramPath)
+            val size = datagram.size - offset
+            if (conn.earlyShortHeaderPackets.size < MAX_EARLY_SHORT_HEADER_PACKETS && conn.earlyShortHeaderBytes + size <= MAX_EARLY_SHORT_HEADER_BYTES) {
+                conn.earlyShortHeaderPackets += QuicConnection.EarlyShortHeaderPacket(datagram.copyOfRange(offset, datagram.size), path)
+                conn.earlyShortHeaderBytes += size
             } else {
                 conn.qlogObserver.onPacketDropped("1-RTT before the handshake completed", datagram.size - offset)
             }
@@ -669,6 +678,11 @@ private fun feedShortHeaderPacket(
                 errorCode = com.vitorpamplona.quic.frame.QuicTransportError.AEAD_LIMIT_REACHED,
             )
         }
+        return
+    }
+    // RFC 9000 §12.3: drop a duplicate (or replayed) packet number.
+    if (state.ackTracker.hasReceived(parsed.packet.packetNumber)) {
+        conn.qlogObserver.onPacketDropped("duplicate packet number ${parsed.packet.packetNumber}", datagram.size - offset)
         return
     }
     // AEAD succeeded with the candidate next-phase keys → commit the
@@ -871,9 +885,9 @@ private fun dispatchFrames(
                 // RFC 9002 §B.5 / §B.7: release the acknowledged bytes,
                 // grow the window, and treat a rising CE count as congestion.
                 conn.onPacketsAckedLocked(state, drained)
-                val ce = frame.ecnCounts?.ce
-                if (ce != null && level == EncryptionLevel.APPLICATION) {
-                    conn.onPeerEcnCountsLocked(ce, largestSentTime, nowMillis)
+                val ecn = frame.ecnCounts
+                if (ecn != null && level == EncryptionLevel.APPLICATION) {
+                    conn.onPeerEcnCountsLocked(ecn, advancedLargest, state.pnSpace.nextPacketNumber, largestSentTime, nowMillis)
                 }
                 state.largestAckedPn?.let { largestAckedPn ->
                     val result =
@@ -921,7 +935,7 @@ private fun dispatchFrames(
                     return
                 }
                 // Server: the ClientHello again from the start, all of it already read.
-                if (level == EncryptionLevel.INITIAL && frame.offset == 0L && frameEnd <= state.cryptoReceive.readOffset) {
+                if (level == EncryptionLevel.INITIAL && frame.offset == 0L && frame.data.isNotEmpty() && frameEnd <= state.cryptoReceive.readOffset) {
                     conn.onRepeatedClientHelloLocked()
                 }
                 state.cryptoReceive.insert(frame.offset, frame.data)
@@ -1344,7 +1358,7 @@ private fun dispatchFrames(
                     conn.peerMigration = null
                 } else if (probe != null && probe.matches(frame.data)) {
                     conn.completePreferredAddressMigrationLocked()
-                } else if (conn.isServer && conn.onServerPathResponseLocked(frame.data)) {
+                } else if (conn.isServer && conn.onServerPathResponseLocked(frame.data, nowMillis)) {
                     // A path the client probed is validated; nothing moves yet.
                 } else {
                     conn.applyPeerPathResponseLocked(frame.data)

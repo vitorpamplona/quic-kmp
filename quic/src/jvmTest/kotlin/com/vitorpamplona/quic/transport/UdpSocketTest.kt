@@ -101,6 +101,22 @@ class UdpSocketTest {
     }
 
     @Test
+    fun `an ICMP port unreachable does not end send either`() {
+        runBlocking {
+            // With no receive pending, the kernel reports the ICMP error on the next send.
+            val deadPort = DatagramSocket(InetSocketAddress("127.0.0.1", 0)).use { it.localPort }
+            val socket = UdpSocket.connect("127.0.0.1", deadPort)
+            try {
+                socket.send(byteArrayOf(1))
+                delay(200)
+                repeat(3) { socket.send(byteArrayOf(2)) }
+            } finally {
+                socket.close()
+            }
+        }
+    }
+
+    @Test
     fun `blocking receive runs on a dedicated thread, not Dispatchers-IO`() {
         runBlocking {
             val socket = UdpSocket.connect("127.0.0.1", peer.localPort)

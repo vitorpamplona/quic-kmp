@@ -386,4 +386,45 @@ class ServerConnectionTest {
                     ).totalLength
             }
         }
+
+    @Test
+    fun `a replayed copy of the client's first Initial is dropped`() {
+        // RFC 9000 §12.3: a packet number seen before is a duplicate. A replay
+        // of the first Initial used to make the server resend its whole flight
+        // each time, a 3x reflection to wherever the copy came from.
+        val client = client()
+        client.start()
+        val server = serverFor(client)
+        val clientHello = assertNotNull(drainOutbound(client, now))
+        feedDatagram(server, clientHello, now)
+        while (true) drainOutbound(server, now) ?: break
+        server.initial.cryptoSend.markAcked(0L, server.initial.cryptoSend.nextOffset)
+        server.initial.clearSentPackets()
+
+        feedDatagram(server, clientHello, now)
+        assertNull(drainOutbound(server, now), "the copy changed nothing")
+    }
+
+    @Test
+    fun `an Initial from a new address restarts the amplification budget there`() {
+        // Anyone who saw the first Initial can forge one: what we may send to
+        // the new address is bounded by what came from it alone.
+        val client = client()
+        client.start()
+        val server = serverFor(client)
+        server.datagramPath = ServerPath(0, clientAddress)
+        while (true) feedDatagram(server, drainOutbound(client, now) ?: break, now)
+        while (true) drainOutbound(server, now) ?: break
+
+        now += 300
+        client.requeueAllInflightCrypto(EncryptionLevel.INITIAL)
+        val retransmit = assertNotNull(drainOutbound(client, now))
+        val moved =
+            com.vitorpamplona.quic.transport
+                .UdpPeerAddress(byteArrayOf(10, 0, 0, 9), 6000)
+        server.datagramPath = ServerPath(0, moved)
+        feedDatagram(server, retransmit, now)
+        assertEquals(ServerPath(0, moved), server.sendPath)
+        assertEquals(3L * retransmit.size, server.amplificationAllowance(), "three times the one datagram from there")
+    }
 }
