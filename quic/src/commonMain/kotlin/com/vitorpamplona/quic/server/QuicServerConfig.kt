@@ -64,8 +64,6 @@ class QuicServerConfig(
             TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
-    /** Key-exchange groups accepted, most preferred first (X25519 and secp256r1). */
-    val keyExchangeGroups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
     /** Length of the connection IDs the server picks; short headers are routed on it. */
     val connectionIdLength: Int = 8,
     /** A qlog observer per connection, keyed by the client's original DCID. */
@@ -77,6 +75,8 @@ class QuicServerConfig(
      * [QuicServer] then needs the transport that listens there.
      */
     val preferredAddress: ServerPreferredAddress? = null,
+    /** Key-exchange groups accepted, most preferred first (X25519 and secp256r1). */
+    val keyExchangeGroups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
 ) {
     init {
         require(connectionIdLength in 8..20) { "connectionIdLength must be 8..20" }

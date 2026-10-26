@@ -95,7 +95,7 @@ data class TlsServerHello(
                 throw QuicCodecException("ServerHello legacy_session_id_echo non-empty (${sessionId.size} bytes)")
             }
             val cipherSuite = r.readUint16()
-            r.readByte() // legacy_compression_method = 0
+            if (r.readByte() != 0) throw QuicCodecException("ServerHello legacy_compression_method != 0")
             val extensions = TlsExtension.decodeList(r)
             // RFC 8446 §4.1.3: ServerHello body ends with the extensions
             // block. Any trailing bytes are a malformed handshake message.

@@ -77,6 +77,26 @@ class HelloRetryRequestTest {
     }
 
     @Test
+    fun a_retry_with_an_extension_it_may_not_carry_is_refused() {
+        val (tls, _) = startedClient()
+        val ex =
+            assertFailsWith<TlsAlertException> {
+                tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1, extraExtension = TlsConstants.EXT_PRE_SHARED_KEY))
+            }
+        kotlin.test.assertEquals(TlsConstants.ALERT_UNSUPPORTED_EXTENSION, ex.alertCode)
+    }
+
+    @Test
+    fun a_retry_with_an_empty_cookie_is_refused() {
+        val (tls, _) = startedClient()
+        val ex =
+            assertFailsWith<TlsAlertException> {
+                tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1, cookie = byteArrayOf(0, 0)))
+            }
+        kotlin.test.assertEquals(TlsConstants.ALERT_DECODE_ERROR, ex.alertCode)
+    }
+
+    @Test
     fun a_second_retry_is_refused() {
         val (tls, _) = startedClient()
         tls.pushHandshakeBytes(TlsClient.Level.INITIAL, buildHelloRetryRequest(TlsConstants.GROUP_SECP256R1))
@@ -94,6 +114,7 @@ class HelloRetryRequestTest {
     private fun buildHelloRetryRequest(
         group: Int,
         cookie: ByteArray? = null,
+        extraExtension: Int? = null,
     ): ByteArray {
         val helloRetryRequestRandom =
             byteArrayOf(
@@ -147,6 +168,10 @@ class HelloRetryRequestTest {
                 if (cookie != null) {
                     writeUint16(TlsConstants.EXT_COOKIE)
                     writeTlsOpaque2(cookie)
+                }
+                if (extraExtension != null) {
+                    writeUint16(extraExtension)
+                    withUint16Length { writeUint16(0) }
                 }
             }
         }

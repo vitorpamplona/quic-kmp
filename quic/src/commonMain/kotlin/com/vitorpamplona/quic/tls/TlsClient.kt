@@ -205,6 +205,9 @@ class TlsClient(
     /** The cipher suite of the HelloRetryRequest we answered, if any; the ServerHello must repeat it. */
     private var retryCipherSuite: Int = -1
 
+    /** Whether our latest ClientHello offered early data (a second one, after a retry, never does). */
+    private var offeredEarlyData: Boolean = false
+
     /**
      * True after ServerHello carries a `pre_shared_key` extension with the
      * `selected_identity` we offered. When set, the state machine accepts
@@ -258,11 +261,12 @@ class TlsClient(
                 .bytes(32)
         clientRandom = random
 
+        offeredEarlyData = resumption != null && resumption.maxEarlyDataSize > 0
         val chBytes =
             buildClientHello(
                 publicKey = keyPair!!.publicKey,
                 cookie = null,
-                earlyData = resumption != null && resumption.maxEarlyDataSize > 0,
+                earlyData = offeredEarlyData,
             )
 
         transcript.append(chBytes)
@@ -360,9 +364,20 @@ class TlsClient(
                 "HelloRetryRequest picked cipher 0x${suite.toString(16)} we did not offer",
             )
         }
+        // RFC 8446 §4.1.4: only supported_versions, key_share and cookie belong in a retry.
+        sh.extensions.firstOrNull { it.type !in HELLO_RETRY_REQUEST_EXTENSIONS }?.let {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_UNSUPPORTED_EXTENSION, "HelloRetryRequest carries extension ${it.type}")
+        }
         val groupExt = sh.extensions.firstOrNull { it.type == TlsConstants.EXT_KEY_SHARE }
+        if (groupExt != null && groupExt.data.size != 2) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_DECODE_ERROR, "HelloRetryRequest key_share of ${groupExt.data.size} bytes")
+        }
         val group = groupExt?.let { QuicReader(it.data).readUint16() }
         val cookie = sh.extensions.firstOrNull { it.type == TlsConstants.EXT_COOKIE }?.data
+        // opaque cookie<1..2^16-1>: its length, then at least one byte.
+        if (cookie != null && (cookie.size < 3 || QuicReader(cookie).readUint16() != cookie.size - 2)) {
+            throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_DECODE_ERROR, "malformed HelloRetryRequest cookie")
+        }
         if (group != null && (group !in CLIENT_SUPPORTED_GROUPS || group == keyShareGroup)) {
             throw com.vitorpamplona.quic.TlsAlertException(
                 TlsConstants.ALERT_ILLEGAL_PARAMETER,
@@ -393,6 +408,11 @@ class TlsClient(
                     keyPair!!.publicKey
                 }
             }
+        // RFC 8446 §4.2.10: no early data after a retry; whatever 0-RTT went out is lost.
+        if (offeredEarlyData) {
+            offeredEarlyData = false
+            secretsListener.onEarlyDataRejected()
+        }
         val ch2 = buildClientHello(publicKey, cookie, earlyData = false)
         transcript.append(ch2)
         outboundQueues[Level.INITIAL]!!.addLast(ch2)
@@ -529,8 +549,9 @@ class TlsClient(
                         val r = QuicReader(pskExt.data)
                         val selectedIdentity = r.readUint16()
                         if (selectedIdentity != 0) {
-                            throw QuicCodecException(
-                                "server selected PSK identity $selectedIdentity but we only offered 0",
+                            throw com.vitorpamplona.quic.TlsAlertException(
+                                alertCode = TlsConstants.ALERT_ILLEGAL_PARAMETER,
+                                message = "server selected PSK identity $selectedIdentity but we only offered 0",
                             )
                         }
                         // RFC 8446 §4.2.11: the suite must hash like the ticket's.
@@ -543,7 +564,7 @@ class TlsClient(
                         pskAccepted = true
                     }
                 } else if (pskExt != null) {
-                    throw QuicCodecException("server picked PSK we never offered")
+                    throw com.vitorpamplona.quic.TlsAlertException(TlsConstants.ALERT_ILLEGAL_PARAMETER, "server picked a PSK we did not offer")
                 } else {
                     // No ticket on offer: the early secret starts over under the suite's hash.
                     keySchedule.hash = hash
@@ -602,7 +623,15 @@ class TlsClient(
                 // ignored / dropped any app data we already sent under
                 // early-data keys, and the QUIC layer must re-queue it
                 // for 1-RTT replay.
-                earlyDataAccepted = ee.extensions.any { it.type == TlsConstants.EXT_EARLY_DATA }
+                val eeEarlyData = ee.extensions.any { it.type == TlsConstants.EXT_EARLY_DATA }
+                // RFC 8446 §4.2: an extension we didn't send is unsupported_extension.
+                if (eeEarlyData && !offeredEarlyData) {
+                    throw com.vitorpamplona.quic.TlsAlertException(
+                        alertCode = TlsConstants.ALERT_UNSUPPORTED_EXTENSION,
+                        message = "server accepted early data we did not offer",
+                    )
+                }
+                earlyDataAccepted = eeEarlyData
                 transcript.append(msg)
                 state = State.WAITING_CERTIFICATE_OR_FINISHED
             }
@@ -844,6 +873,12 @@ interface TlsSecretsListener {
     ) = Unit
 
     /**
+     * Client: a HelloRetryRequest came, so the server will discard any 0-RTT
+     * (RFC 8446 §4.2.10); stop sending it. Default no-op.
+     */
+    fun onEarlyDataRejected() = Unit
+
+    /**
      * Server issued a NewSessionTicket. The TLS layer hands off a
      * ready-to-use [TlsResumptionState] capturing everything the next
      * connection needs for PSK-based resumption: the opaque ticket, the
@@ -1024,6 +1059,10 @@ internal class ByteArrayBuilder {
         return msg
     }
 }
+
+/** The extensions a HelloRetryRequest may carry (RFC 8446 §4.1.4). */
+private val HELLO_RETRY_REQUEST_EXTENSIONS: Set<Int> =
+    setOf(TlsConstants.EXT_SUPPORTED_VERSIONS, TlsConstants.EXT_KEY_SHARE, TlsConstants.EXT_COOKIE)
 
 /** The cipher suites this stack implements. */
 internal val SUPPORTED_CIPHER_SUITES: Set<Int> =

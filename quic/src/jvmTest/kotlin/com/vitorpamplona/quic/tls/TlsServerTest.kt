@@ -41,6 +41,7 @@ class TlsServerTest {
         var application: Pair<ByteArray, ByteArray>? = null
         var early: ByteArray? = null
         var cipherSuite = -1
+        var earlyRejected = false
         var complete = false
         val tickets = mutableListOf<TlsResumptionState>()
 
@@ -70,6 +71,10 @@ class TlsServerTest {
 
         override fun onHandshakeComplete() {
             complete = true
+        }
+
+        override fun onEarlyDataRejected() {
+            earlyRejected = true
         }
 
         override fun onNewSessionTicket(state: TlsResumptionState) {
@@ -484,6 +489,29 @@ class TlsServerTest {
         assertTrue(cl2.complete && sl2.complete)
         assertEquals(32, cl2.application!!.first.size)
         assertContentEquals(sl2.application!!.first, cl2.application!!.first)
+    }
+
+    @Test
+    fun a_retry_turns_off_0rtt() {
+        // RFC 8446 §4.2.10: the server discards 0-RTT after a HelloRetryRequest,
+        // so the client stops sending it instead of filling the window with it.
+        val tickets = TlsSessionTicketKeys()
+        val cl = Recorder()
+        run(client(cl), server(Recorder(), tickets = tickets, maxEarly = 0xFFFFFFFFL))
+        val ticket = cl.tickets.single()
+
+        val cl2 = Recorder()
+        val c2 = client(cl2, resumption = ticket)
+        run(c2, server(Recorder(), tickets = tickets, maxEarly = 0xFFFFFFFFL, groups = listOf(GROUP_SECP256R1)))
+        assertNotNull(cl2.early, "0-RTT keys were offered first")
+        assertTrue(cl2.earlyRejected)
+        assertFalse(c2.earlyDataAccepted)
+        assertTrue(cl2.complete)
+    }
+
+    @Test
+    fun a_group_the_server_does_not_implement_is_refused_at_construction() {
+        assertFailsWith<IllegalArgumentException> { server(Recorder(), groups = listOf(GROUP_SECP384R1)) }
     }
 
     private companion object {

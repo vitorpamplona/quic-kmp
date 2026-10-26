@@ -67,12 +67,6 @@ class TlsServer(
             TlsConstants.CIPHER_TLS_AES_256_GCM_SHA384,
             TlsConstants.CIPHER_TLS_CHACHA20_POLY1305_SHA256,
         ),
-    /**
-     * Key-exchange groups we accept, most preferred first: X25519 and
-     * secp256r1 (P-256). We use the most preferred one the client sent a share for,
-     * and otherwise ask for the most preferred one it lists.
-     */
-    val keyExchangeGroups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
     /** Enables session tickets and PSK resumption. */
     val ticketKeys: TlsSessionTicketKeys? = null,
     /** Ticket lifetime advertised in NewSessionTicket (RFC 8446 caps it at 7 days). */
@@ -95,7 +89,19 @@ class TlsServer(
      * switch to a compatible version the client offered (RFC 9368 §2.3).
      */
     val onClientTransportParameters: ((ByteArray) -> ByteArray?)? = null,
+    /**
+     * Key-exchange groups we accept, most preferred first: X25519 and
+     * secp256r1 (P-256). We use the most preferred one the client sent a share for,
+     * and otherwise ask for the most preferred one it lists.
+     */
+    val keyExchangeGroups: List<Int> = listOf(TlsConstants.GROUP_X25519, TlsConstants.GROUP_SECP256R1),
 ) : TlsHandshake {
+    init {
+        require(keyExchangeGroups.isNotEmpty() && keyExchangeGroups.all { it == TlsConstants.GROUP_X25519 || it == TlsConstants.GROUP_SECP256R1 }) {
+            "keyExchangeGroups must be X25519 and/or secp256r1, got $keyExchangeGroups"
+        }
+    }
+
     enum class State { WAITING_CLIENT_HELLO, WAITING_CLIENT_FINISHED, CONNECTED, FAILED }
 
     var state: State = State.WAITING_CLIENT_HELLO
