@@ -66,8 +66,13 @@ plugins {
 
 magpie {
     group("com.vitorpamplona.quic")
+    group("com.vitorpamplona.crypto")
 }
 ```
+
+From 1.2.1 on, its dependency [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp) is released on
+Nostr + Blossom only, so a build needs the `com.vitorpamplona.crypto` group above wherever it
+takes this library from, Maven Central included.
 
 | Requirement | |
 |---|---|
