@@ -3,6 +3,7 @@ plugins {
     alias(libs.plugins.androidKotlinMultiplatformLibrary) apply false
     alias(libs.plugins.jetbrainsKotlinJvm) apply false
     alias(libs.plugins.vanniktech.mavenPublish) apply false
+    alias(libs.plugins.magpiePublish) apply false
     alias(libs.plugins.diffplugSpotless)
 }
 
