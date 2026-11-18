@@ -2,12 +2,12 @@
 agp = "9.4.1"
 android-compileSdk = "37"
 android-minSdk = "26"
-cryptoKmp = "2.1.0"
+# 2.1.1 is the first release on Nostr + Blossom (settings.gradle.kts), with the same sources as 2.1.0.
+cryptoKmp = "2.1.1"
 jacksonModuleKotlin = "2.22.4"
 kotlin = "2.4.21"
 kotlinxCoroutines = "1.11.0"
 mavenPublish = "0.37.0"
-magpie = "0.2.0"
 spotless = "8.10.4"
 
 [libraries]
@@ -23,4 +23,3 @@ diffplugSpotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
 jetbrainsKotlinJvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
 vanniktech-mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
-magpiePublish = { id = "com.vitorpamplona.magpie.publish", version.ref = "magpie" }
