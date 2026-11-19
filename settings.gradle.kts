@@ -11,7 +11,7 @@ pluginManagement {
 // gradle/magpie.lock pins that key and every resolved version's files. It also puts the publish plugin
 // (com.vitorpamplona.magpie.publish) on the classpath, so build scripts apply that one by id alone.
 plugins {
-    id("com.vitorpamplona.magpie") version "0.2.0"
+    id("com.vitorpamplona.magpie") version "0.2.3"
 }
 
 magpie {
