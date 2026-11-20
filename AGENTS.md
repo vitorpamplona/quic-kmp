@@ -57,9 +57,10 @@ asks, and before opening, revising or merging one by either path, use the `ngit-
 ## Releasing
 
 Bump `VERSION_NAME` in `gradle.properties`, then push a `v<version>` tag. The
-`create-release.yml` workflow tests, publishes to Maven Central and opens the GitHub release.
-See `README.md` → Publishing for the signing secrets it needs. The workflow's `nostr` job publishes the same files to Nostr + Blossom with Magpie's
-`publishToNostr`, independently of Maven Central, so either can be re-run alone. It needs the
-signing secrets and `MAGPIE_BUNKER`, a NIP-46 `bunker://` URI for the release key that
-`vitorpamplona.com/.well-known/nostr.json` names as `releases`; the signer approves each release,
-and a version already on Nostr fails the job.
+`create-release.yml` workflow runs two jobs that don't wait for each other, each running the checks
+first: `central` publishes to Maven Central (see `README.md` → Publishing for the signing secrets),
+and `nostr` publishes the same files to Nostr + Blossom with Magpie's `publishToNostr`, then opens
+the GitHub release. When one channel fails (Central's monthly upload limit, an unanswered signer),
+re-run only that job. `nostr` needs the signing secrets and `MAGPIE_BUNKER`, a NIP-46 `bunker://`
+URI for the release key that `vitorpamplona.com/.well-known/nostr.json` names as `releases`; the
+signer approves each release, and a version already on Nostr fails the job.
