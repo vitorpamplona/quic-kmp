@@ -8,9 +8,10 @@
 [![License: MIT](https://img.shields.io/github/license/vitorpamplona/quic-kmp?labelColor=27303D&color=0877d2)](LICENSE)
 
 A pure-Kotlin **QUIC** client and server (v1 and v2) with **HTTP/3**, **QPACK** and
-**WebTransport** building blocks, for the JVM and Android. No JNI, no BouncyCastle, no native QUIC library: the TLS 1.3 handshake,
-packet protection, loss recovery, flow control and stream machinery are all Kotlin. The platform's
-JCA does AES-GCM, ChaCha20-Poly1305 and certificate validation.
+**WebTransport** building blocks, for the JVM, Android and iOS. No JNI, no BouncyCastle, no native QUIC library: the TLS 1.3 handshake,
+packet protection, loss recovery, flow control and stream machinery are all Kotlin. On the JVM the
+platform's JCA does AES-GCM, ChaCha20-Poly1305 and certificate validation; on iOS crypto-kmp does
+the AEADs and the Security framework checks the server's certificate (`systemCertificateValidator()`).
 
 It was written for [Amethyst](https://github.com/vitorpamplona/amethyst)'s audio rooms (MoQ over
 WebTransport), because no Android-compatible Java QUIC library existed, and it carries Amethyst's
@@ -40,9 +41,9 @@ server (see [Interop matrix](#interop-matrix)).
   groups such as X25519MLKEM768).
 - HTTP/3 server push and QPACK dynamic-table inserts on the encoder.
 - Client certificates on the server.
-- **Targets other than JVM and Android.** The protocol code in `commonMain` is platform-neutral
-  (CI compiles it as common code), but the UDP socket, packet ciphers, TLS transcript hash, lock
-  and certificate validation exist only for the JVM so far.
+- **Targets other than JVM, Android and iOS.** The POSIX sockets would serve macOS and Linux too
+  (the Linux build runs the test suite), but neither is published. On iOS, a server cannot sign its
+  CertificateVerify yet (no native certificate signer).
 
 ## Install
 

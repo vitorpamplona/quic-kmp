@@ -18,26 +18,11 @@
  * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package com.vitorpamplona.quic.transport
+package com.vitorpamplona.quic.tls
 
-// Placeholder actual for the -PquicNativeCheck target; see ../Synchronized.kt.
-
-actual class UdpServerSocket : QuicServerTransport {
-    actual override suspend fun receive(): ReceivedDatagram? = throw NotImplementedError("native check stub")
-
-    actual override suspend fun send(
-        payload: ByteArray,
-        to: UdpPeerAddress,
-    ): Int = throw NotImplementedError("native check stub")
-
-    actual override fun close(): Unit = throw NotImplementedError("native check stub")
-
-    actual val localPort: Int get() = throw NotImplementedError("native check stub")
-
-    actual companion object {
-        actual suspend fun bind(
-            host: String?,
-            port: Int,
-        ): UdpServerSocket = throw NotImplementedError("native check stub")
-    }
-}
+/**
+ * A [CertificateValidator] backed by the platform's trust store: the JDK's (Android's system CAs)
+ * on the JVM, the Security framework's on Apple platforms. What a client verifying a public server
+ * uses, rather than picking a platform class by name.
+ */
+expect fun systemCertificateValidator(): CertificateValidator

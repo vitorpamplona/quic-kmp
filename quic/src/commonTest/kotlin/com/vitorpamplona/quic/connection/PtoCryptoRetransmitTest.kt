@@ -76,6 +76,9 @@ class PtoCryptoRetransmitTest {
                     entry.value.tokens.any { it is RecoveryToken.Crypto }
                 }
             assertNotNull(firstSent, "Initial-level SentPacket must carry a Crypto token after first drain")
+            // Read now: a map entry does not outlive later inserts on every target (Kotlin/Native
+            // throws ConcurrentModificationException on a stale entry's key).
+            val firstSentKey = firstSent.key
             val firstCrypto =
                 firstSent.value.tokens
                     .filterIsInstance<RecoveryToken.Crypto>()
@@ -116,7 +119,7 @@ class PtoCryptoRetransmitTest {
             // CRYPTO frame went out (not a PING-only probe).
             val replayEntries =
                 client.initial.sentPackets.entries
-                    .filter { it.key != firstSent.key }
+                    .filter { it.key != firstSentKey }
             val replaySent =
                 replayEntries.firstOrNull { entry ->
                     entry.value.tokens.any { it is RecoveryToken.Crypto }
@@ -199,6 +202,7 @@ class PtoCryptoRetransmitTest {
                     entry.value.tokens.any { it is RecoveryToken.Crypto }
                 }
             assertNotNull(firstSent, "Initial-level SentPacket must carry a Crypto token")
+            val firstSentKey = firstSent.key
             val firstCrypto =
                 firstSent.value.tokens
                     .filterIsInstance<RecoveryToken.Crypto>()
@@ -264,7 +268,7 @@ class PtoCryptoRetransmitTest {
             // this session.
             val sentPNs =
                 client.initial.sentPackets.keys
-                    .filter { it != firstSent.key }
+                    .filter { it != firstSentKey }
                     .toSet()
             assertEquals(
                 2,

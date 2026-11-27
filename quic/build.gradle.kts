@@ -20,12 +20,14 @@ kotlin {
         }
     }
 
-    // commonMain must stay platform-neutral, but with only JVM-family targets Kotlin
-    // lets it use JVM APIs and its metadata compile checks nothing. -PquicNativeCheck
-    // adds a native target, which turns commonMain and commonTest into real common
-    // code, so `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64` (CI and
-    // the pre-push hook) catches a JVM-only call in either. Its actuals are throwing
-    // placeholders (src/nativeCheck): never run or publish it.
+    // iOS: the same protocol code over POSIX UDP sockets, crypto-kmp's AEADs and Apple's
+    // Security framework for the server's certificate (src/nativeMain, src/appleMain).
+    iosArm64()
+    iosSimulatorArm64()
+
+    // linuxX64 runs the native actuals where there is no Mac: -PquicNativeCheck adds it, so
+    // `./gradlew -PquicNativeCheck :quic:linuxX64Test` runs commonTest over the POSIX sockets
+    // (CI and the pre-push hook compile it). It is never published.
     val nativeCheck = providers.gradleProperty("quicNativeCheck").isPresent
     if (nativeCheck) {
         linuxX64()
@@ -72,10 +74,15 @@ kotlin {
                 dependsOn(commonMain.get())
             }
 
+        // The POSIX actuals, shared by iOS and the Linux check target; Apple's own (the Security
+        // framework's certificate checks) above them. Explicit, because the jvmAndroid edge above
+        // turns the default hierarchy template off.
+        val nativeMain = maybeCreate("nativeMain").apply { dependsOn(commonMain.get()) }
+        val appleMain = maybeCreate("appleMain").apply { dependsOn(nativeMain) }
+        getByName("iosArm64Main").dependsOn(appleMain)
+        getByName("iosSimulatorArm64Main").dependsOn(appleMain)
         if (nativeCheck) {
-            // Throwing placeholder actuals, so the check target builds and commonTest
-            // compiles too: `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64`.
-            getByName("linuxX64Main").kotlin.srcDir("src/nativeCheck/kotlin")
+            getByName("linuxX64Main").dependsOn(nativeMain)
         }
 
         jvmMain {
@@ -126,7 +133,7 @@ mavenPublishing {
 
     pom {
         name = "QUIC for Kotlin Multiplatform"
-        description = "Pure-Kotlin QUIC v1/v2 client and server, HTTP/3 and WebTransport for JVM and Android"
+        description = "Pure-Kotlin QUIC v1/v2 client and server, HTTP/3 and WebTransport for JVM, Android and iOS"
         inceptionYear = "2026"
         url = "https://github.com/vitorpamplona/quic-kmp/"
         licenses {
