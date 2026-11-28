@@ -11,7 +11,9 @@ Marmot's binding in marmot-kmp.
 
 - `quic/` — the library. `commonMain` holds the protocol (connection, recovery, frames, packets,
   TLS 1.3 state machine, HTTP/3, QPACK, WebTransport); `jvmAndroid` holds the JCA AEADs, the
-  certificate validators and the UDP socket. Targets: `jvm` and `android` only.
+  certificate validators and the UDP socket; `nativeMain` the POSIX UDP sockets, crypto-kmp's AEADs
+  and the transcript hash; `appleMain` the Security-framework certificate validator. Targets:
+  `jvm`, `android`, `iosArm64`, `iosSimulatorArm64` (and `linuxX64` under `-PquicNativeCheck`).
 - `interop/` — `:quic-interop`, the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
   endpoint (JVM app + Docker image). Never published.
 - `plans/`, `interop/plans/` — design notes, `YYYY-MM-DD-<slug>.md`.
@@ -22,15 +24,17 @@ Marmot's binding in marmot-kmp.
   [crypto-kmp](https://github.com/vitorpamplona/crypto-kmp) (`com.vitorpamplona.crypto`). Don't
   reimplement them here; if one is missing, add it there. To change both together, build against
   a local checkout with `-PcryptoKmpDir=../crypto-kmp`.
-- `commonMain` and `commonTest` stay free of JVM-only APIs, so more targets can be added. CI and the
-  pre-push hook compile both for a native target with
+- `commonMain` and `commonTest` stay free of JVM-only APIs: iOS compiles them. CI and the pre-push
+  hook compile both for a native target with
   `./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64`; plain `jvm`/`android` builds don't
-  catch a JVM call there. That target's actuals in `quic/src/nativeCheck/` only throw: they exist so
-  the check compiles, never run them. For a lock, use `com.vitorpamplona.quic.synchronized` with a
+  catch a JVM call there. That Linux target runs the real POSIX actuals iOS uses (not the Security
+  framework), so `./gradlew -PquicNativeCheck :quic:linuxX64Test` runs commonTest natively without
+  a Mac. Hold no `Map.Entry` across a later insert into its map: Kotlin/Native throws on a stale one. For a lock, use `com.vitorpamplona.quic.synchronized` with a
   `SynchronizedObject`, not `kotlin.synchronized`; for `@Volatile`, import `kotlin.concurrent.Volatile`;
   in tests use `assertTrue`, not `assert`, and write backticked test names with letters, digits,
   spaces, `-` and `_` only (Kotlin/Native rejects `()`, `,`, `.`, `:`, `/`, `#` and others). JVM-only tests go in `jvmTest`. The platform layer (UDP
-  socket, ciphers, TLS transcript hash, lock, certificate validators) has JVM actuals only.
+  socket, ciphers, TLS transcript hash, lock, certificate validators) has JVM and native actuals;
+  a client verifying a public server takes `systemCertificateValidator()`.
 - Releases follow semantic versioning from 1.0.0: a breaking change to the public API bumps the
   major version. Amethyst and marmot-kmp pin a version, so a breaking change also needs a matching
   change in Amethyst's `nestsClient` and marmot-kmp's `marmot-quic`. crypto-kmp is pinned in `gradle/libs.versions.toml`.

@@ -464,3 +464,5 @@ class JdkCertificateValidator(
             }
     }
 }
+
+actual fun systemCertificateValidator(): CertificateValidator = JdkCertificateValidator()

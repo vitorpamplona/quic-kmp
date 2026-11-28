@@ -18,18 +18,24 @@
  * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package com.vitorpamplona.quic
+package com.vitorpamplona.quic.tls
 
-/*
- * Placeholder native actuals, compiled only under -PquicNativeCheck. They let the
- * linuxX64 check target build so commonMain AND commonTest compile as common code
- * (./gradlew -PquicNativeCheck :quic:compileTestKotlinLinuxX64). Nothing here runs:
- * every member throws. A real native target replaces this file with working actuals.
+import com.vitorpamplona.quic.QuicCodecException
+
+/**
+ * The Linux check target has no trust store binding: it runs the protocol tests, which bring
+ * their own validators. A public server cannot be verified here.
  */
+actual fun systemCertificateValidator(): CertificateValidator =
+    object : CertificateValidator {
+        override fun validateChain(
+            chain: List<ByteArray>,
+            expectedHost: String,
+        ): Unit = throw QuicCodecException("no system trust store on this target")
 
-internal actual class SynchronizedObject
-
-internal actual inline fun <T> synchronized(
-    lock: SynchronizedObject,
-    block: () -> T,
-): T = throw NotImplementedError("native check stub")
+        override fun verifySignature(
+            signatureAlgorithm: Int,
+            signature: ByteArray,
+            transcriptHash: ByteArray,
+        ): Unit = throw QuicCodecException("no system trust store on this target")
+    }

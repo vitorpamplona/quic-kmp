@@ -18,18 +18,28 @@
  * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package com.vitorpamplona.quic.crypto
+package com.vitorpamplona.quic.tls
 
-// Placeholder actuals for the -PquicNativeCheck target; see ../Synchronized.kt.
+import com.vitorpamplona.crypto.sha2.sha256
 
-actual val PlatformAesOneBlock: AesOneBlockEncrypt
-    get() = throw NotImplementedError("native check stub")
+/**
+ * The transcript kept as bytes and hashed whole at each [snapshot], the JVM's own fallback: a
+ * TLS 1.3 handshake transcript is a few kilobytes and is sampled three times, so the re-hash costs
+ * microseconds.
+ */
+actual class TlsRunningSha256 actual constructor() {
+    private var transcript = ByteArray(INITIAL_CAPACITY)
+    private var size = 0
 
-actual val PlatformChaCha20Block: ChaCha20BlockEncrypt
-    get() = throw NotImplementedError("native check stub")
+    actual fun update(bytes: ByteArray) {
+        if (size + bytes.size > transcript.size) transcript = transcript.copyOf(maxOf(transcript.size * 2, size + bytes.size))
+        bytes.copyInto(transcript, size)
+        size += bytes.size
+    }
 
-actual fun bestAes128GcmAead(key: ByteArray): Aead = throw NotImplementedError("native check stub")
+    actual fun snapshot(): ByteArray = sha256(transcript.copyOf(size))
 
-actual fun bestAes256GcmAead(key: ByteArray): Aead = throw NotImplementedError("native check stub")
-
-actual fun bestChaCha20Poly1305Aead(key: ByteArray): Aead = throw NotImplementedError("native check stub")
+    private companion object {
+        const val INITIAL_CAPACITY = 4096
+    }
+}
